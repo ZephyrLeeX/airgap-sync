@@ -110,11 +110,32 @@ class SourceState:
     def register_table(self, table_name: str, mode: str) -> None:
         """登记同步表 (幂等)。
 
-        表已存在时只更新 mode, 不改动 current_run_id / status 等运行状态。
+        - 未登记: 插入, current_run_id = NULL, status = 'IDLE';
+        - 已登记且 current_run_id 为 NULL (尚无 committed baseline):
+          允许调整 mode;
+        - 已登记且 current_run_id 非空 (已产生 baseline): 禁止修改 mode,
+          报错并要求通过显式 reset / snapshot 机制处理 (本阶段未实现)。
+
+        任何情况下都不会重置 current_run_id / status 等运行状态。
         """
         now = _utcnow_iso()
         try:
             with self._transaction():
+                existing = self._conn.execute(
+                    "SELECT mode, current_run_id FROM table_state WHERE table_name = ?",
+                    (table_name,),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and existing["current_run_id"] is not None
+                    and existing["mode"] != mode
+                ):
+                    raise StateError(
+                        f"cannot change sync mode of table '{table_name}' from "
+                        f"'{existing['mode']}' to '{mode}': table already has a committed "
+                        f"baseline (current_run_id={existing['current_run_id']}); "
+                        "use an explicit reset or snapshot mechanism instead"
+                    )
                 self._conn.execute(
                     f"INSERT INTO table_state ({_TABLE_STATE_COLUMNS})"
                     " VALUES (?, ?, NULL, 'IDLE', ?, ?)"

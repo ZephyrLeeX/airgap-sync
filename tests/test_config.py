@@ -113,6 +113,29 @@ class TestInvalidConfigs:
         with pytest.raises(ConfigError, match="must not be empty"):
             load_config(write_config(config_data))
 
+    def test_keyed_with_duplicate_key_columns(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "t_bad", "mode": "keyed", "key": ["id", "id"]}]
+        with pytest.raises(ConfigError, match="duplicate key columns"):
+            load_config(write_config(config_data))
+
+    def test_keyed_composite_key_duplicate_reported_with_column_name(
+        self, config_data, write_config, password_env
+    ):
+        config_data["tables"] = [
+            {"name": "t_bad", "mode": "keyed", "key": ["hh", "fyrq", "hh"]},
+        ]
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(write_config(config_data))
+        assert "duplicate key columns" in str(excinfo.value)
+        assert "hh" in str(excinfo.value)
+
+    def test_distinct_composite_key_columns_allowed(self, config_data, write_config, password_env):
+        config_data["tables"] = [
+            {"name": "t_ok", "mode": "keyed", "key": ["hh", "fyrq"]},
+        ]
+        config = load_config(write_config(config_data))
+        assert config.tables[0].key == ["hh", "fyrq"]
+
 
 class TestConfigFileErrors:
     def test_file_not_found(self, tmp_path):

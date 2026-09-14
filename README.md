@@ -8,9 +8,18 @@
 
 Phase 1（项目基础）已完成，当前支持：
 
-- YAML 配置加载与强类型校验（表配置支持 `keyed` / `row_multiset` 两种模式）；
+- YAML 配置加载与强类型校验（表配置支持 `keyed` / `row_multiset` 两种模式，key 字段不允许重复）；
 - `airgap-sync config validate` 配置校验；
 - `airgap-sync source check`：Source MySQL 只读连接测试、同步表与 key 字段元数据检查、本地 SQLite 状态库初始化。
+
+### 源数据库只读保护
+
+Airgap Sync 不修改源业务表。`SourceMySQLConnection` 提供**双层只读保护**：
+
+1. **应用层**：对外只提供 SELECT 查询能力（`fetch_all` / `ping`），`INSERT` / `UPDATE` / `DELETE` / `CREATE` / `DROP` 等非 SELECT SQL 在发送给 MySQL 之前直接抛出 `SourceMySQLError` 拒绝；
+2. **MySQL 层**：连接建立后立即执行 `SET SESSION TRANSACTION READ ONLY` 并验证生效（只影响当前 Session，不改 GLOBAL，不需要 SUPER）。即使数据库账号具有写权限，写操作也会被 MySQL 以错误 1792 拒绝。设置失败时连接初始化直接失败，不会静默降级为可写连接。
+
+生产代码不提供任何执行 DML/DDL 或暴露原始连接的公共 API。需要真实 MySQL 的集成测试通过独立的 PyMySQL 管理连接创建/清理测试表，`SourceMySQLConnection` 在测试中也保持只读。
 
 以下能力**尚未实现**，属于后续阶段：数据扫描、行 Hash、Diff、Chunk、HTTP 上传、Destination 端、一致性校验等。
 
@@ -77,7 +86,7 @@ some_legacy_table             SKIP mode=row_multiset (disabled)
 
 任何检查失败时命令返回非 0 退出码并给出明确错误（如 `TABLE_NOT_FOUND`、`KEY_COLUMN_NOT_FOUND`）。
 
-SQLite 状态库自动创建在 `<data_dir>/state/meta.db`，首次运行自动初始化 schema，重复运行幂等。
+SQLite 状态库自动创建在 `<data_dir>/state/meta.db`，首次运行自动初始化 schema，重复运行幂等。已产生同步基线（`current_run_id` 非空）的表不允许修改同步 `mode`，需通过显式 reset / snapshot 机制处理（本阶段尚未实现）。
 
 ## 日志级别
 

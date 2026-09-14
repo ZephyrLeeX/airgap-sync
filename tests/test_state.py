@@ -117,6 +117,62 @@ class TestTableState:
         assert state.get_table_state("t_b").mode == "row_multiset"
 
 
+class TestModeChangeProtection:
+    """register_table 的 mode 变更保护。
+
+    current_run_id 为 NULL 表示尚无 committed baseline, 允许调整 mode;
+    一旦存在 current_run_id, 禁止静默修改 mode (需要显式 reset / snapshot
+    机制, 本阶段未实现)。
+    """
+
+    @staticmethod
+    def _commit_baseline(state: SourceState, table: str, run_id: str = "run-0001") -> None:
+        state._conn.execute(
+            "UPDATE table_state SET current_run_id = ? WHERE table_name = ?", (run_id, table)
+        )
+
+    def test_mode_change_allowed_without_baseline(self, state):
+        state.register_table("t_demo", "keyed")
+        state.register_table("t_demo", "row_multiset")  # current_run_id 为 NULL
+        row = state.get_table_state("t_demo")
+        assert row is not None
+        assert row.mode == "row_multiset"
+        assert row.current_run_id is None
+
+    def test_mode_change_rejected_with_baseline(self, state):
+        state.register_table("t_demo", "keyed")
+        self._commit_baseline(state, "t_demo")
+        with pytest.raises(StateError, match="cannot change sync mode"):
+            state.register_table("t_demo", "row_multiset")
+
+    def test_rejected_change_keeps_original_state(self, state):
+        state.register_table("t_demo", "keyed")
+        self._commit_baseline(state, "t_demo")
+        with pytest.raises(StateError):
+            state.register_table("t_demo", "row_multiset")
+        row = state.get_table_state("t_demo")
+        assert row is not None
+        assert row.mode == "keyed"  # 原值保留, 不重置同步状态
+        assert row.current_run_id == "run-0001"
+
+    def test_same_mode_reregister_allowed_with_baseline(self, state):
+        state.register_table("t_demo", "keyed")
+        self._commit_baseline(state, "t_demo")
+        state.register_table("t_demo", "keyed")  # 幂等, 不报错
+        row = state.get_table_state("t_demo")
+        assert row is not None
+        assert row.mode == "keyed"
+        assert row.current_run_id == "run-0001"
+
+    def test_other_tables_not_affected_by_rejection(self, state):
+        state.register_table("t_a", "keyed")
+        state.register_table("t_b", "row_multiset")
+        self._commit_baseline(state, "t_a")
+        with pytest.raises(StateError):
+            state.register_table("t_a", "row_multiset")
+        assert state.get_table_state("t_b").mode == "row_multiset"  # t_b 不受影响
+
+
 class TestUninitialized:
     def test_schema_version_before_initialize(self, tmp_path):
         state = SourceState(state_db_path(tmp_path / "data"))

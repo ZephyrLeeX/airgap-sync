@@ -67,6 +67,9 @@ class TableConfig(BaseModel):
         empty = [column for column in self.key if not column.strip()]
         if empty:
             raise ValueError(f"table '{self.name}': key column names must not be empty")
+        duplicates = sorted({column for column in self.key if self.key.count(column) > 1})
+        if duplicates:
+            raise ValueError(f"table '{self.name}': duplicate key columns: {', '.join(duplicates)}")
         return self
 
 

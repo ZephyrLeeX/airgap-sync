@@ -182,3 +182,36 @@ class TestSourceCheckFullFlow:
         assert result.exit_code == 1
         assert "KEY_COLUMN_NOT_FOUND" in result.output
         assert "missing key column(s): id" in result.output
+
+    def test_mode_change_with_existing_baseline_fails(
+        self, run_cli, config_data, write_config, password_env, monkeypatch, tmp_path
+    ):
+        """状态库中已有 baseline 的表, 配置改成不同 mode 时 CLI 必须报错退出。"""
+        import airgap_sync.cli as cli_module
+        from airgap_sync.source.state import SourceState, state_db_path
+
+        monkeypatch.setattr(
+            cli_module,
+            "SourceMySQLConnection",
+            lambda config: FakeSourceMySQL(config, {"t_keyed": {"id"}}),
+        )
+
+        # 预置状态: t_keyed (keyed) 已有 committed baseline
+        state = SourceState(state_db_path(tmp_path / "data"))
+        try:
+            state.initialize()
+            state.register_table("t_keyed", "keyed")
+            state._conn.execute(
+                "UPDATE table_state SET current_run_id = 'run-0001' WHERE table_name = 't_keyed'"
+            )
+        finally:
+            state.close()
+
+        # 同一 data_dir, 表改成 row_multiset
+        config_data["tables"] = [{"name": "t_keyed", "mode": "row_multiset"}]
+        path = write_config(config_data)
+
+        result = run_cli(["source", "check", "--config", str(path)])
+        assert result.exit_code == 1
+        assert "cannot change sync mode of table 't_keyed'" in result.output
+        assert "row_multiset" in result.output
