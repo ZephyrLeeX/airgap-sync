@@ -10,7 +10,6 @@ import pytest
 
 import airgap_sync
 from airgap_sync.cli import main
-from test_mysql_checks import FakeExecutor
 
 EXAMPLE_CONFIG = Path(__file__).parent.parent / "config" / "config.example.yaml"
 
@@ -61,12 +60,13 @@ class TestConfigValidate:
         assert result.exit_code == 1
         assert "AIRGAP_TEST_PASSWORD" in result.output
 
-    def test_invalid_config(self, run_cli, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "keyed"}]
+    def test_legacy_mode_config_rejected(self, run_cli, config_data, write_config, password_env):
+        """旧 keyed 配置必须明确失败。"""
+        config_data["tables"] = [{"name": "t_old", "mode": "keyed", "key": ["id"]}]
         path = write_config(config_data)
         result = run_cli(["config", "validate", "--config", str(path)])
         assert result.exit_code == 1
-        assert "requires at least one key column" in result.output
+        assert "tables.0" in result.output
 
     def test_missing_config_file(self, run_cli, tmp_path):
         result = run_cli(["config", "validate", "--config", str(tmp_path / "no.yaml")])
@@ -79,6 +79,57 @@ class TestConfigValidate:
         result = run_cli(["config", "validate", "--config", str(EXAMPLE_CONFIG)])
         assert result.exit_code == 0, result.output
         assert "role=source tables=3 enabled=2" in result.output
+
+
+class FakeTableStream:
+    def __init__(self, columns: list[str], batches: list[list[tuple]]) -> None:
+        self.columns = columns
+        self._batches = batches
+
+    def __enter__(self) -> FakeTableStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def __iter__(self):
+        yield from self._batches
+
+
+class FakeSourceMySQL:
+    """替身: 模拟 SourceMySQLConnection 的 ping / 元数据检查 / Snapshot 能力。"""
+
+    def __init__(self, config, table_types: dict[str, str], rows: list[tuple] | None = None):
+        self._config = config
+        self.table_types = table_types
+        self.rows = rows if rows is not None else [(1, "a"), (2, None)]
+        self.queries: list[tuple[str, tuple]] = []
+
+    def __enter__(self) -> FakeSourceMySQL:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def ping(self) -> str:
+        return "5.7.35-log"
+
+    def fetch_all(self, sql: str, params: tuple = ()) -> list[tuple]:
+        self.queries.append((sql, params))
+        if "information_schema.TABLES" in sql:
+            table_type = self.table_types.get(params[1])
+            return [(table_type,)] if table_type else []
+        raise AssertionError(f"unexpected query: {sql}")
+
+    def get_create_table(self, table_name: str) -> str:
+        return (
+            f"CREATE TABLE `{table_name}` (\n  `id` int(11) DEFAULT NULL,\n"
+            "  `name` varchar(32) DEFAULT NULL\n) ENGINE=InnoDB"
+        )
+
+    def stream_table(self, table_name: str, fetch_size: int) -> FakeTableStream:
+        batches = [self.rows[i : i + fetch_size] for i in range(0, len(self.rows), fetch_size)]
+        return FakeTableStream(columns=["id", "name"], batches=batches)
 
 
 class TestSourceCheck:
@@ -97,32 +148,15 @@ class TestSourceCheck:
         assert "AIRGAP_TEST_PASSWORD" in result.output
 
 
-class FakeSourceMySQL(FakeExecutor):
-    """替身: 模拟 SourceMySQLConnection 的 with 语句行为和 ping。"""
-
-    def __init__(self, config, tables):
-        super().__init__(tables)
-        self._config = config
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        return None
-
-    def ping(self) -> str:
-        return "5.7.35-log"
-
-
 class TestSourceCheckFullFlow:
     def test_success(self, run_cli, config_data, write_config, password_env, monkeypatch):
         import airgap_sync.cli as cli_module
 
-        config_data["tables"].append({"name": "t_legacy", "mode": "row_multiset", "enabled": False})
+        config_data["tables"].append({"name": "t_legacy", "enabled": False})
         path = write_config(config_data)
 
         def fake_connect(config):
-            return FakeSourceMySQL(config, {"t_keyed": {"id", "name"}})
+            return FakeSourceMySQL(config, {"t_snapshot": "BASE TABLE"})
 
         monkeypatch.setattr(cli_module, "SourceMySQLConnection", fake_connect)
 
@@ -133,8 +167,9 @@ class TestSourceCheckFullFlow:
         assert "MySQL server        5.7.35-log" in result.output
         assert "Database            sgaj_data" in result.output
         assert "SQLite state        OK" in result.output
-        assert "t_keyed                 OK   mode=keyed key=id" in result.output
-        assert "t_legacy                SKIP mode=row_multiset (disabled)" in result.output
+        assert "schema v2" in result.output
+        assert "t_snapshot" in result.output and "OK" in result.output
+        assert "t_legacy" in result.output and "SKIP (disabled)" in result.output
 
         # 状态库已创建, 且通过的 enabled 表被登记
         state_db = path.parent / "data" / "state" / "meta.db"
@@ -143,9 +178,8 @@ class TestSourceCheckFullFlow:
 
         state = SourceState(state_db)
         try:
-            row = state.get_table_state("t_keyed")
+            row = state.get_table_state("t_snapshot")
             assert row is not None
-            assert row.mode == "keyed"
             assert row.status == "IDLE"
             assert state.get_table_state("t_legacy") is None  # disabled 表不登记
         finally:
@@ -158,7 +192,9 @@ class TestSourceCheckFullFlow:
 
         path = write_config(config_data)
         monkeypatch.setattr(
-            cli_module, "SourceMySQLConnection", lambda config: FakeSourceMySQL(config, {})
+            cli_module,
+            "SourceMySQLConnection",
+            lambda config: FakeSourceMySQL(config, {}),
         )
 
         result = run_cli(["source", "check", "--config", str(path)])
@@ -166,52 +202,143 @@ class TestSourceCheckFullFlow:
         assert "TABLE_NOT_FOUND" in result.output
         assert "1 enabled table(s) failed check" in result.output
 
-    def test_key_column_missing_fails(
+    def test_view_rejected(self, run_cli, config_data, write_config, password_env, monkeypatch):
+        import airgap_sync.cli as cli_module
+
+        config_data["tables"] = [
+            {"name": "t_snapshot", "enabled": True},
+            {"name": "v_report", "enabled": True},
+        ]
+        path = write_config(config_data)
+        monkeypatch.setattr(
+            cli_module,
+            "SourceMySQLConnection",
+            lambda config: FakeSourceMySQL(
+                config, {"t_snapshot": "BASE TABLE", "v_report": "VIEW"}
+            ),
+        )
+
+        result = run_cli(["source", "check", "--config", str(path)])
+        assert result.exit_code == 1
+        assert "UNSUPPORTED_TABLE_TYPE (VIEW)" in result.output
+
+
+class TestSourceSnapshot:
+    def _patch(self, monkeypatch, rows=None):
+        import airgap_sync.cli as cli_module
+
+        def fake_connect(config):
+            return FakeSourceMySQL(config, {"t_snapshot": "BASE TABLE"}, rows=rows)
+
+        monkeypatch.setattr(cli_module, "SourceMySQLConnection", fake_connect)
+
+    def test_success(self, run_cli, config_data, write_config, password_env, monkeypatch):
+        self._patch(monkeypatch, rows=[(1, "a"), (2, None), (3, "中文")])
+        path = write_config(config_data)
+        config_data["snapshot"] = {"fetch_size": 2}
+        path = write_config(config_data)
+
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
+        assert result.exit_code == 0, result.output
+        assert "Table           t_snapshot" in result.output
+        assert "Run             " in result.output
+        assert "Rows            3" in result.output
+        assert "Chunks          1" in result.output
+        assert "Status          COMPLETED" in result.output
+        assert "Output          " in result.output
+        # 输出不含业务数据
+        assert "中文" not in result.output
+
+        run_dir = Path(result.output.split("Output          ")[1].strip().splitlines()[0])
+        manifest_path = run_dir / "manifest.json"
+        assert manifest_path.exists()
+        assert (run_dir / "schema.sql").exists()
+        chunks = sorted(run_dir.glob("chunk-*.jsonl.zst"))
+        assert len(chunks) == 1
+
+    def test_current_run_id_recorded(
+        self, run_cli, config_data, write_config, password_env, monkeypatch
+    ):
+        self._patch(monkeypatch)
+        path = write_config(config_data)
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
+        assert result.exit_code == 0, result.output
+
+        from airgap_sync.source.state import SourceState, state_db_path
+
+        state = SourceState(state_db_path(path.parent / "data"))
+        try:
+            row = state.get_table_state("t_snapshot")
+            assert row is not None
+            assert row.status == "COMPLETED"
+            assert row.current_run_id in result.output
+        finally:
+            state.close()
+
+    def test_table_not_in_config(
+        self, run_cli, config_data, write_config, password_env, monkeypatch
+    ):
+        self._patch(monkeypatch)
+        path = write_config(config_data)
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "ghost"])
+        assert result.exit_code == 1
+        assert "TABLE_NOT_CONFIGURED" in result.output
+
+    def test_disabled_table(self, run_cli, config_data, write_config, password_env, monkeypatch):
+        self._patch(monkeypatch)
+        config_data["tables"] = [{"name": "t_snapshot", "enabled": False}]
+        path = write_config(config_data)
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
+        assert result.exit_code == 1
+        assert "TABLE_NOT_ENABLED" in result.output
+
+    def test_scan_failure_reports_failed(
         self, run_cli, config_data, write_config, password_env, monkeypatch
     ):
         import airgap_sync.cli as cli_module
 
-        path = write_config(config_data)
+        class ExplodingSource(FakeSourceMySQL):
+            def stream_table(self, table_name, fetch_size):
+                raise RuntimeError("boom during scan")
+
         monkeypatch.setattr(
             cli_module,
             "SourceMySQLConnection",
-            lambda config: FakeSourceMySQL(config, {"t_keyed": {"name"}}),
+            lambda config: ExplodingSource(config, {"t_snapshot": "BASE TABLE"}),
         )
-
-        result = run_cli(["source", "check", "--config", str(path)])
+        path = write_config(config_data)
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
         assert result.exit_code == 1
-        assert "KEY_COLUMN_NOT_FOUND" in result.output
-        assert "missing key column(s): id" in result.output
+        assert "Status          FAILED" in result.output
+        assert "boom during scan" in result.output
+        assert "ERROR: snapshot failed" in result.output
 
-    def test_mode_change_with_existing_baseline_fails(
-        self, run_cli, config_data, write_config, password_env, monkeypatch, tmp_path
+    def test_ddl_change_fails_without_manifest(
+        self, run_cli, config_data, write_config, password_env, monkeypatch
     ):
-        """状态库中已有 baseline 的表, 配置改成不同 mode 时 CLI 必须报错退出。"""
         import airgap_sync.cli as cli_module
-        from airgap_sync.source.state import SourceState, state_db_path
+
+        class DdlChangingSource(FakeSourceMySQL):
+            def __init__(self, config, table_types):
+                super().__init__(config, table_types)
+                self.calls = 0
+
+            def get_create_table(self, table_name):
+                self.calls += 1
+                if self.calls == 2:
+                    return super().get_create_table(table_name).replace("int(11)", "bigint(20)")
+                return super().get_create_table(table_name)
 
         monkeypatch.setattr(
             cli_module,
             "SourceMySQLConnection",
-            lambda config: FakeSourceMySQL(config, {"t_keyed": {"id"}}),
+            lambda config: DdlChangingSource(config, {"t_snapshot": "BASE TABLE"}),
         )
-
-        # 预置状态: t_keyed (keyed) 已有 committed baseline
-        state = SourceState(state_db_path(tmp_path / "data"))
-        try:
-            state.initialize()
-            state.register_table("t_keyed", "keyed")
-            state._conn.execute(
-                "UPDATE table_state SET current_run_id = 'run-0001' WHERE table_name = 't_keyed'"
-            )
-        finally:
-            state.close()
-
-        # 同一 data_dir, 表改成 row_multiset
-        config_data["tables"] = [{"name": "t_keyed", "mode": "row_multiset"}]
         path = write_config(config_data)
-
-        result = run_cli(["source", "check", "--config", str(path)])
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
         assert result.exit_code == 1
-        assert "cannot change sync mode of table 't_keyed'" in result.output
-        assert "row_multiset" in result.output
+        assert "SCHEMA_CHANGED_DURING_SNAPSHOT" in result.output
+
+        run_dir = Path(result.output.split("Output          ")[1].strip().splitlines()[0])
+        assert not (run_dir / "manifest.json").exists()
+        assert not (run_dir / "schema.sql").exists()

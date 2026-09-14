@@ -13,8 +13,8 @@
 测试边界:
 - 测试表的 CREATE / INSERT / DROP 全部由独立的 admin/setup 连接
   (直接使用 PyMySQL, 只存在于本测试文件) 完成;
-- SourceMySQLConnection 只负责读取和检查, 与生产代码行为完全一致,
-  不承担测试 fixture 的 DDL 职责。
+- SourceMySQLConnection 只负责读取、检查和 Snapshot 生成,
+  与生产代码行为完全一致, 不承担测试 fixture 的 DDL 职责。
 
 注意: admin 连接会在该库中创建并删除临时表, 请使用可丢弃的数据库。
 """
@@ -22,22 +22,29 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pymysql
 import pytest
 
-from airgap_sync.common.models import MySQLConfig, TableConfig, TableMode
+from airgap_sync.common.manifest import read_manifest
+from airgap_sync.common.models import AppConfig, MySQLConfig, TableConfig
+from airgap_sync.common.row_codec import decode_row, encode_row
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
     SourceMySQLError,
     check_tables,
-    fetch_table_columns,
+    fetch_table_info,
 )
+from airgap_sync.source.snapshot import SnapshotRunner
+from airgap_sync.source.state import SourceState, state_db_path
 
 # MySQL 5.7 起 READ ONLY Session 中执行修改语句的错误码。
 ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION = 1792
 
 DEMO_TABLE = "airgap_it_demo"
+SNAP_TABLE = "airgap_it_snap"
+SNAP_VIEW = "airgap_it_snap_view"
 
 pytestmark = [
     pytest.mark.integration,
@@ -116,27 +123,65 @@ def demo_table(admin_connection: pymysql.Connection) -> str:
         admin_exec(admin_connection, f"DROP TABLE IF EXISTS {DEMO_TABLE}")
 
 
+@pytest.fixture
+def snapshot_table(admin_connection: pymysql.Connection) -> str:
+    """无 PRIMARY KEY 的快照测试表: 重复行 / NULL / Decimal / datetime / text / binary。"""
+    admin_exec(admin_connection, f"DROP VIEW IF EXISTS {SNAP_VIEW}")
+    admin_exec(admin_connection, f"DROP TABLE IF EXISTS {SNAP_TABLE}")
+    admin_exec(
+        admin_connection,
+        f"CREATE TABLE {SNAP_TABLE} ("
+        "  sid INT DEFAULT NULL,"
+        "  name VARCHAR(64) DEFAULT NULL,"
+        "  amount DECIMAL(12,4) DEFAULT NULL,"
+        "  ts DATETIME(6) DEFAULT NULL,"
+        "  note TEXT,"
+        "  payload VARBINARY(32) DEFAULT NULL"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    )
+    admin_exec(
+        admin_connection,
+        f"INSERT INTO {SNAP_TABLE} (sid, name, amount, ts, note, payload) VALUES"
+        " (1, 'a', 12.3400, '2026-09-14 20:00:00.123456', 'first', 0x0001FF),"
+        " (1, 'a', 12.3400, '2026-09-14 20:00:00.123456', 'first', 0x0001FF),"  # 完全重复
+        " (2, NULL, NULL, NULL, NULL, NULL),"  # 全 NULL 行
+        " (3, '中文长文本测试', -0.5000, '2026-01-01 00:00:00.000001', '', 0x00),"  # 空串/0x00
+        " (4, '', 99999999.9999, '2026-12-31 23:59:59.999999', '中文身份证字段', 0xDeadBeef)",
+    )
+    admin_exec(admin_connection, f"CREATE VIEW {SNAP_VIEW} AS SELECT sid, name FROM {SNAP_TABLE}")
+    try:
+        yield SNAP_TABLE
+    finally:
+        admin_exec(admin_connection, f"DROP VIEW IF EXISTS {SNAP_VIEW}")
+        admin_exec(admin_connection, f"DROP TABLE IF EXISTS {SNAP_TABLE}")
+
+
 def test_ping_returns_version(connection: SourceMySQLConnection):
     version = connection.ping()
     assert version  # 非空即视为连通, MySQL 5.7 也应返回版本串
 
 
-def test_metadata_checks(connection: SourceMySQLConnection, mysql_config, demo_table: str):
-    columns = fetch_table_columns(connection, mysql_config.database, demo_table)
-    assert columns == {"id", "name", "fyrq"}
-    assert fetch_table_columns(connection, mysql_config.database, "airgap_no_such") is None
+def test_table_type_checks(connection: SourceMySQLConnection, mysql_config, snapshot_table: str):
+    info = fetch_table_info(connection, mysql_config.database, snapshot_table)
+    assert info is not None
+    assert info.table_type.upper() == "BASE TABLE"
+
+    view_info = fetch_table_info(connection, mysql_config.database, SNAP_VIEW)
+    assert view_info is not None
+    assert view_info.table_type.upper() == "VIEW"
 
     results = check_tables(
         connection,
         mysql_config.database,
         [
-            TableConfig(name=demo_table, mode=TableMode.KEYED, key=["id", "name"]),
-            TableConfig(name=demo_table, mode=TableMode.KEYED, key=["id", "ghost"]),
-            TableConfig(name=demo_table, mode=TableMode.ROW_MULTISET),
+            TableConfig(name=snapshot_table),
+            TableConfig(name=SNAP_VIEW),
+            TableConfig(name="airgap_no_such"),
         ],
     )
-    assert [r.ok for r in results] == [True, False, True]
-    assert results[1].missing_key_columns == ("ghost",)
+    assert [r.ok for r in results] == [True, False, False]
+    assert results[1].error_code == "UNSUPPORTED_TABLE_TYPE"
+    assert results[2].error_code == "TABLE_NOT_FOUND"
 
 
 def test_source_can_read_table_rows(connection: SourceMySQLConnection, demo_table: str):
@@ -151,12 +196,13 @@ def test_source_can_read_table_rows(connection: SourceMySQLConnection, demo_tabl
         f"DELETE FROM {DEMO_TABLE} WHERE id = 1",
         f"INSERT INTO {DEMO_TABLE} (id, name) VALUES (99, 'hacked')",
         f"DROP TABLE {DEMO_TABLE}",
+        "SHOW TABLES",
     ],
 )
 def test_source_rejects_non_select_before_sending(
     connection: SourceMySQLConnection, demo_table: str, sql: str
 ):
-    """应用层只读保护: 修改语句在发送给 MySQL 之前就被拒绝。"""
+    """应用层只读保护: 修改语句与非 SELECT 语句在发送给 MySQL 之前就被拒绝。"""
     with pytest.raises(SourceMySQLError, match="non-read-only SQL"):
         connection.fetch_all(sql)
 
@@ -199,3 +245,94 @@ def test_source_session_is_read_only(
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'airgap_it_should_fail'"
         )
         assert cursor.fetchone()[0] == 0
+
+
+def test_get_create_table_returns_real_ddl(connection: SourceMySQLConnection, snapshot_table: str):
+    ddl = connection.get_create_table(snapshot_table)
+    assert ddl.startswith(f"CREATE TABLE `{snapshot_table}`")
+    assert "`amount` decimal(12,4)" in ddl
+    assert "ENGINE=InnoDB" in ddl
+
+
+def test_snapshot_run_on_real_mysql(
+    mysql_config: MySQLConfig,
+    admin_connection: pymysql.Connection,
+    snapshot_table: str,
+    tmp_path: Path,
+):
+    """端到端: 只读连接对无主键表生成完整 Snapshot Run。
+
+    故意使用: 无 PRIMARY KEY、重复行、NULL、Decimal、datetime(6)、
+    text、binary; 小 fetch_size / 小 chunk 阈值强制多批多 Chunk。
+    """
+    import zstandard
+
+    config = AppConfig.model_validate(
+        {
+            "role": "source",
+            "mysql": mysql_config.model_dump(),
+            "paths": {"data_dir": str(tmp_path / "data")},
+            "snapshot": {"fetch_size": 2},
+            "chunk": {"max_rows": 2, "max_uncompressed_bytes": 4096, "compression_level": 3},
+            "tables": [{"name": snapshot_table, "enabled": True}],
+        }
+    )
+
+    with SourceMySQLConnection(mysql_config) as conn:
+        state = SourceState(state_db_path(config.paths.data_dir))
+        try:
+            state.initialize()
+            result = SnapshotRunner(conn, state, config).snapshot(snapshot_table)
+        finally:
+            state.close()
+
+    assert result.status == "COMPLETED", result.error
+    assert result.row_count == 5
+    assert result.chunk_count == 3  # max_rows=2 → 2+2+1
+
+    # DDL 成功携带
+    schema_text = (result.run_dir / "schema.sql").read_text(encoding="utf-8")
+    assert schema_text.startswith(f"CREATE TABLE `{snapshot_table}`")
+
+    # Manifest 完整且与文件一致
+    manifest = read_manifest(result.run_dir / "manifest.json")
+    assert manifest.row_count == 5
+    assert [c.sequence for c in manifest.chunks] == [1, 2, 3]
+    assert manifest.columns == ["sid", "name", "amount", "ts", "note", "payload"]
+
+    # 解压解码全部行, 与 admin 直读的行 multiset 比较 (顺序无关)
+    dctx = zstandard.ZstdDecompressor()
+    recovered: list[tuple] = []
+    for chunk in manifest.chunks:
+        with open(result.run_dir / chunk.file, "rb") as fh:
+            for line in dctx.stream_reader(fh).read().splitlines():
+                recovered.append(tuple(decode_row(line)))
+    assert len(recovered) == 5
+
+    with admin_connection.cursor() as cursor:
+        cursor.execute(f"SELECT * FROM {SNAP_TABLE}")
+        expected = [tuple(row) for row in cursor.fetchall()]
+    assert sorted(recovered, key=lambda r: encode_row(r)) == sorted(
+        expected, key=lambda r: encode_row(r)
+    )
+    # 重复行没有丢失: (1, 'a', ...) 出现两次
+    duplicates = [row for row in recovered if row[0] == 1]
+    assert len(duplicates) == 2
+
+    # binary / Decimal / datetime 无损
+    binary_row = next(row for row in recovered if row[5] == b"\x00\x01\xff")
+    assert binary_row[2] is not None  # Decimal
+    decimal_row = next(row for row in recovered if row[0] == 3)
+    from decimal import Decimal
+
+    assert decimal_row[2] == Decimal("-0.5000")
+
+    # 状态: current_run_id 已推进
+    state = SourceState(state_db_path(config.paths.data_dir))
+    try:
+        row = state.get_table_state(snapshot_table)
+        assert row is not None
+        assert row.status == "COMPLETED"
+        assert row.current_run_id == result.run_id
+    finally:
+        state.close()

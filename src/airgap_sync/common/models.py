@@ -2,6 +2,9 @@
 
 密码本身不属于配置:配置只记录提供密码的环境变量名
 (mysql.password_env), 密码在连接时从环境变量读取。
+
+V1 统一 Full Snapshot 同步: 表配置只有 name / enabled,
+不存在同步模式与 key 概念。
 """
 
 from __future__ import annotations
@@ -18,13 +21,6 @@ class Role(StrEnum):
 
     SOURCE = "source"
     DESTINATION = "destination"
-
-
-class TableMode(StrEnum):
-    """表同步模式。"""
-
-    KEYED = "keyed"
-    ROW_MULTISET = "row_multiset"
 
 
 class MySQLConfig(BaseModel):
@@ -48,28 +44,49 @@ class PathsConfig(BaseModel):
     data_dir: Path
 
 
+class SnapshotConfig(BaseModel):
+    """全表扫描参数。
+
+    fetch_size 是每次从 server-side cursor 读取的行数,
+    不是协议限制, 只是流式读取的批量大小。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fetch_size: int = Field(default=2000, ge=1, le=1_000_000)
+
+
+class ChunkConfig(BaseModel):
+    """Chunk 切分与压缩参数。
+
+    max_rows / max_uncompressed_bytes 是可配置默认值, 不是协议硬限制;
+    单行本身超过字节阈值时允许生成单行超限 Chunk (不丢数据)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_rows: int = Field(default=50_000, ge=1)
+    max_uncompressed_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    compression_level: int = Field(default=3, ge=1, le=19)
+
+
 class TableConfig(BaseModel):
-    """单张同步表的配置。"""
+    """单张同步表的配置。
+
+    所有表统一 FULL_SNAPSHOT, 不需要主键 / 逻辑键 / 同步模式;
+    旧的 mode / key 字段因 extra=forbid 会明确校验失败。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
-    mode: TableMode
-    key: list[str] | None = None
     enabled: bool = True
 
     @model_validator(mode="after")
-    def validate_key(self) -> Self:
-        if self.mode is not TableMode.KEYED:
-            return self
-        if not self.key:
-            raise ValueError(f"table '{self.name}': mode 'keyed' requires at least one key column")
-        empty = [column for column in self.key if not column.strip()]
-        if empty:
-            raise ValueError(f"table '{self.name}': key column names must not be empty")
-        duplicates = sorted({column for column in self.key if self.key.count(column) > 1})
-        if duplicates:
-            raise ValueError(f"table '{self.name}': duplicate key columns: {', '.join(duplicates)}")
+    def validate_name(self) -> Self:
+        # 表名会进入 MySQL 引用与文件路径 (outbox/<table>), 不允许空白名
+        if not self.name.strip():
+            raise ValueError("table name must not be blank")
         return self
 
 
@@ -81,6 +98,8 @@ class AppConfig(BaseModel):
     role: Role
     mysql: MySQLConfig
     paths: PathsConfig
+    snapshot: SnapshotConfig = SnapshotConfig()
+    chunk: ChunkConfig = ChunkConfig()
     tables: list[TableConfig] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -90,6 +109,10 @@ class AppConfig(BaseModel):
         if duplicates:
             raise ValueError(f"duplicate table names in config: {', '.join(duplicates)}")
         return self
+
+    def table(self, name: str) -> TableConfig | None:
+        """按名称查找表配置; 不存在时返回 None。"""
+        return next((table for table in self.tables if table.name == name), None)
 
     @property
     def enabled_tables(self) -> list[TableConfig]:

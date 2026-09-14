@@ -14,26 +14,30 @@ mysql:
   connect_timeout: 10
 
 paths:
-  # 状态库存放在 <data_dir>/state/ 下。
+  # 状态库存放在 <data_dir>/state/ 下, Snapshot 输出到 <data_dir>/outbox/ 下。
   # Windows 风格路径同样合法, 例如 D:/airgap-sync/data
   data_dir: D:/airgap-sync/data
 
+snapshot:
+  # 每次从 server-side cursor 读取的行数 (流式批量大小, 非协议限制)。
+  fetch_size: 2000
+
+chunk:
+  # Chunk 同时受行数与未压缩字节数限制, 任一达到阈值即封闭;
+  # 单行本身超过字节阈值时允许生成单行超限 Chunk。
+  max_rows: 50000
+  max_uncompressed_bytes: 67108864 # 64 MiB
+  # zstd 压缩级别 (1-19, 默认 3: 速度与压缩比均衡, 不追求极限压缩)。
+  compression_level: 3
+
 tables:
-  # keyed: 有可靠唯一键的表 (数据库主键或已验证的逻辑唯一键, 支持组合键)。
+  # 所有表统一 FULL_SNAPSHOT: 只需要 name 和 enabled。
+  # 不需要配置主键、逻辑键或同步模式。
   - name: std_scjgj_zhgsxt_qyjbxx_all
-    mode: keyed
-    key:
-      - etps_id
     enabled: true
 
-  # keyed 组合键示例。
   - name: dwd_frk_jbxx_djxx_frjbxx
-    mode: keyed
-    key:
-      - zjid
     enabled: true
 
-  # row_multiset: 真正没有可靠唯一键的表, 不需要 key。
   - name: some_legacy_table
-    mode: row_multiset
     enabled: false

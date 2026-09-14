@@ -33,7 +33,7 @@ def config_data(tmp_path: Path) -> dict:
         },
         "paths": {"data_dir": str(tmp_path / "data")},
         "tables": [
-            {"name": "t_keyed", "mode": "keyed", "key": ["id"], "enabled": True},
+            {"name": "t_snapshot", "enabled": True},
         ],
     }
 

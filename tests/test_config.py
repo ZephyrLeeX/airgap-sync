@@ -12,27 +12,17 @@ from conftest import PASSWORD_VALUE
 
 
 class TestValidConfigs:
-    def test_keyed_single_key(self, config_data, write_config, password_env):
+    def test_minimal_table_config(self, config_data, write_config, password_env):
         config = load_config(write_config(config_data))
         assert isinstance(config, AppConfig)
         table = config.tables[0]
-        assert table.name == "t_keyed"
-        assert table.mode.value == "keyed"
-        assert table.key == ["id"]
+        assert table.name == "t_snapshot"
         assert table.enabled is True
 
-    def test_keyed_composite_key(self, config_data, write_config, password_env):
-        config_data["tables"] = [
-            {"name": "t_comp", "mode": "keyed", "key": ["hh", "fyrq"]},
-        ]
+    def test_disabled_table(self, config_data, write_config, password_env):
+        config_data["tables"].append({"name": "t_off", "enabled": False})
         config = load_config(write_config(config_data))
-        assert config.tables[0].key == ["hh", "fyrq"]
-
-    def test_row_multiset_without_key(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_legacy", "mode": "row_multiset"}]
-        config = load_config(write_config(config_data))
-        assert config.tables[0].key is None
-        assert config.tables[0].enabled is True  # 默认值
+        assert [t.name for t in config.enabled_tables] == ["t_snapshot"]
 
     def test_defaults(self, config_data, write_config, password_env):
         del config_data["mysql"]["port"]
@@ -40,34 +30,61 @@ class TestValidConfigs:
         config = load_config(write_config(config_data))
         assert config.mysql.port == 3306
         assert config.mysql.connect_timeout == 10
+        assert config.snapshot.fetch_size == 2000
+        assert config.chunk.max_rows == 50_000
+        assert config.chunk.max_uncompressed_bytes == 64 * 1024 * 1024
+        assert config.chunk.compression_level == 3
+
+    def test_snapshot_and_chunk_overrides(self, config_data, write_config, password_env):
+        config_data["snapshot"] = {"fetch_size": 500}
+        config_data["chunk"] = {
+            "max_rows": 1000,
+            "max_uncompressed_bytes": 1048576,
+            "compression_level": 7,
+        }
+        config = load_config(write_config(config_data))
+        assert config.snapshot.fetch_size == 500
+        assert config.chunk.max_rows == 1000
+        assert config.chunk.max_uncompressed_bytes == 1048576
+        assert config.chunk.compression_level == 7
 
     def test_windows_style_data_dir(self, config_data, write_config, password_env):
         config_data["paths"]["data_dir"] = "D:/airgap-sync/data"
         config = load_config(write_config(config_data))
         assert config.paths.data_dir == Path("D:/airgap-sync/data")
 
-    def test_enabled_tables_property(self, config_data, write_config, password_env):
-        config_data["tables"].append({"name": "t_off", "mode": "row_multiset", "enabled": False})
+    def test_lookup_table(self, config_data, write_config, password_env):
         config = load_config(write_config(config_data))
-        assert [t.name for t in config.enabled_tables] == ["t_keyed"]
+        assert config.table("t_snapshot") is not None
+        assert config.table("nope") is None
 
 
-class TestInvalidConfigs:
-    def test_keyed_with_empty_key_list(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "keyed", "key": []}]
-        with pytest.raises(ConfigError, match="keyed.*requires at least one key column"):
-            load_config(write_config(config_data))
+class TestLegacyDiffConfigRejected:
+    """旧的 keyed / row_multiset 增量配置必须明确失败, 避免用户误以为仍然有效。"""
 
-    def test_keyed_without_key(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "keyed"}]
-        with pytest.raises(ConfigError, match="requires at least one key column"):
-            load_config(write_config(config_data))
-
-    def test_unknown_mode(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "primary", "key": ["id"]}]
+    def test_mode_field_rejected(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "t_old", "mode": "keyed"}]
         with pytest.raises(ConfigError, match="tables.0.mode"):
             load_config(write_config(config_data))
 
+    def test_key_field_rejected(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "t_old", "key": ["id"]}]
+        with pytest.raises(ConfigError, match="tables.0.key"):
+            load_config(write_config(config_data))
+
+    def test_row_multiset_mode_rejected(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "t_old", "mode": "row_multiset"}]
+        with pytest.raises(ConfigError, match="tables.0.mode"):
+            load_config(write_config(config_data))
+
+    def test_error_mentions_extra_field_not_allowed(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "t_old", "mode": "keyed", "key": ["id"]}]
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(write_config(config_data))
+        assert "Extra inputs" in str(excinfo.value) or "extra" in str(excinfo.value).lower()
+
+
+class TestInvalidConfigs:
     @pytest.mark.parametrize(
         "mutation",
         [
@@ -99,7 +116,7 @@ class TestInvalidConfigs:
             load_config(write_config(config_data))
 
     def test_duplicate_table_names(self, config_data, write_config, password_env):
-        config_data["tables"].append({"name": "t_keyed", "mode": "row_multiset"})
+        config_data["tables"].append({"name": "t_snapshot"})
         with pytest.raises(ConfigError, match="duplicate table names"):
             load_config(write_config(config_data))
 
@@ -108,33 +125,48 @@ class TestInvalidConfigs:
         with pytest.raises(ConfigError, match="redis"):
             load_config(write_config(config_data))
 
-    def test_keyed_with_blank_column_name(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "keyed", "key": ["  "]}]
-        with pytest.raises(ConfigError, match="must not be empty"):
+    def test_blank_table_name(self, config_data, write_config, password_env):
+        config_data["tables"] = [{"name": "  "}]
+        with pytest.raises(ConfigError, match="tables.0.*blank"):
             load_config(write_config(config_data))
 
-    def test_keyed_with_duplicate_key_columns(self, config_data, write_config, password_env):
-        config_data["tables"] = [{"name": "t_bad", "mode": "keyed", "key": ["id", "id"]}]
-        with pytest.raises(ConfigError, match="duplicate key columns"):
-            load_config(write_config(config_data))
-
-    def test_keyed_composite_key_duplicate_reported_with_column_name(
-        self, config_data, write_config, password_env
+    @pytest.mark.parametrize(
+        "snapshot_mutation",
+        [
+            lambda d: d.update(snapshot={"fetch_size": 0}),
+            lambda d: d.update(snapshot={"fetch_size": -1}),
+            lambda d: d.update(snapshot={"batch": 100}),
+        ],
+        ids=["fetch-size-zero", "fetch-size-negative", "snapshot-unknown-field"],
+    )
+    def test_invalid_snapshot_config(
+        self, config_data, write_config, password_env, snapshot_mutation
     ):
-        config_data["tables"] = [
-            {"name": "t_bad", "mode": "keyed", "key": ["hh", "fyrq", "hh"]},
-        ]
-        with pytest.raises(ConfigError) as excinfo:
+        snapshot_mutation(config_data)
+        with pytest.raises(ConfigError):
             load_config(write_config(config_data))
-        assert "duplicate key columns" in str(excinfo.value)
-        assert "hh" in str(excinfo.value)
 
-    def test_distinct_composite_key_columns_allowed(self, config_data, write_config, password_env):
-        config_data["tables"] = [
-            {"name": "t_ok", "mode": "keyed", "key": ["hh", "fyrq"]},
-        ]
-        config = load_config(write_config(config_data))
-        assert config.tables[0].key == ["hh", "fyrq"]
+    @pytest.mark.parametrize(
+        "chunk_mutation",
+        [
+            lambda d: d.update(chunk={"max_rows": 0}),
+            lambda d: d.update(chunk={"max_uncompressed_bytes": 0}),
+            lambda d: d.update(chunk={"compression_level": 0}),
+            lambda d: d.update(chunk={"compression_level": 20}),
+            lambda d: d.update(chunk={"level": 3}),
+        ],
+        ids=[
+            "max-rows-zero",
+            "max-bytes-zero",
+            "level-too-low",
+            "level-too-high",
+            "chunk-unknown-field",
+        ],
+    )
+    def test_invalid_chunk_config(self, config_data, write_config, password_env, chunk_mutation):
+        chunk_mutation(config_data)
+        with pytest.raises(ConfigError):
+            load_config(write_config(config_data))
 
 
 class TestConfigFileErrors:

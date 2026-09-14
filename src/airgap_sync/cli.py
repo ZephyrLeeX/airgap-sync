@@ -19,11 +19,14 @@ from airgap_sync.source.mysql import (
     TableCheckResult,
     check_tables,
 )
+from airgap_sync.source.snapshot import SnapshotError, SnapshotResult, SnapshotRunner
 from airgap_sync.source.state import SourceState, StateError, state_db_path
 
 logger = logging.getLogger(__name__)
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+_SIZE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
 
 
 @click.group()
@@ -83,7 +86,7 @@ def source_group() -> None:
 def source_check(config_path: Path) -> None:
     """检查配置、MySQL 连接、SQLite 状态库和同步表元数据。
 
-    不做全表扫描, 也不检查 key 是否真正唯一 (属于后续任务)。
+    表级检查只验证表存在且为 BASE TABLE, 不做全表扫描。
     """
     config = load_config(config_path)
     _require_source_role(config)
@@ -111,10 +114,44 @@ def source_check(config_path: Path) -> None:
         sys.exit(1)
 
 
+@source_group.command("snapshot")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="YAML 配置文件路径。",
+)
+@click.option("--table", "table_name", required=True, help="要生成 Snapshot 的表名。")
+def source_snapshot(config_path: Path, table_name: str) -> None:
+    """生成一张表的完整 Full Snapshot Run。
+
+    单条流式 SELECT * 全表扫描 → JSONL + zstd 分 Chunk →
+    schema.sql + manifest.json, 输出到 <data_dir>/outbox/<table>/<run_id>/。
+    """
+    config = load_config(config_path)
+    _require_source_role(config)
+    resolve_password(config.mysql)
+
+    with SourceMySQLConnection(config.mysql) as connection:
+        state = SourceState(state_db_path(config.paths.data_dir))
+        try:
+            state.initialize()
+            runner = SnapshotRunner(connection, state, config)
+            result = runner.snapshot(table_name)
+        finally:
+            state.close()
+
+    _print_snapshot_result(result)
+    if result.status != "COMPLETED":
+        click.echo(f"ERROR: snapshot failed: {result.error}", err=True)
+        sys.exit(1)
+
+
 def _require_source_role(config: AppConfig) -> None:
     if config.role is not Role.SOURCE:
         raise ConfigError(
-            f"'source check' requires role=source, but config has role={config.role.value}"
+            f"'source' commands require role=source, but config has role={config.role.value}"
         )
 
 
@@ -127,22 +164,42 @@ def _print_table_report(
     for table in config.tables:
         label = f"{table.name:<24}"
         if not table.enabled:
-            click.echo(f"{label}SKIP mode={table.mode.value} (disabled)")
+            click.echo(f"{label}SKIP (disabled)")
             continue
         result = result_by_name[table.name]
         if result.ok:
-            state.register_table(table.name, table.mode.value)
-            key_part = f" key={'+'.join(table.key)}" if table.key else ""
-            click.echo(f"{label}OK   mode={table.mode.value}{key_part}")
+            state.register_table(table.name)
+            click.echo(f"{label}OK")
         else:
             click.echo(f"{label}FAIL {_failure_detail(result)}")
 
 
 def _failure_detail(result: TableCheckResult) -> str:
-    if result.error_code == "TABLE_NOT_FOUND":
-        return "TABLE_NOT_FOUND"
-    missing = ", ".join(result.missing_key_columns)
-    return f"{result.error_code} missing key column(s): {missing}"
+    if result.error_code == "UNSUPPORTED_TABLE_TYPE":
+        return f"UNSUPPORTED_TABLE_TYPE ({result.table_type})"
+    return result.error_code or "UNKNOWN"
+
+
+def _print_snapshot_result(result: SnapshotResult) -> None:
+    """输出 Run 摘要 (不输出任何业务数据)。"""
+    click.echo(f"Table           {result.table}")
+    click.echo(f"Run             {result.run_id}")
+    click.echo(f"Rows            {result.row_count:,}")
+    click.echo(f"Chunks          {result.chunk_count}")
+    click.echo(f"Raw size        {_format_size(result.raw_bytes)}")
+    click.echo(f"Compressed      {_format_size(result.compressed_bytes)}")
+    click.echo(f"Status          {result.status}")
+    click.echo(f"Output          {result.run_dir}")
+
+
+def _format_size(size: int) -> str:
+    """字节数的人类可读表达 (二进制单位)。"""
+    value = float(size)
+    for unit in _SIZE_UNITS:
+        if value < 1024 or unit == _SIZE_UNITS[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"  # pragma: no cover - 循环必在 TiB 内返回
 
 
 def main() -> None:
@@ -157,7 +214,7 @@ def main() -> None:
     except click.Abort:
         click.echo("Aborted.", err=True)
         sys.exit(130)
-    except (ConfigError, SourceMySQLError, StateError) as exc:
+    except (ConfigError, SourceMySQLError, StateError, SnapshotError) as exc:
         click.echo(f"ERROR: {exc}", err=True)
         sys.exit(1)
 
