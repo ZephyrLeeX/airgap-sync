@@ -1,0 +1,39 @@
+# Airgap Sync 配置示例。
+#
+# 数据库密码不要写进本文件:
+# 通过 mysql.password_env 指定的环境变量提供真实密码。
+
+role: source
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  database: sgaj_data
+  user: sgaj_sync
+  password_env: AIRGAP_SYNC_MYSQL_PASSWORD
+  connect_timeout: 10
+
+paths:
+  # 状态库存放在 <data_dir>/state/ 下。
+  # Windows 风格路径同样合法, 例如 D:/airgap-sync/data
+  data_dir: D:/airgap-sync/data
+
+tables:
+  # keyed: 有可靠唯一键的表 (数据库主键或已验证的逻辑唯一键, 支持组合键)。
+  - name: std_scjgj_zhgsxt_qyjbxx_all
+    mode: keyed
+    key:
+      - etps_id
+    enabled: true
+
+  # keyed 组合键示例。
+  - name: dwd_frk_jbxx_djxx_frjbxx
+    mode: keyed
+    key:
+      - zjid
+    enabled: true
+
+  # row_multiset: 真正没有可靠唯一键的表, 不需要 key。
+  - name: some_legacy_table
+    mode: row_multiset
+    enabled: false
