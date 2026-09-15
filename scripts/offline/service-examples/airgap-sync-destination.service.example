@@ -1,0 +1,28 @@
+# Example systemd unit for the Airgap Sync Destination worker.
+#
+# Install (as root):
+#   cp airgap-sync-destination.service.example /etc/systemd/system/airgap-sync-destination.service
+#   systemctl daemon-reload
+#   systemctl enable --now airgap-sync-destination
+#
+# The unit always points at /opt/airgap-sync/current, so upgrades only switch
+# the "current" symlink; the unit file never needs editing. The incoming
+# directory is owned by the external FTP client and is never touched here.
+
+[Unit]
+Description=Airgap Sync destination worker
+After=network-online.target mysqld.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The MySQL password is provided through the environment variable named by
+# mysql.password_env in the YAML config; use an EnvironmentFile to supply it.
+# EnvironmentFile=/etc/airgap-sync/destination.env
+ExecStart=/opt/airgap-sync/current/venv/bin/airgap-sync destination worker --config /etc/airgap-sync/destination.yaml
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

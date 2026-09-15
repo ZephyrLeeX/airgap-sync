@@ -1,0 +1,29 @@
+# Example systemd unit for the Airgap Sync Source worker.
+#
+# Install (as root):
+#   cp airgap-sync-source.service.example /etc/systemd/system/airgap-sync-source.service
+#   systemctl daemon-reload
+#   systemctl enable --now airgap-sync-source
+#
+# The unit always points at /opt/airgap-sync/current, so upgrades only switch
+# the "current" symlink; the unit file never needs editing. Adjust
+# --install-root if you deployed elsewhere.
+
+[Unit]
+Description=Airgap Sync source worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The MySQL password is provided through the environment variable named by
+# mysql.password_env in the YAML config; use an EnvironmentFile to supply it.
+# EnvironmentFile=/etc/airgap-sync/source.env
+ExecStart=/opt/airgap-sync/current/venv/bin/airgap-sync source worker --config /etc/airgap-sync/source.yaml
+Restart=on-failure
+RestartSec=30
+# Source writes state/outbox under paths.data_dir from the YAML config.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

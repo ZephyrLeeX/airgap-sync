@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+
+# scripts/offline 下的共享 helper (release_manifest / build_release) 按顶层模块导入。
+OFFLINE_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "offline"
+if str(OFFLINE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(OFFLINE_SCRIPTS_DIR))
 
 PASSWORD_ENV = "AIRGAP_TEST_PASSWORD"
 PASSWORD_VALUE = "test-secret-password"

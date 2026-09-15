@@ -1,0 +1,15 @@
+{
+  "python": "3.13.15",
+  "windows": {
+    "installer": "python-3.13.15-amd64.exe",
+    "url": "https://www.python.org/ftp/python/3.13.15/python-3.13.15-amd64.exe",
+    "sha256": null
+  },
+  "linux_x86_64": {
+    "pbs_release": "20260901",
+    "artifact": "cpython-3.13.15+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.13.15+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+    "sha256sums_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/SHA256SUMS",
+    "sha256": "8a689a077337bea6d1c4bc0b7df1d52fcaa28f5f67e50df8bf417c1e3f9d8874"
+  }
+}

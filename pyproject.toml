@@ -46,4 +46,4 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["airgap_sync"]
+known-first-party = ["airgap_sync", "release_manifest", "build_release"]
