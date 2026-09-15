@@ -1,28 +1,4 @@
-"""Source 本地 SQLite 状态库。
-
-状态库位于 <data_dir>/state/meta.db。首次使用时自动创建目录、
-数据库和 schema; 初始化是幂等的, 重复运行不会报错。
-
-状态库只保存控制信息: 表状态 / Run 状态 (后续阶段还有上传状态)。
-不保存业务行数据或行 Hash 状态 —— V1 的 Full Snapshot 不依赖
-任何业务数据指纹, 这部分设计已随增量方案一并删除。
-
-schema v2 (相对 v1 删除了失去意义的 table_state.mode 列):
-
-    CREATE TABLE table_state (
-        table_name      TEXT PRIMARY KEY,
-        current_run_id  TEXT,     -- 最近成功生成的完整 Snapshot Run
-        status          TEXT NOT NULL,
-        last_run_id     TEXT,     -- 最近一次尝试的 Run (含失败)
-        last_error      TEXT,
-        created_at      TEXT NOT NULL,
-        updated_at      TEXT NOT NULL
-    );
-
-current_run_id 的语义是 "Source 最近成功生成的完整 Snapshot Run",
-不代表目标端已经同步 —— 严格单向网络下 Source 永远无法知道
-目标 Apply 状态。
-"""
+"""Source SQLite schema v3：表、Run 与 artifact 传输状态。"""
 
 from __future__ import annotations
 
@@ -34,26 +10,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-SCHEMA_VERSION = 2
-
+SCHEMA_VERSION = 3
 STATE_DIR_NAME = "state"
 STATE_DB_NAME = "meta.db"
-
-_TABLE_STATE_COLUMNS = (
-    "table_name, current_run_id, status, last_run_id, last_error, created_at, updated_at"
-)
-
-_CREATE_TABLE_STATE_SQL = (
-    "CREATE TABLE table_state ("
-    "    table_name      TEXT PRIMARY KEY,"
-    "    current_run_id  TEXT,"
-    "    status          TEXT NOT NULL,"
-    "    last_run_id     TEXT,"
-    "    last_error      TEXT,"
-    "    created_at      TEXT NOT NULL,"
-    "    updated_at      TEXT NOT NULL"
-    ")"
-)
 
 
 class StateError(Exception):
@@ -61,16 +20,39 @@ class StateError(Exception):
 
 
 class TableStatus(StrEnum):
-    """table_state.status 的取值。"""
-
     IDLE = "IDLE"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+    DISK_PRESSURE = "DISK_PRESSURE"
+
+
+class RunStatus(StrEnum):
+    GENERATING = "GENERATING"
+    UPLOADING = "UPLOADING"
+    FINALIZING = "FINALIZING"
+    SNAPSHOT_READY = "SNAPSHOT_READY"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+    DISK_PRESSURE = "DISK_PRESSURE"
+
+
+class UploadStatus(StrEnum):
+    PENDING = "PENDING"
+    UPLOADING = "UPLOADING"
+    UPLOADED = "UPLOADED"
     FAILED = "FAILED"
 
 
+_ACTIVE_RUN_STATUSES = (
+    RunStatus.GENERATING.value,
+    RunStatus.UPLOADING.value,
+    RunStatus.FINALIZING.value,
+)
+
+
 def state_db_path(data_dir: Path) -> Path:
-    """状态库文件路径: <data_dir>/state/meta.db。"""
     return data_dir / STATE_DIR_NAME / STATE_DB_NAME
 
 
@@ -80,179 +62,369 @@ def _utcnow_iso() -> str:
 
 @dataclass(frozen=True)
 class TableState:
-    """table_state 表中的一行。"""
-
     table_name: str
-    current_run_id: str | None
+    last_snapshot_run_id: str | None
+    last_delivered_run_id: str | None
     status: str
     last_run_id: str | None
     last_error: str | None
     created_at: str
     updated_at: str
 
+    @property
+    def current_run_id(self) -> str | None:
+        """Python API 兼容别名；持久化 schema 只保留明确的新字段。"""
+        return self.last_snapshot_run_id
+
+
+@dataclass(frozen=True)
+class SyncRun:
+    run_id: str
+    table_name: str
+    status: str
+    created_at: str
+    snapshot_completed_at: str | None
+    delivered_at: str | None
+    row_count: int | None
+    chunk_count: int | None
+    raw_bytes: int | None
+    compressed_bytes: int | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class RunArtifact:
+    run_id: str
+    kind: str
+    sequence: int | None
+    logical_name: str
+    transport_name: str
+    size: int
+    sha256: str
+    upload_status: str
+    attempts: int
+    request_id: str | None
+    last_error: str | None
+    uploaded_at: str | None
+    cleanup_error: str | None
+    created_at: str
+
+
+_CREATE_TABLE_STATE = """
+CREATE TABLE table_state (
+    table_name TEXT PRIMARY KEY,
+    last_snapshot_run_id TEXT,
+    last_delivered_run_id TEXT,
+    status TEXT NOT NULL,
+    last_run_id TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)"""
+_CREATE_SYNC_RUNS = """
+CREATE TABLE sync_runs (
+    run_id TEXT PRIMARY KEY,
+    table_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    snapshot_completed_at TEXT,
+    delivered_at TEXT,
+    row_count INTEGER,
+    chunk_count INTEGER,
+    raw_bytes INTEGER,
+    compressed_bytes INTEGER,
+    last_error TEXT
+)"""
+_CREATE_ARTIFACTS = """
+CREATE TABLE run_artifacts (
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    sequence INTEGER,
+    logical_name TEXT NOT NULL,
+    transport_name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    upload_status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    request_id TEXT,
+    last_error TEXT,
+    uploaded_at TEXT,
+    cleanup_error TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, logical_name),
+    UNIQUE (transport_name)
+)"""
+
 
 class SourceState:
-    """Source 状态库句柄。"""
-
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(db_path, isolation_level=None)
+            self._conn = sqlite3.connect(db_path, isolation_level=None, timeout=30)
             self._conn.row_factory = sqlite3.Row
         except (OSError, sqlite3.Error) as exc:
             raise StateError(f"cannot open state database at {db_path}: {exc}") from exc
 
     def initialize(self) -> None:
-        """创建或迁移 schema (在单个事务内执行, 幂等)。
-
-        - 全新数据库: 创建 v2 schema;
-        - v1 开发期状态库 (table_state 含 mode 列): 简单迁移到 v2 ——
-          重建 table_state (mode 列删除, 控制信息重新开始)。
-          项目尚未生产运行, 不做通用 migration framework;
-        - 其他版本: 明确报错, 不静默产生错误 schema。
-        """
         try:
             with self._transaction():
                 self._conn.execute(
-                    "CREATE TABLE IF NOT EXISTS schema_version (    version INTEGER NOT NULL)"
+                    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
                 )
                 row = self._conn.execute("SELECT version FROM schema_version").fetchone()
                 if row is None:
-                    self._conn.execute(_CREATE_TABLE_STATE_SQL)
-                    self._conn.execute(
-                        "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+                    self._create_v3()
+                    self._conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+                    return
+                version = int(row["version"])
+                if version == 2:
+                    self._migrate_v2_to_v3()
+                elif version == 1:
+                    self._conn.execute("DROP TABLE IF EXISTS table_state")
+                    self._create_v3()
+                    self._conn.execute("UPDATE schema_version SET version = 3")
+                elif version != SCHEMA_VERSION:
+                    raise StateError(
+                        f"state database {self.db_path} has schema version {version}, "
+                        f"but this program expects {SCHEMA_VERSION}"
                     )
                 else:
-                    version = int(row["version"])
-                    self._check_version(version)
-                    if version == 1:
-                        self._migrate_v1_to_v2()
+                    self._create_v3(if_not_exists=True)
         except sqlite3.Error as exc:
             raise StateError(f"failed to initialize state database {self.db_path}: {exc}") from exc
 
-    def _migrate_v1_to_v2(self) -> None:
-        """v1 → v2: 丢弃含 mode 列的旧 table_state, 重建 v2 结构。
+    def _create_v3(self, *, if_not_exists: bool = False) -> None:
+        suffix = " IF NOT EXISTS" if if_not_exists else ""
+        for sql in (_CREATE_TABLE_STATE, _CREATE_SYNC_RUNS, _CREATE_ARTIFACTS):
+            self._conn.execute(sql.replace("CREATE TABLE ", f"CREATE TABLE{suffix} ", 1))
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_runs_table_status ON sync_runs(table_name, status)"
+        )
 
-        旧状态只含开发期的 mode / run 标记, 直接重建;
-        迁移与版本号更新在同一个事务内完成。
-        """
-        self._conn.execute("DROP TABLE IF EXISTS table_state")
-        self._conn.execute(_CREATE_TABLE_STATE_SQL)
-        self._conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
-
-    def _check_version(self, version: int) -> None:
-        if version != SCHEMA_VERSION and version != 1:
-            raise StateError(
-                f"state database {self.db_path} has schema version {version}, "
-                f"but this program expects {SCHEMA_VERSION}"
-            )
+    def _migrate_v2_to_v3(self) -> None:
+        self._conn.execute("ALTER TABLE table_state RENAME TO table_state_v2")
+        self._create_v3()
+        self._conn.execute(
+            "INSERT INTO table_state "
+            "(table_name,last_snapshot_run_id,last_delivered_run_id,status,last_run_id,"
+            "last_error,created_at,updated_at) "
+            "SELECT table_name,current_run_id,NULL,status,last_run_id,last_error,"
+            "created_at,updated_at "
+            "FROM table_state_v2"
+        )
+        self._conn.execute("DROP TABLE table_state_v2")
+        self._conn.execute("UPDATE schema_version SET version = 3")
 
     def schema_version(self) -> int:
-        """返回当前状态库 schema 版本。"""
         try:
             row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         except sqlite3.Error as exc:
             raise StateError(f"state database {self.db_path} is not initialized: {exc}") from exc
         if row is None:
-            raise StateError(
-                f"state database {self.db_path} is not initialized; call initialize() first"
-            )
+            raise StateError(f"state database {self.db_path} is not initialized")
         return int(row["version"])
 
     def register_table(self, table_name: str) -> None:
-        """登记同步表 (幂等)。
-
-        新表: current_run_id = NULL, status = 'IDLE';
-        已登记: 只更新 updated_at, 不重置任何运行状态。
-        """
         now = _utcnow_iso()
-        try:
-            with self._transaction():
-                self._conn.execute(
-                    f"INSERT INTO table_state ({_TABLE_STATE_COLUMNS})"
-                    " VALUES (?, NULL, 'IDLE', NULL, NULL, ?, ?)"
-                    " ON CONFLICT(table_name) DO UPDATE SET"
-                    "     updated_at = excluded.updated_at",
-                    (table_name, now, now),
-                )
-        except sqlite3.Error as exc:
-            raise StateError(
-                f"failed to register table '{table_name}' in {self.db_path}: {exc}"
-            ) from exc
-
-    def _update_run(self, table_name: str, run_id: str, assignments: dict[str, str | None]) -> None:
-        """通用 Run 状态更新; 表未登记时明确报错。"""
-        set_columns = ", ".join(f"{column} = ?" for column in assignments)
-        sql = (
-            "UPDATE table_state SET"
-            f"    {set_columns},"
-            "     last_run_id = ?,"
-            "     updated_at = ?"
-            " WHERE table_name = ?"
+        self._execute(
+            "INSERT INTO table_state VALUES (?,NULL,NULL,'IDLE',NULL,NULL,?,?) "
+            "ON CONFLICT(table_name) DO UPDATE SET updated_at=excluded.updated_at",
+            (table_name, now, now),
         )
-        params = (*assignments.values(), run_id, _utcnow_iso(), table_name)
-        try:
-            with self._transaction():
-                cursor = self._conn.execute(sql, params)
-                if cursor.rowcount == 0:
-                    raise StateError(
-                        f"table '{table_name}' is not registered in {self.db_path}; "
-                        "call register_table() first"
-                    )
-        except sqlite3.Error as exc:
-            raise StateError(
-                f"failed to update run state for '{table_name}' in {self.db_path}: {exc}"
-            ) from exc
 
     def begin_run(self, table_name: str, run_id: str) -> None:
-        """Run 开始: status = RUNNING, 清除上次错误。
+        now = _utcnow_iso()
+        with self._transaction():
+            active = self._conn.execute(
+                "SELECT run_id FROM sync_runs WHERE table_name=? AND status IN (?,?,?) LIMIT 1",
+                (table_name, *_ACTIVE_RUN_STATUSES),
+            ).fetchone()
+            if active is not None:
+                raise StateError(f"table '{table_name}' already has active run {active['run_id']}")
+            cursor = self._conn.execute(
+                "UPDATE table_state SET status=?,last_run_id=?,last_error=NULL,updated_at=? "
+                "WHERE table_name=?",
+                (TableStatus.RUNNING.value, run_id, now, table_name),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"table '{table_name}' is not registered")
+            self._conn.execute(
+                "INSERT INTO sync_runs (run_id,table_name,status,created_at) VALUES (?,?,?,?)",
+                (run_id, table_name, RunStatus.GENERATING.value, now),
+            )
 
-        current_run_id 不变 —— 只有 complete_run 才能推进它。
-        """
-        self._update_run(table_name, run_id, {"status": TableStatus.RUNNING, "last_error": None})
+    def set_run_status(self, run_id: str, status: RunStatus) -> None:
+        self._execute("UPDATE sync_runs SET status=? WHERE run_id=?", (status.value, run_id))
 
-    def complete_run(self, table_name: str, run_id: str) -> None:
-        """Run 成功: status = COMPLETED, current_run_id = run_id。"""
-        self._update_run(
-            table_name,
-            run_id,
-            {"status": TableStatus.COMPLETED, "current_run_id": run_id, "last_error": None},
+    def complete_run(
+        self,
+        table_name: str,
+        run_id: str,
+        *,
+        row_count: int | None = None,
+        chunk_count: int | None = None,
+        raw_bytes: int | None = None,
+        compressed_bytes: int | None = None,
+    ) -> None:
+        now = _utcnow_iso()
+        with self._transaction():
+            cursor = self._conn.execute(
+                "UPDATE sync_runs SET status=?,snapshot_completed_at=?,row_count=?,chunk_count=?,"
+                "raw_bytes=?,compressed_bytes=?,last_error=NULL WHERE run_id=?",
+                (
+                    RunStatus.SNAPSHOT_READY.value,
+                    now,
+                    row_count,
+                    chunk_count,
+                    raw_bytes,
+                    compressed_bytes,
+                    run_id,
+                ),
+            )
+            table_cursor = self._conn.execute(
+                "UPDATE table_state SET status=?,last_snapshot_run_id=?,last_run_id=?,"
+                "last_error=NULL,updated_at=? WHERE table_name=?",
+                (TableStatus.COMPLETED.value, run_id, run_id, now, table_name),
+            )
+            if cursor.rowcount == 0 or table_cursor.rowcount == 0:
+                raise StateError(f"table '{table_name}' is not registered")
+
+    def deliver_run(
+        self,
+        table_name: str,
+        run_id: str,
+        *,
+        row_count: int,
+        chunk_count: int,
+        raw_bytes: int,
+        compressed_bytes: int,
+    ) -> None:
+        now = _utcnow_iso()
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE sync_runs SET status=?,"
+                "snapshot_completed_at=COALESCE(snapshot_completed_at,?),"
+                "delivered_at=?,row_count=?,chunk_count=?,raw_bytes=?,compressed_bytes=?,"
+                "last_error=NULL WHERE run_id=?",
+                (
+                    RunStatus.DELIVERED.value,
+                    now,
+                    now,
+                    row_count,
+                    chunk_count,
+                    raw_bytes,
+                    compressed_bytes,
+                    run_id,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE table_state SET status=?,last_snapshot_run_id=?,last_delivered_run_id=?,"
+                "last_run_id=?,last_error=NULL,updated_at=? WHERE table_name=?",
+                (TableStatus.DELIVERED.value, run_id, run_id, run_id, now, table_name),
+            )
+
+    def fail_run(self, table_name: str, run_id: str, error: str, *, disk_pressure=False) -> None:
+        run_status = RunStatus.DISK_PRESSURE if disk_pressure else RunStatus.FAILED
+        table_status = TableStatus.DISK_PRESSURE if disk_pressure else TableStatus.FAILED
+        now = _utcnow_iso()
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE sync_runs SET status=?,last_error=? WHERE run_id=?",
+                (run_status.value, error, run_id),
+            )
+            cursor = self._conn.execute(
+                "UPDATE table_state SET status=?,last_run_id=?,last_error=?,updated_at=? "
+                "WHERE table_name=?",
+                (table_status.value, run_id, error, now, table_name),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"table '{table_name}' is not registered")
+
+    def register_artifact(
+        self,
+        run_id: str,
+        kind: str,
+        sequence: int | None,
+        logical_name: str,
+        transport_name: str,
+        size: int,
+        sha256: str,
+    ) -> None:
+        self._execute(
+            "INSERT INTO run_artifacts "
+            "(run_id,kind,sequence,logical_name,transport_name,size,sha256,"
+            "upload_status,created_at) "
+            "VALUES (?,?,?,?,?,?,?,'PENDING',?)",
+            (run_id, kind, sequence, logical_name, transport_name, size, sha256, _utcnow_iso()),
         )
 
-    def fail_run(self, table_name: str, run_id: str, error: str) -> None:
-        """Run 失败: status = FAILED, 记录错误。
+    def mark_upload_attempt(self, run_id: str, logical_name: str, attempt: int) -> None:
+        self._execute(
+            "UPDATE run_artifacts SET upload_status='UPLOADING',attempts=? "
+            "WHERE run_id=? AND logical_name=?",
+            (attempt, run_id, logical_name),
+        )
 
-        current_run_id 不变 —— 失败的 Run 不能成为 current。
-        """
-        self._update_run(table_name, run_id, {"status": TableStatus.FAILED, "last_error": error})
+    def mark_uploaded(self, run_id: str, logical_name: str, attempts: int, request_id: str) -> None:
+        self._execute(
+            "UPDATE run_artifacts SET upload_status='UPLOADED',attempts=?,request_id=?,"
+            "last_error=NULL,uploaded_at=? WHERE run_id=? AND logical_name=?",
+            (attempts, request_id, _utcnow_iso(), run_id, logical_name),
+        )
+
+    def mark_artifact_failed(
+        self, run_id: str, logical_name: str, attempts: int, error: str
+    ) -> None:
+        self._execute(
+            "UPDATE run_artifacts SET upload_status='FAILED',attempts=?,last_error=? "
+            "WHERE run_id=? AND logical_name=?",
+            (attempts, error, run_id, logical_name),
+        )
+
+    def mark_cleanup_error(self, run_id: str, logical_name: str, error: str | None) -> None:
+        self._execute(
+            "UPDATE run_artifacts SET cleanup_error=? WHERE run_id=? AND logical_name=?",
+            (error, run_id, logical_name),
+        )
 
     def get_table_state(self, table_name: str) -> TableState | None:
-        """读取指定表的同步状态; 未登记时返回 None。"""
+        row = self._fetchone("SELECT * FROM table_state WHERE table_name=?", (table_name,))
+        return TableState(**dict(row)) if row is not None else None
+
+    def get_run(self, run_id: str) -> SyncRun | None:
+        row = self._fetchone("SELECT * FROM sync_runs WHERE run_id=?", (run_id,))
+        return SyncRun(**dict(row)) if row is not None else None
+
+    def get_artifacts(self, run_id: str) -> list[RunArtifact]:
         try:
-            row = self._conn.execute(
-                f"SELECT {_TABLE_STATE_COLUMNS} FROM table_state WHERE table_name = ?",
-                (table_name,),
-            ).fetchone()
+            rows = self._conn.execute(
+                "SELECT * FROM run_artifacts WHERE run_id=? ORDER BY "
+                "CASE kind WHEN 'chunk' THEN 1 WHEN 'schema' THEN 2 ELSE 3 END, sequence",
+                (run_id,),
+            ).fetchall()
         except sqlite3.Error as exc:
-            raise StateError(
-                f"failed to read table_state for '{table_name}' from {self.db_path}: {exc}"
-            ) from exc
-        if row is None:
-            return None
-        return TableState(
-            table_name=row["table_name"],
-            current_run_id=row["current_run_id"],
-            status=row["status"],
-            last_run_id=row["last_run_id"],
-            last_error=row["last_error"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+            raise StateError(f"failed to read artifacts: {exc}") from exc
+        return [RunArtifact(**dict(row)) for row in rows]
+
+    def _execute(self, sql: str, params: tuple[object, ...]) -> None:
+        try:
+            with self._transaction():
+                self._conn.execute(sql, params)
+        except sqlite3.Error as exc:
+            raise StateError(f"state database operation failed: {exc}") from exc
+
+    def _fetchone(self, sql: str, params: tuple[object, ...]) -> sqlite3.Row | None:
+        try:
+            return self._conn.execute(sql, params).fetchone()
+        except sqlite3.Error as exc:
+            raise StateError(f"state database query failed: {exc}") from exc
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        self._conn.execute("BEGIN")
+        # 先取得写锁，使跨进程同表 begin_run 串行检查，而不是两个 DEFERRED
+        # transaction 同时观察到“无 active run”。
+        self._conn.execute("BEGIN IMMEDIATE")
         try:
             yield
         except BaseException:

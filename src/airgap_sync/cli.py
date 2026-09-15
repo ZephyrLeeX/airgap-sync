@@ -10,9 +10,15 @@ import click
 from click.exceptions import Exit as ClickExit
 
 from airgap_sync import __version__
-from airgap_sync.common.config import ConfigError, load_config, resolve_password
+from airgap_sync.common.config import (
+    ConfigError,
+    load_config,
+    resolve_password,
+    resolve_relay_token,
+)
 from airgap_sync.common.logging import setup_logging
 from airgap_sync.common.models import AppConfig, Role
+from airgap_sync.source.delivery import DeliveryRunner
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
     SourceMySQLError,
@@ -21,6 +27,7 @@ from airgap_sync.source.mysql import (
 )
 from airgap_sync.source.snapshot import SnapshotError, SnapshotResult, SnapshotRunner
 from airgap_sync.source.state import SourceState, StateError, state_db_path
+from airgap_sync.source.uploader import RelayUploader, UploadError
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +155,53 @@ def source_snapshot(config_path: Path, table_name: str) -> None:
         sys.exit(1)
 
 
+@source_group.command("relay-check")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_relay_check(config_path: Path) -> None:
+    """检查 Relay GET /health（不会上传文件）。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    if config.relay is None:
+        raise ConfigError("relay configuration is required for source relay-check")
+    RelayUploader(config.relay, "").check_health()
+    click.echo("Relay HTTP    OK")
+
+
+@source_group.command("sync")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--table", "table_name", required=True, help="要可靠交付的表名。")
+def source_sync(config_path: Path, table_name: str) -> None:
+    """生成 Full Snapshot 并通过 HTTP Relay 可靠交付。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    if config.relay is None:
+        raise ConfigError("relay configuration is required for source sync")
+    resolve_password(config.mysql)
+    token = resolve_relay_token(config.relay)
+    uploader = RelayUploader(config.relay, token)
+    with SourceMySQLConnection(config.mysql) as connection:
+        state = SourceState(state_db_path(config.paths.data_dir))
+        try:
+            state.initialize()
+            result = DeliveryRunner(connection, state, config, uploader).sync(table_name)
+        finally:
+            state.close()
+    _print_snapshot_result(result, relay=config.relay.base_url)
+    if result.status != "DELIVERED":
+        click.echo(f"ERROR: sync failed: {result.error}", err=True)
+        sys.exit(1)
+
+
 def _require_source_role(config: AppConfig) -> None:
     if config.role is not Role.SOURCE:
         raise ConfigError(
@@ -180,7 +234,7 @@ def _failure_detail(result: TableCheckResult) -> str:
     return result.error_code or "UNKNOWN"
 
 
-def _print_snapshot_result(result: SnapshotResult) -> None:
+def _print_snapshot_result(result: SnapshotResult, *, relay: str | None = None) -> None:
     """输出 Run 摘要 (不输出任何业务数据)。"""
     click.echo(f"Table           {result.table}")
     click.echo(f"Run             {result.run_id}")
@@ -189,7 +243,11 @@ def _print_snapshot_result(result: SnapshotResult) -> None:
     click.echo(f"Raw size        {_format_size(result.raw_bytes)}")
     click.echo(f"Compressed      {_format_size(result.compressed_bytes)}")
     click.echo(f"Status          {result.status}")
-    click.echo(f"Output          {result.run_dir}")
+    if relay is None:
+        click.echo(f"Output          {result.run_dir}")
+    else:
+        click.echo(f"Uploaded        {result.chunk_count}/{result.chunk_count}")
+        click.echo(f"Relay           {relay}")
 
 
 def _format_size(size: int) -> str:
@@ -214,7 +272,7 @@ def main() -> None:
     except click.Abort:
         click.echo("Aborted.", err=True)
         sys.exit(130)
-    except (ConfigError, SourceMySQLError, StateError, SnapshotError) as exc:
+    except (ConfigError, SourceMySQLError, StateError, SnapshotError, UploadError) as exc:
         click.echo(f"ERROR: {exc}", err=True)
         sys.exit(1)
 

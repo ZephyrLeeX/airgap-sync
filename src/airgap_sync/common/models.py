@@ -70,6 +70,43 @@ class ChunkConfig(BaseModel):
     compression_level: int = Field(default=3, ge=1, le=19)
 
 
+class RelayConfig(BaseModel):
+    """HTTP Relay 配置；Bearer token 本身永不进入配置模型。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = Field(min_length=1)
+    token_env: str = Field(min_length=1, repr=False)
+    ca_file: Path | None = None
+    connect_timeout_seconds: float = Field(default=10, gt=0, le=600)
+    read_timeout_seconds: float = Field(default=600, gt=0, le=86_400)
+    max_attempts: int = Field(default=5, ge=1, le=100)
+    retry_base_seconds: float = Field(default=5, ge=0, le=3600)
+    retry_max_seconds: float = Field(default=60, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def validate_relay(self) -> Self:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("relay.base_url must be an absolute http:// or https:// URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("relay.base_url must not contain credentials, query, or fragment")
+        if self.ca_file is not None and parsed.scheme != "https":
+            raise ValueError("relay.ca_file is only valid with an https:// base_url")
+        return self
+
+
+class SpoolConfig(BaseModel):
+    """Source 临时磁盘占用保护阈值。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_pending_bytes: int = Field(default=10 * 1024**3, ge=1)
+    min_free_bytes: int = Field(default=10 * 1024**3, ge=0)
+
+
 class TableConfig(BaseModel):
     """单张同步表的配置。
 
@@ -100,6 +137,8 @@ class AppConfig(BaseModel):
     paths: PathsConfig
     snapshot: SnapshotConfig = SnapshotConfig()
     chunk: ChunkConfig = ChunkConfig()
+    relay: RelayConfig | None = None
+    spool: SpoolConfig = SpoolConfig()
     tables: list[TableConfig] = Field(min_length=1)
 
     @model_validator(mode="after")

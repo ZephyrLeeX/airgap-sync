@@ -85,7 +85,8 @@ class TestInitialization:
         assert "mode" not in columns
         assert {
             "table_name",
-            "current_run_id",
+            "last_snapshot_run_id",
+            "last_delivered_run_id",
             "status",
             "last_run_id",
             "last_error",

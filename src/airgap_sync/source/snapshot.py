@@ -183,7 +183,14 @@ class SnapshotRunner:
                 run_dir=run_dir,
                 error=str(exc),
             )
-        self._state.complete_run(table_name, run_id)
+        self._state.complete_run(
+            table_name,
+            run_id,
+            row_count=scan.verification.row_count,
+            chunk_count=len(scan.chunks),
+            raw_bytes=sum(chunk.uncompressed_bytes for chunk in scan.chunks),
+            compressed_bytes=sum(chunk.compressed_bytes for chunk in scan.chunks),
+        )
         elapsed = (datetime.now(UTC) - started).total_seconds()
         logger.info(
             "snapshot completed: table=%s run_id=%s rows=%d chunks=%d "

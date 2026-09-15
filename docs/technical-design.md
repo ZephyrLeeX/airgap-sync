@@ -42,7 +42,8 @@ V1 优先保证：
 * Pydantic —— 配置与 Manifest 模型；
 * PyYAML —— 配置文件；
 * zstandard —— Chunk 压缩；
-* Click —— CLI。
+* Click —— CLI；
+* Requests —— HTTP/HTTPS 流式 PUT（文件对象请求体）。
 
 ## 2.3 Source 本地状态
 
@@ -72,10 +73,12 @@ src/airgap_sync/
 │   └── manifest.py        # Manifest 模型与原子读写
 └── source/
     ├── mysql.py           # 只读连接 + identifier quoting + DDL + 流式扫描
-    ├── state.py           # SQLite 状态库 (schema v2)
+    ├── state.py           # SQLite 状态库 (schema v3)
     ├── scanner.py         # 单表扫描 (流式读取 → 编码 → chunk/digest)
     ├── chunk_writer.py    # zstd Chunk 原子写入
-    └── snapshot.py        # Run 生命周期编排
+    ├── snapshot.py        # 本地 Snapshot 生命周期编排
+    ├── uploader.py        # Relay 流式 PUT、严格确认、重试
+    └── delivery.py        # producer + 单 upload worker
 ```
 
 Source 和 Destination 使用同一套项目代码，通过配置决定角色。Destination 端模块在 Phase 4 实现。
@@ -111,7 +114,7 @@ Source 和 Destination 使用同一套项目代码，通过配置决定角色。
            └──────────┬──────────┘
                    manifest.json (最后原子写入)
                       │
-                HTTP Upload (Phase 3)
+                HTTP Upload (Phase 3 已实现)
                       │
                      FTP
 ════════════════ 单向隔离边界 ════════════════
@@ -280,12 +283,13 @@ RUNNING → FAILED      (任何失败: 连接错误 / 扫描异常 / DDL 变化 
 
 ---
 
-# 8. Source State (SQLite schema v2)
+# 8. Source State (SQLite schema v3)
 
 ```sql
 CREATE TABLE table_state (
     table_name      TEXT PRIMARY KEY,
-    current_run_id  TEXT,                -- 最近成功生成的 Snapshot Run (不代表目标端已同步)
+    last_snapshot_run_id TEXT,           -- 最近成功完成生成语义的 Run
+    last_delivered_run_id TEXT,          -- 最近被 Relay 可靠确认的 Run
     status          TEXT NOT NULL,       -- IDLE / RUNNING / COMPLETED / FAILED
     last_run_id     TEXT,                -- 最近一次尝试的 Run (含失败)
     last_error      TEXT,
@@ -298,17 +302,63 @@ CREATE TABLE table_state (
 
 Schema 版本从 v1（含 `mode` 列）升级到 v2：项目尚未生产运行，采用简单迁移——检测到 v1 时重建 `table_state`（丢弃 `mode`），单事务完成。不做通用 migration framework。
 
-`current_run_id` 语义：
+另有 `sync_runs` 记录 Run 的 `GENERATING / UPLOADING / FINALIZING /
+SNAPSHOT_READY / DELIVERED / FAILED / DISK_PRESSURE`、行数/Chunk 数/字节数和时间；
+`run_artifacts` 按 Chunk/schema/manifest 记录 logical/transport name、size、SHA256、
+attempts、request_id、uploaded_at、last_error 和 cleanup_error。SQLite 不保存业务数据。
+
+`last_snapshot_run_id` 语义：
 
 > Source 最近成功生成的完整 Snapshot Run。
 
-严格单向网络下 Source 永远无法知道目标端 Apply 状态，该字段只描述 Source 本地生成进度。
+`last_delivered_run_id` 只表示 Relay 已可靠接收全部 artifact 且 manifest 最后确认；
+严格单向网络下 Source 永远无法知道目标端 Apply/VERIFIED 状态。Python 读取对象暂时
+提供 `current_run_id` 兼容属性，但 v3 SQLite 只持久化上述两个明确字段。
+
+## 8.1 schema v2 → v3
+
+迁移在单个 SQLite 事务中重建 `table_state`，把旧 `current_run_id` 复制到
+`last_snapshot_run_id`，`last_delivered_run_id` 初始为空，并创建 Run/artifact 表。
+重复初始化幂等，不引入 ORM 或 Alembic。
+
+# 9. Phase 3 HTTP Relay 与磁盘流水线
+
+## 9.1 协议与安全
+
+上传地址为 `{base_url}/api/v1/upload/{transport_filename}`。Requests 接收打开的二进制
+文件对象作为 body，因此大文件按客户端缓冲流式读取；显式发送文件 stat 得到的
+`Content-Length` 及预先生成的 SHA256。Token 只从 `relay.token_env` 指定的环境变量
+读取，不进入配置 repr、SQLite、异常或日志。HTTPS 默认使用系统 CA；配置 `ca_file`
+时使用指定 CA，不提供关闭 TLS 校验选项。HTTP 继续支持内网 Relay。
+
+成功必须同时满足 201、`success=true`、transport filename/size/sha256 精确匹配及非空
+request_id。网络错误、connect/read timeout、429、500 和所有合理 5xx（含 507）有限
+指数退避重试；401/411/413/415/422 等确定性 4xx 不重试。409 无法核验已有文件，
+以 `REMOTE_FILE_EXISTS_AMBIGUOUS` 失败并保留本地文件。
+
+## 9.2 producer / worker
+
+Scanner 在 Chunk 原子关闭时快速执行 callback：metadata 持久化、磁盘阈值检查、入队，
+随后继续消费 SSCursor。唯一的 upload worker 顺序 PUT；确认后先写 `UPLOADED` 和
+request_id，再 unlink。删除失败只记 `cleanup_error`，不重新上传。这样 MySQL 可生成
+Chunk N+1，同时 HTTP 上传 Chunk N，但不会触发 Relay 的多文件并发 429 限制。
+
+待上传本地字节数受 `spool.max_pending_bytes` 限制，可用空间受
+`spool.min_free_bytes` 限制；越界直接停止扫描而非等待队列。上传最终失败通过 batch
+边界检查尽快中止 scanner。失败 Run 不传 manifest，已上传文件成为 Destination 不得
+应用的 orphan。
+
+## 9.3 最终提交和文件生命周期
+
+顺序固定为：全部 Chunk 确认 → DDL 一致 → schema 确认 → manifest 最后确认 →
+`DELIVERED`。Manifest 从内存/SQLite ChunkMeta 构建，不依赖 Chunk 文件仍在本地。
+成功后再次清理确认过但先前 unlink 失败的文件及空 run_dir；失败 Run 保留未确认文件。
 
 ---
 
-# 9. Chunk Writer
+# 10. Chunk Writer
 
-## 9.1 阈值
+## 10.1 阈值
 
 Chunk 同时受：
 
@@ -323,7 +373,7 @@ max_uncompressed_bytes
 
 空表：0 个 Chunk。
 
-## 9.2 原子生成
+## 10.2 原子生成
 
 ```text
 chunk-000001.jsonl.zst.part    (写入中)
@@ -333,7 +383,7 @@ os.replace → chunk-000001.jsonl.zst
 
 只有最终文件名代表完整 Chunk；`.part` 不是有效数据。
 
-## 9.3 压缩与校验
+## 10.3 压缩与校验
 
 * zstd（`zstandard` 库，可配置级别，默认 3）；
 * SHA256 针对最终压缩文件字节计算（边写边算，不回读文件）；
@@ -350,9 +400,9 @@ sha256
 
 ---
 
-# 10. Row Codec
+# 11. Row Codec
 
-## 10.1 格式
+## 11.1 格式
 
 每行编码为 JSON array（列顺序 = `SELECT *` 返回顺序），一行一个 JSON 对象加换行符写入 JSONL。
 
@@ -365,7 +415,7 @@ json.dumps(values, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 同一份数据始终编码为完全相同的 bytes。
 
-## 10.2 类型映射
+## 11.2 类型映射
 
 | MySQL/PyMySQL 值 | JSON 表达 | 说明 |
 |---|---|---|
@@ -389,13 +439,13 @@ json.dumps(values, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 * tag 对象只出现在对象位置，且 key 以 `$` 开头，与普通数据不混淆；
 * 不使用 pickle。
 
-## 10.3 解码
+## 11.3 解码
 
 Destination 使用同一模块 `decode_row()` 还原 Python 值（`Decimal`、`bytes`、`datetime` 等按 tag 还原），round-trip 无损。
 
 ---
 
-# 11. Snapshot Multiset Digest
+# 12. Snapshot Multiset Digest
 
 表可能无主键、有重复行、行顺序不稳定，因此验证摘要必须：
 
@@ -404,7 +454,7 @@ Destination 使用同一模块 `decode_row()` 还原 Python 值（`Decimal`、`b
 * 非 XOR：XOR 会被偶数个相同行抵消；
 * O(1) 内存：与总行数无关。
 
-## 11.1 算法
+## 12.1 算法
 
 对每一行：
 
@@ -428,7 +478,7 @@ digest_a    64 hex 字符
 digest_b    64 hex 字符
 ```
 
-## 11.2 性质
+## 12.2 性质
 
 * 模加交换 → 顺序无关；
 * 每行贡献固定非零值的加法项 → 重复行可区分（两条相同行 ≠ 一条）；
@@ -436,7 +486,7 @@ digest_b    64 hex 字符
 * 空表得到确定结果（全零 digest + row_count 0）；
 * 每行只需两次 SHA256 与一个大整数加法，流式 O(1) 内存。
 
-## 11.3 复用
+## 12.3 复用
 
 Source 生成 Snapshot 时计算；Destination（Phase 5）导入 staging 后用**完全相同实现**复算比对。
 
@@ -444,7 +494,7 @@ Source 生成 Snapshot 时计算；Destination（Phase 5）导入 staging 后用
 
 ---
 
-# 12. Manifest
+# 13. Manifest
 
 ```json
 {
@@ -485,7 +535,7 @@ Source 生成 Snapshot 时计算；Destination（Phase 5）导入 staging 后用
 
 Manifest 必须最后生成：`manifest.json` 存在即代表 Run 完整。
 
-## 12.1 schema.sql
+## 13.1 schema.sql
 
 * 内容 = `SHOW CREATE TABLE` 的实际输出（第一次读取结果）；
 * 不重新构造 CREATE TABLE，不丢字段类型 / DEFAULT / NULL / INDEX / PRIMARY KEY / charset / collation / comment；
@@ -494,13 +544,13 @@ Manifest 必须最后生成：`manifest.json` 存在即代表 Run 完整。
 
 目标端（Phase 4）基于该 DDL 创建 staging 表；本阶段只负责携带。
 
-## 12.2 columns
+## 13.2 columns
 
 `SELECT *` 返回的列名顺序。每条 JSON row 是 array，不重复列名。Destination 严格按 manifest columns 写入 staging。
 
 ---
 
-# 13. Snapshot 执行流程
+# 14. Snapshot 执行流程
 
 `airgap-sync source snapshot --config config.yaml --table TABLE_NAME`
 
@@ -521,7 +571,7 @@ Manifest 必须最后生成：`manifest.json` 存在即代表 Run 完整。
 
 ---
 
-# 14. 性能与内存模型
+# 15. 性能与内存模型
 
 Snapshot 全链路没有 `list(all_rows)` / `fetchall()`：
 
@@ -534,7 +584,7 @@ Snapshot 全链路没有 `list(all_rows)` / `fetchall()`：
 
 ---
 
-# 15. 日志
+# 16. 日志
 
 Snapshot 日志只记录：
 
@@ -547,16 +597,16 @@ raw bytes, compressed bytes, elapsed time, status, error
 
 ---
 
-# 16. 后续阶段
+# 17. 后续阶段
 
-* **Phase 3**：HTTP 上传 + Source 磁盘流水线（Chunk 生成 → 上传 → 确认 → 删除）；
+* **Phase 3**：HTTP 上传 + Source 磁盘流水线（已实现）；
 * **Phase 4**：Destination 接收 + staging 导入；
 * **Phase 5**：一致性验证（复算 Multiset Digest）+ 正式表切换；
 * **Phase 6**：调度、状态、异常恢复、大表压力测试。
 
 ---
 
-# 17. V1 不实现
+# 18. V1 不实现
 
 * Binlog CDC；
 * 增量同步 / Diff / 逻辑键 / 行级 Hash 状态；

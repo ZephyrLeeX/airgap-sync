@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -61,6 +62,9 @@ def scan_table(
     run_dir: Path,
     snapshot_config: SnapshotConfig,
     chunk_config: ChunkConfig,
+    *,
+    on_chunk_closed: Callable[[ChunkMeta], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> ScanResult:
     """流式扫描一张表, 生成 Chunk 文件并计算验证摘要。
 
@@ -68,10 +72,17 @@ def scan_table(
     摘要与行顺序无关。
     """
     digest = MultisetDigest()
-    with ChunkWriter(run_dir, chunk_config, log_context=f" table={table_name}") as writer:
+    with ChunkWriter(
+        run_dir,
+        chunk_config,
+        log_context=f" table={table_name}",
+        on_chunk_closed=on_chunk_closed,
+    ) as writer:
         with source.stream_table(table_name, snapshot_config.fetch_size) as stream:
             columns = list(stream.columns)
             for batch in stream:
+                if cancel_check is not None:
+                    cancel_check()
                 for row in batch:
                     encoded = encode_row(row)
                     writer.write_row(encoded)

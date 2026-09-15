@@ -21,7 +21,7 @@ V1 统一采用 Full Snapshot 全量快照同步。旧设计中的 keyed / row_m
 
 ---
 
-# Phase 2：Full Snapshot Source 核心 ← 当前阶段
+# Phase 2：Full Snapshot Source 核心 ✅ 已完成
 
 ## T101 表配置简化
 
@@ -119,9 +119,15 @@ outbox/<table>/<run_id>/schema.sql + chunk-*.jsonl.zst + manifest.json
 
 # Phase 3：HTTP 上传 + Source 磁盘流水线
 
-* T201 HTTP Uploader（超时、重试、网络异常恢复；服务器确认可靠接收后才允许删除本地 Chunk）；
-* T202 流水线生成与上传（Chunk 生成 → 上传 → 删除 → 继续扫描，不要求整个 Run 先全部落盘）；
-* T203 磁盘保护（剩余空间检测、spool 限制、DISK_PRESSURE 状态）。
+✅ 已完成：
+
+* T201 HTTP Uploader（Requests 文件对象流式 PUT、严格 201 JSON 确认、超时/有限重试、
+  409 ambiguous、TLS/CA 与 token 安全）；
+* T202 单 producer + 单 upload worker（metadata → enqueue → confirm → SQLite → unlink，
+  schema 后置、manifest 最后提交）；
+* T203 磁盘保护（可配置 pending bytes / minimum free bytes，越界停止 scanner）；
+* T204 SQLite schema v3（Run/artifact 状态，snapshot/delivered 指针分离）；
+* T205 `source sync` 与 `source relay-check` CLI 及无真实 Relay 的测试。
 
 ---
 
@@ -145,7 +151,8 @@ outbox/<table>/<run_id>/schema.sql + chunk-*.jsonl.zst + manifest.json
 
 # Phase 6：调度、状态、异常恢复、大表压力测试
 
-* T501 Source 表级调度（同表不并发，默认单大表串行）；
+* T501 Source 表级 fixed-delay 调度（整个 Cycle 交付后等待，默认成功间隔建议 7d；
+  失败使用独立较短间隔；同表不并发）；
 * T502 Destination Worker（自动发现文件、按 Run 处理）；
 * T503 状态命令（表 / Run / 状态 / Chunk / 错误）；
 * T504 大表性能测试（700 万行：内存、耗时、压缩比、磁盘占用）；

@@ -97,6 +97,41 @@
 
 **可靠的最终一致性数据同步系统。**
 
+## 3.1 Phase 3：Source 到 HTTP Relay 的可靠交付
+
+`source sync` 必须把 SSCursor 扫描/编码/压缩与一个 HTTP 上传 worker 重叠执行。
+Chunk 原子关闭后先把 metadata 写入 SQLite，再入队；Relay 严格确认后先标记
+`UPLOADED`，再删除本地 Chunk。积压字节或磁盘可用空间越过配置阈值时直接以
+`DISK_PRESSURE` / `UPLOAD_BACKLOG_LIMIT` 结束 Run，不允许无限阻塞 SSCursor。
+
+Relay 是扁平命名空间，远端名称固定为
+`airgap-v1--<run_id>--<logical_name>`；logical name 仅允许六位序号 Chunk、
+`schema.sql` 和 `manifest.json`。原始表名不得进入 transport filename。
+
+HTTP 合同：`PUT /api/v1/upload/{filename}`，body 为文件原始二进制（禁止
+multipart），请求必须携带 Bearer Authorization、`application/octet-stream`、真实
+`Content-Length` 和 `X-File-SHA256`。只有 HTTP 201 且 JSON 中 `success=true`、
+filename/size/sha256 与本地完全一致、request_id 非空才算确认。409 表示
+`REMOTE_FILE_EXISTS_AMBIGUOUS`，不得推断为成功。
+
+扫描完成且 DDL 二次检查通过后等待全部 Chunk 确认，再依次上传 schema 和
+manifest；manifest 必须最后提交。`DELIVERED` 仅表示 Relay 已可靠接收，不表示
+Destination 已 Apply 或 VERIFIED。
+
+## 3.2 后续阶段已确定的行为
+
+Phase 6 的 Source 调度采用 fixed-delay：一个 Cycle 可靠交付完成后等待可配置间隔
+（建议默认 `delay_after_success=7d`）再启动下一 Cycle；失败使用独立较短重试间隔。
+本阶段不实现 Scheduler。
+
+Phase 4/5 的 Destination 在完整 Run 到达后立即处理：staging → VERIFY → 正式表切换
+→ VERIFIED，随后删除本地 Snapshot 文件。失败时保留文件和上一版正式表，不采用
+Destination 定时导入。
+
+V1 领导统计只提供：总行数、本次净增、月度净增。总行数是最近 VERIFIED Snapshot
+的 row_count；本次净增是本次减上次 VERIFIED row_count；月度净增是本月最后一次
+减上月最后一次 VERIFIED row_count。它们是“净增”，不是“真实新增记录数”。
+
 ---
 
 # 4. V1 同步方案：Full Snapshot 全量快照

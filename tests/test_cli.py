@@ -171,7 +171,7 @@ class TestSourceCheckFullFlow:
         assert "MySQL server        5.7.35-log" in result.output
         assert "Database            sgaj_data" in result.output
         assert "SQLite state        OK" in result.output
-        assert "schema v2" in result.output
+        assert "schema v3" in result.output
         assert "t_snapshot" in result.output and "OK" in result.output
         assert "t_legacy" in result.output and "SKIP (disabled)" in result.output
 
@@ -382,3 +382,54 @@ class TestSourceSnapshot:
         run_dir = Path(result.output.split("Output          ")[1].strip().splitlines()[0])
         assert not (run_dir / "manifest.json").exists()
         assert not (run_dir / "schema.sql").exists()
+
+
+class TestSourceRelayCommands:
+    def test_relay_check(self, run_cli, config_data, write_config, monkeypatch):
+        import airgap_sync.cli as cli_module
+
+        config_data["relay"] = {"base_url": "http://relay", "token_env": "RELAY_TOKEN"}
+        path = write_config(config_data)
+
+        class Healthy:
+            def __init__(self, config, token):
+                assert token == ""
+
+            def check_health(self):
+                return None
+
+        monkeypatch.setattr(cli_module, "RelayUploader", Healthy)
+        result = run_cli(["source", "relay-check", "--config", str(path)])
+        assert result.exit_code == 0
+        assert "Relay HTTP    OK" in result.output
+
+    def test_sync_success(self, run_cli, config_data, write_config, password_env, monkeypatch):
+        import airgap_sync.cli as cli_module
+        from airgap_sync.source.uploader import UploadConfirmation
+
+        config_data["relay"] = {"base_url": "http://relay", "token_env": "RELAY_TOKEN"}
+        config_data["spool"] = {"max_pending_bytes": 1_000_000, "min_free_bytes": 0}
+        config_data["chunk"] = {"max_rows": 1, "max_uncompressed_bytes": 1000}
+        path = write_config(config_data)
+        monkeypatch.setenv("RELAY_TOKEN", "secret")
+        monkeypatch.setattr(
+            cli_module,
+            "SourceMySQLConnection",
+            lambda config: FakeSourceMySQL(config, {"t_snapshot": "BASE TABLE"}),
+        )
+
+        class Successful:
+            def __init__(self, config, token):
+                assert token == "secret"
+
+            def upload(self, path, name, sha256, *, on_attempt=None):
+                if on_attempt:
+                    on_attempt(1)
+                return UploadConfirmation(name, path.stat().st_size, sha256, "req", 1)
+
+        monkeypatch.setattr(cli_module, "RelayUploader", Successful)
+        result = run_cli(["source", "sync", "--config", str(path), "--table", "t_snapshot"])
+        assert result.exit_code == 0, result.output
+        assert "Status          DELIVERED" in result.output
+        assert "Relay           http://relay" in result.output
+        assert "secret" not in result.output

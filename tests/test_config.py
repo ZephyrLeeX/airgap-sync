@@ -6,8 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from airgap_sync.common.config import ConfigError, load_config, resolve_password
-from airgap_sync.common.models import AppConfig, MySQLConfig
+from airgap_sync.common.config import (
+    ConfigError,
+    load_config,
+    resolve_password,
+    resolve_relay_token,
+)
+from airgap_sync.common.models import AppConfig, MySQLConfig, RelayConfig
 from conftest import PASSWORD_VALUE
 
 
@@ -227,3 +232,33 @@ def load_mysql(config_data: dict, env_name: str):
     data = dict(config_data["mysql"])
     data["password_env"] = env_name
     return MySQLConfig.model_validate(data)
+
+
+class TestRelayConfig:
+    def test_optional_for_local_snapshot(self, config_data, write_config):
+        assert load_config(write_config(config_data)).relay is None
+
+    def test_https_custom_ca_and_defaults(self, config_data, write_config, tmp_path):
+        config_data["relay"] = {
+            "base_url": "https://relay.example",
+            "token_env": "RELAY_TOKEN",
+            "ca_file": str(tmp_path / "ca.pem"),
+        }
+        relay = load_config(write_config(config_data)).relay
+        assert relay.ca_file == tmp_path / "ca.pem"
+        assert relay.max_attempts == 5
+
+    def test_http_rejects_ca_file(self, config_data, write_config):
+        config_data["relay"] = {
+            "base_url": "http://relay.example",
+            "token_env": "RELAY_TOKEN",
+            "ca_file": "ca.pem",
+        }
+        with pytest.raises(ConfigError, match="ca_file"):
+            load_config(write_config(config_data))
+
+    def test_token_only_from_environment_and_not_repr(self, monkeypatch):
+        relay = RelayConfig(base_url="http://relay", token_env="RELAY_TOKEN")
+        monkeypatch.setenv("RELAY_TOKEN", "super-secret-token")
+        assert resolve_relay_token(relay) == "super-secret-token"
+        assert "super-secret-token" not in repr(relay)

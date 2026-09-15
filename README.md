@@ -6,12 +6,15 @@
 
 ## 当前状态
 
-Phase 1（项目基础）与 Phase 2（Full Snapshot Source 核心）已完成，当前支持：
+Phase 1、Phase 2 与 Phase 3（HTTP Relay 可靠交付）已完成，当前支持：
 
 - YAML 配置加载与强类型校验（表配置只需 `name` + `enabled`，所有表统一 FULL_SNAPSHOT；旧 `mode` / `key` 字段已删除，配置中残留会明确报错）；
 - `airgap-sync config validate` 配置校验；
 - `airgap-sync source check`：MySQL 只读连接测试、同步表存在性与表类型检查（仅支持 BASE TABLE，配置 VIEW 报 `UNSUPPORTED_TABLE_TYPE`）、SQLite 状态库初始化；
 - `airgap-sync source snapshot --table TABLE`：单条流式 `SELECT *` 全表扫描 → JSONL + zstd 分 Chunk → `schema.sql` + `manifest.json`，输出到 `<data_dir>/outbox/<table>/<run_id>/`。
+- `airgap-sync source sync --table TABLE`：扫描与单路 HTTP PUT 并行，Relay 严格确认每个
+  Chunk 后即释放 Source 文件，最后依次提交 schema 和 manifest；
+- `airgap-sync source relay-check`：只调用 `GET /health` 的诊断命令。
 
 ### 源数据库只读保护
 
@@ -43,7 +46,8 @@ outbox/<table>/<run_id>/
 - 扫描前后各取一次 DDL，结构变化则 Run FAILED（`SCHEMA_CHANGED_DURING_SNAPSHOT`），不产生结构错配的快照；
 - 验证摘要是与行顺序无关的 multiset digest（`row_count` + `digest_a` + `digest_b`），供目标端导入后复算比对。
 
-以下能力**尚未实现**，属于后续阶段：HTTP 上传、Destination 端、staging 导入、一致性验证、调度器。
+以下能力**尚未实现**：FTP Client、Destination 端、staging/VERIFY/正式表切换、领导统计
+和 fixed-delay Scheduler。
 
 ## 环境要求
 
@@ -63,9 +67,10 @@ uv sync           # 创建虚拟环境并安装依赖
 cp config/config.example.yaml config/config.yaml
 ```
 
-按实际环境修改 `mysql`、`paths`、`snapshot`、`chunk`、`tables` 配置。注意：
+按实际环境修改 `mysql`、`paths`、`snapshot`、`chunk`、`relay`、`spool`、`tables` 配置。注意：
 
 - 数据库密码**不写入 YAML**，只通过 `mysql.password_env` 指定的环境变量提供；
+- Relay Token 也**不写入 YAML**，只通过 `relay.token_env` 指定的环境变量提供；
 - `paths.data_dir` 支持 Windows 风格路径，例如 `D:/airgap-sync/data`；
 - 每张同步表只需要 `name` 和 `enabled`，所有表统一 FULL_SNAPSHOT，不需要配置主键或同步模式。
 
@@ -74,12 +79,14 @@ cp config/config.example.yaml config/config.yaml
 ```bash
 # Linux / macOS
 export AIRGAP_SYNC_MYSQL_PASSWORD='真实密码'
+export AIRGAP_SYNC_UPLOAD_TOKEN='真实Relay Token'
 
 # Windows PowerShell
 $env:AIRGAP_SYNC_MYSQL_PASSWORD = '真实密码'
+$env:AIRGAP_SYNC_UPLOAD_TOKEN = '真实Relay Token'
 ```
 
-环境变量未设置时程序会明确报错；密码不会出现在日志或错误输出中。
+环境变量未设置时程序会明确报错；密码和 Token 不会出现在日志或错误输出中。
 
 ## 使用
 
@@ -88,6 +95,8 @@ uv run airgap-sync --version
 uv run airgap-sync config validate --config config/config.yaml
 uv run airgap-sync source check --config config/config.yaml
 uv run airgap-sync source snapshot --config config/config.yaml --table std_scjgj_zhgsxt_qyjbxx_all
+uv run airgap-sync source relay-check --config config/config.yaml
+uv run airgap-sync source sync --config config/config.yaml --table std_scjgj_zhgsxt_qyjbxx_all
 ```
 
 `source check` 输出示例：
@@ -97,7 +106,7 @@ Configuration       OK
 MySQL connection    OK
 MySQL server        5.7.35-log
 Database            sgaj_data
-SQLite state        OK (D:/airgap-sync/data/state/meta.db, schema v2)
+SQLite state        OK (D:/airgap-sync/data/state/meta.db, schema v3)
 
 Tables:
 std_scjgj_zhgsxt_qyjbxx_all   OK
@@ -118,7 +127,43 @@ Status          COMPLETED
 Output          D:/airgap-sync/data/outbox/std_scjgj_zhgsxt_qyjbxx_all/20260914T213500Z-a1b2c3d4
 ```
 
-SQLite 状态库自动创建在 `<data_dir>/state/meta.db`。`table_state.current_run_id` 表示 Source 最近成功生成的完整 Snapshot Run——由于网络严格单向，它不代表目标端已经同步完成。Snapshot 中途失败的 Run 状态为 FAILED，不生成 manifest，也不推进 `current_run_id`；下一次运行会生成全新 Run（V1 不做断点续扫）。
+SQLite 状态库自动创建在 `<data_dir>/state/meta.db`。`last_snapshot_run_id` 表示最近成功
+生成的 Snapshot，`last_delivered_run_id` 表示最近被 HTTP Relay 可靠确认的 Run；后者
+也不表示 Destination 已 Apply/VERIFIED。失败不推进 delivered 指针，下一次运行生成全新
+Run（V1 不做断点续扫）。
+
+## HTTP Relay 协议与流水线
+
+Relay 上传使用 `PUT /api/v1/upload/{filename}`，body 是文件原始二进制，不使用
+multipart。客户端通过 Requests 直接传打开的文件对象，显式设置真实
+`Content-Length` 和 `X-File-SHA256`，因此内存不会随 Chunk 大小线性增长。transport
+filename 为 `airgap-v1--<run_id>--<logical_name>`，不包含原始表名。
+
+只有 HTTP 201 且响应 `success`、filename、size、sha256、request_id 全部验证通过才会
+记录 `UPLOADED` 并删除本地文件。网络超时、429 和 5xx 有限指数退避；确定性 4xx 不
+重试；409 以 `REMOTE_FILE_EXISTS_AMBIGUOUS` 失败并保留文件。HTTPS 使用系统 CA，或
+通过 `relay.ca_file` 指定私有 CA；不支持跳过 TLS 验证。
+
+Scanner 每关闭一个 Chunk 只持久化 metadata 并入队，然后继续读取 SSCursor；一个固定
+HTTP worker 顺序上传，所以扫描/压缩可与 PUT 重叠，但不会并发多个 PUT。待上传字节超过
+`spool.max_pending_bytes` 或可用空间低于 `spool.min_free_bytes` 时 Run 立即失败，不无限
+阻塞数据库读取。全部 Chunk 确认且 DDL 二次检查通过后才上传 schema，manifest 永远最后。
+
+`DELIVERED` 后清理本地 Run 文件；删除失败只作为本地 cleanup error 记录，不会重新 PUT。
+
+## 真实 Relay 手工测试
+
+自动化测试不会访问 `10.9.195.133:50552`。设置 Token 后可先检查健康，再选择一张很小
+的测试表执行同步：
+
+```bash
+export AIRGAP_SYNC_UPLOAD_TOKEN='...'
+uv run airgap-sync source relay-check --config config/config.yaml
+uv run airgap-sync source sync --config config/config.yaml --table small_test_table
+```
+
+Relay 单文件上限 20 GiB，不支持覆盖或断点续传；Chunk 参数必须保证实际压缩文件低于
+该限制。
 
 ## 日志级别
 

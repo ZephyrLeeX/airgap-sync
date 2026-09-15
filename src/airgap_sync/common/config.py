@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
-from airgap_sync.common.models import AppConfig, MySQLConfig
+from airgap_sync.common.models import AppConfig, MySQLConfig, RelayConfig
 
 
 class ConfigError(Exception):
@@ -64,3 +64,14 @@ def resolve_password(mysql: MySQLConfig) -> str:
             "password through this variable"
         )
     return password
+
+
+def resolve_relay_token(relay: RelayConfig) -> str:
+    """只从环境变量读取 Relay token，不在错误中包含 token 值。"""
+    token = os.environ.get(relay.token_env)
+    if not token:
+        raise ConfigError(
+            f"environment variable '{relay.token_env}' (relay.token_env) is not set; "
+            "provide the upload token through this variable"
+        )
+    return token

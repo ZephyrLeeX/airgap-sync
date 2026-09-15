@@ -30,6 +30,24 @@ chunk:
   # zstd 压缩级别 (1-19, 默认 3: 速度与压缩比均衡, 不追求极限压缩)。
   compression_level: 3
 
+# source snapshot 不需要 relay；只有 source sync / relay-check 使用本节。
+relay:
+  base_url: http://10.9.195.133:50552
+  # Token 值禁止写入 YAML，只写环境变量名。
+  token_env: AIRGAP_SYNC_UPLOAD_TOKEN
+  # HTTPS 私有 CA 时配置路径；系统可信 CA 或 HTTP 时省略。
+  # ca_file: D:/airgap-sync/certs/internal-ca.pem
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 600
+  max_attempts: 5
+  retry_base_seconds: 5
+  retry_max_seconds: 60
+
+spool:
+  # 运行参数，不是协议常量。积压超过上限或可用空间低于下限时 Run 失败。
+  max_pending_bytes: 10737418240 # 10 GiB
+  min_free_bytes: 10737418240 # 10 GiB
+
 tables:
   # 所有表统一 FULL_SNAPSHOT: 只需要 name 和 enabled。
   # 不需要配置主键、逻辑键或同步模式。

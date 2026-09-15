@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -75,11 +76,18 @@ class ChunkWriter:
     (每个数十字节), 与总行数无关。
     """
 
-    def __init__(self, run_dir: Path, config: ChunkConfig, log_context: str = "") -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        config: ChunkConfig,
+        log_context: str = "",
+        on_chunk_closed: Callable[[ChunkMeta], None] | None = None,
+    ) -> None:
         self._run_dir = run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         self._config = config
         self._log_context = log_context
+        self._on_chunk_closed = on_chunk_closed
         self._compressor_context = zstandard.ZstdCompressor(level=config.compression_level)
         self.chunks: list[ChunkMeta] = []
         self._current: _OpenChunk | None = None
@@ -119,6 +127,8 @@ class ChunkWriter:
         meta = self._current.close()
         self._current = None
         self.chunks.append(meta)
+        if self._on_chunk_closed is not None:
+            self._on_chunk_closed(meta)
         return meta
 
     def finish(self) -> list[ChunkMeta]:
