@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import pymysql.cursors
+import pytest
 
 from airgap_sync.common.models import DestinationConfig, MySQLConfig
-from airgap_sync.destination.mysql import DestinationMySQLConnection
+from airgap_sync.destination.mysql import (
+    DestinationMySQLConnection,
+    DestinationMySQLError,
+    RunRecord,
+    TableVersion,
+)
 
 
 def configs(tmp_path):
@@ -42,6 +50,53 @@ def test_missing_target_promotion_is_one_rename(tmp_path):
     connection = RecordingConnection(*configs(tmp_path))
     connection.rename_for_promotion("target_db", "staging", "live", None)
     assert connection.sql[0][0] == ("RENAME TABLE `target_db`.`staging` TO `target_db`.`live`")
+
+
+class FinalizeConnection(RecordingConnection):
+    def __init__(self, mysql, destination, run, latest):
+        super().__init__(mysql, destination)
+        self.run = run
+        self.latest = latest
+
+    @contextmanager
+    def transaction(self):
+        yield
+
+    def get_run(self, run_id):
+        return self.run
+
+    def latest_version(self, source_database, table_name):
+        return self.latest
+
+
+def test_finalize_rejects_run_older_than_transaction_latest(tmp_path):
+    run_at = datetime(2026, 9, 1)
+    latest_at = datetime(2026, 9, 8, tzinfo=UTC)
+    run = RunRecord("run-a", "source", "table", "SWAPPING", 5, 1, "staging", run_at)
+    latest = TableVersion(
+        "run-b", "source", "table", latest_at, 7, None, None, None, latest_at, latest_at
+    )
+    connection = FinalizeConnection(*configs(tmp_path), run, latest)
+
+    with pytest.raises(DestinationMySQLError, match="run is older"):
+        connection.finalize_verified("run-a", "run-b")
+
+    assert connection.sql == []
+
+
+def test_finalize_is_idempotent_when_current_run_is_already_latest(tmp_path):
+    run_at = datetime(2026, 9, 1)
+    version_at = run_at.replace(tzinfo=UTC)
+    run = RunRecord("run-a", "source", "table", "SWAPPING", 5, 1, "staging", run_at)
+    latest = TableVersion(
+        "run-a", "source", "table", version_at, 5, None, None, None, version_at, version_at
+    )
+    connection = FinalizeConnection(*configs(tmp_path), run, latest)
+
+    connection.finalize_verified("run-a", "run-a")
+
+    assert len(connection.sql) == 1
+    assert "UPDATE `airgap_sync_meta`.runs SET status='VERIFIED'" in connection.sql[0][0]
 
 
 class StreamCursor:

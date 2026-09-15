@@ -185,7 +185,7 @@ class FakeDestinationDB:
         self.objects[target] = self.objects.pop(staging)
         self.target_rows = list(self.verify_rows if self.verify_rows is not None else self.rows)
 
-    def finalize_verified(self, run_id, previous):
+    def finalize_verified(self, run_id, expected_previous_run_id):
         self.run = replace(self.run, status="VERIFIED")
 
     def drop_table(self, database, table):
@@ -363,11 +363,11 @@ def test_crash_after_rename_recovers_by_verifying_live_without_second_rename(tmp
             super().__init__(target_exists=True)
             self.crash = True
 
-        def finalize_verified(self, run_id, previous):
+        def finalize_verified(self, run_id, expected_previous_run_id):
             if self.crash:
                 self.crash = False
                 raise DestinationMySQLError("simulated crash after rename")
-            super().finalize_verified(run_id, previous)
+            super().finalize_verified(run_id, expected_previous_run_id)
 
     app_config = config(tmp_path)
     make_run(app_config.destination.incoming_dir, rows=((1, "new"),))
@@ -399,6 +399,105 @@ def test_rename_failure_keeps_swapping_and_incoming_then_recovers(tmp_path):
     assert database.run.status == "SWAPPING"
     assert list(app_config.destination.incoming_dir.iterdir())
     assert processor.process(RUN).status == "VERIFIED"
+
+
+def test_crash_before_rename_old_run_cannot_replace_newer_verified_run(tmp_path):
+    class RenameOnceDB(FakeDestinationDB):
+        def __init__(self):
+            super().__init__(target_exists=True)
+            self.fail_rename = True
+
+        def rename_for_promotion(self, database, staging, target, backup):
+            if self.fail_rename:
+                self.fail_rename = False
+                raise DestinationMySQLError("simulated crash before rename")
+            super().rename_for_promotion(database, staging, target, backup)
+
+    app_config = config(tmp_path)
+    make_run(app_config.destination.incoming_dir, rows=((1, "run A"),))
+    database = RenameOnceDB()
+    processor = DestinationProcessor(database, app_config)
+    assert processor.process(RUN).status == "FAILED"
+    assert database.run.status == "SWAPPING"
+    assert database.renames == []
+
+    database.run = replace(database.run, source_created_at=datetime(2026, 9, 1))
+    newer_at = datetime(2026, 9, 8, tzinfo=UTC)
+    database.versions = [
+        TableVersion(
+            "run-b", "source_db", "new_table", newer_at, 1, None, None, None, newer_at, newer_at
+        )
+    ]
+    database.target_rows = [(2, "run B")]
+
+    assert processor.process(RUN).status == "SUPERSEDED"
+    assert database.renames == []
+    assert database.target_rows == [(2, "run B")]
+    assert database.run.staging_table not in database.objects
+    assert not list(app_config.destination.incoming_dir.iterdir())
+
+
+def test_crash_before_rename_same_timestamp_is_ambiguous(tmp_path):
+    class RenameOnceDB(FakeDestinationDB):
+        def rename_for_promotion(self, database, staging, target, backup):
+            raise DestinationMySQLError("simulated crash before rename")
+
+    app_config = config(tmp_path)
+    make_run(app_config.destination.incoming_dir, rows=((1, "run A"),))
+    database = RenameOnceDB(target_exists=True)
+    processor = DestinationProcessor(database, app_config)
+    assert processor.process(RUN).status == "FAILED"
+
+    same_at = datetime(2026, 9, 1, tzinfo=UTC)
+    database.run = replace(database.run, source_created_at=same_at.replace(tzinfo=None))
+    database.versions = [
+        TableVersion(
+            "run-b", "source_db", "new_table", same_at, 1, None, None, None, same_at, same_at
+        )
+    ]
+    result = processor.process(RUN)
+
+    assert result.status == "FAILED"
+    assert "RUN_ORDER_AMBIGUOUS" in result.error
+    assert database.run.status == "SWAPPING"
+    assert database.renames == []
+    assert database.run.staging_table in database.objects
+    assert list(app_config.destination.incoming_dir.iterdir())
+
+
+def test_crash_after_rename_old_run_does_not_touch_newer_live_or_own_backup(tmp_path):
+    class CrashOnceDB(FakeDestinationDB):
+        def __init__(self):
+            super().__init__(target_exists=True)
+            self.crash = True
+
+        def finalize_verified(self, run_id, expected_previous_run_id):
+            if self.crash:
+                self.crash = False
+                raise DestinationMySQLError("simulated crash after rename")
+            super().finalize_verified(run_id, expected_previous_run_id)
+
+    app_config = config(tmp_path)
+    make_run(app_config.destination.incoming_dir, rows=((1, "run A"),))
+    database = CrashOnceDB()
+    processor = DestinationProcessor(database, app_config)
+    assert processor.process(RUN).status == "FAILED"
+    backup = database.run.backup_table
+    assert backup in database.objects
+
+    database.run = replace(database.run, source_created_at=datetime(2026, 9, 1))
+    newer_at = datetime(2026, 9, 8, tzinfo=UTC)
+    database.versions = [
+        TableVersion(
+            "run-b", "source_db", "new_table", newer_at, 1, None, None, None, newer_at, newer_at
+        )
+    ]
+    database.target_rows = [(2, "run B")]
+
+    assert processor.process(RUN).status == "SUPERSEDED"
+    assert len(database.renames) == 1
+    assert database.target_rows == [(2, "run B")]
+    assert backup in database.objects
 
 
 def test_backup_cleanup_failure_does_not_revoke_verified(tmp_path):

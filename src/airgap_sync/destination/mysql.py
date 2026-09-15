@@ -50,6 +50,12 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
 @dataclass(frozen=True)
 class DestinationColumn:
     name: str
@@ -649,16 +655,40 @@ class DestinationMySQLConnection:
             sql = f"RENAME TABLE {live} TO {old}, {stg} TO {live}"
         self._execute(sql)
 
-    def finalize_verified(self, run_id: str, previous: TableVersion | None) -> None:
-        run = self.get_run(run_id)
-        if run is None:
-            raise DestinationMySQLError("run metadata is missing")
-        if run.source_created_at is None:
-            raise DestinationMySQLError("run source_created_at is missing")
+    def finalize_verified(self, run_id: str, expected_previous_run_id: str | None) -> None:
         now = _utcnow()
-        previous_rows = None if previous is None else previous.row_count
-        net_change = None if previous_rows is None else run.row_count - previous_rows
         with self.transaction():
+            run = self.get_run(run_id)
+            if run is None:
+                raise DestinationMySQLError("run metadata is missing")
+            if run.source_created_at is None:
+                raise DestinationMySQLError("run source_created_at is missing")
+            previous = self.latest_version(run.source_database, run.table_name)
+            if previous is not None and previous.run_id == run_id:
+                self._execute(
+                    f"UPDATE {self._metadata}.runs SET status='VERIFIED',applied_at=%s,"
+                    "last_error=NULL,updated_at=%s WHERE run_id=%s",
+                    (now, now, run_id),
+                )
+                return
+            actual_previous_run_id = None if previous is None else previous.run_id
+            if actual_previous_run_id != expected_previous_run_id:
+                raise DestinationMySQLError(
+                    "FINALIZE_VERSION_CONFLICT: latest table version changed before finalize"
+                )
+            if previous is not None:
+                run_time = _utc_naive(run.source_created_at)
+                previous_time = _utc_naive(previous.source_created_at)
+                if run_time < previous_time:
+                    raise DestinationMySQLError(
+                        "FINALIZE_VERSION_CONFLICT: run is older than latest table version"
+                    )
+                if run_time == previous_time:
+                    raise DestinationMySQLError(
+                        "RUN_ORDER_AMBIGUOUS: another run has the same source_created_at"
+                    )
+            previous_rows = None if previous is None else previous.row_count
+            net_change = None if previous_rows is None else run.row_count - previous_rows
             self._execute(
                 f"UPDATE {self._metadata}.runs SET status='VERIFIED',applied_at=%s,"
                 "last_error=NULL,updated_at=%s WHERE run_id=%s",

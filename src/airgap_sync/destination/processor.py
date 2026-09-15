@@ -6,6 +6,7 @@ import io
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,20 @@ class ProcessResult:
     rows: int = 0
     chunks: int = 0
     error: str | None = None
+
+
+class VersionRelation(Enum):
+    NO_PREVIOUS = "NO_PREVIOUS"
+    SAME_RUN = "SAME_RUN"
+    NEWER = "NEWER"
+    OLDER = "OLDER"
+    SAME_TIMESTAMP_DIFFERENT_RUN = "SAME_TIMESTAMP_DIFFERENT_RUN"
+
+
+@dataclass(frozen=True)
+class VersionOrdering:
+    relation: VersionRelation
+    latest: TableVersion | None
 
 
 class DestinationVerifier:
@@ -162,15 +177,14 @@ class DestinationProcessor:
                 "DIGEST_MISMATCH: staging database content differs from manifest",
             )
 
-        previous = self._ordering(
+        ordering = self._ordering(
             manifest.run_id, manifest.source.database, manifest.source.table, source_time
         )
-        if previous is False:
+        if ordering.relation is VersionRelation.OLDER:
             run = self._require_run(manifest.run_id)
             self._cleanup_superseded(run)
             return self._result(run)
-        assert previous is None or isinstance(previous, TableVersion)
-        self._promote(manifest.run_id, manifest.source.table, staging, previous)
+        self._promote(manifest.run_id, manifest.source.table, staging, ordering.latest)
         run = self._require_run(manifest.run_id)
         self._retry_cleanup(run, validated)
         return self._result(run)
@@ -247,19 +261,30 @@ class DestinationProcessor:
 
     def _ordering(
         self, run_id: str, source_database: str, table: str, source_time: datetime
-    ) -> TableVersion | None | bool:
-        latest = self._db.latest_version(source_database, table)
-        if latest is None or latest.run_id == run_id:
-            return latest
-        latest_time = _as_utc(latest.source_created_at)
-        if source_time < latest_time:
+    ) -> VersionOrdering:
+        ordering = self._compare_run_to_latest_version(run_id, source_database, table, source_time)
+        if ordering.relation is VersionRelation.OLDER:
             self._db.set_superseded(run_id)
-            return False
-        if source_time == latest_time:
+        elif ordering.relation is VersionRelation.SAME_TIMESTAMP_DIFFERENT_RUN:
             raise DestinationError(
                 "RUN_ORDER_AMBIGUOUS", "another run has the same source_created_at"
             )
-        return latest
+        return ordering
+
+    def _compare_run_to_latest_version(
+        self, run_id: str, source_database: str, table: str, source_time: datetime
+    ) -> VersionOrdering:
+        latest = self._db.latest_version(source_database, table)
+        if latest is None:
+            return VersionOrdering(VersionRelation.NO_PREVIOUS, None)
+        if latest.run_id == run_id:
+            return VersionOrdering(VersionRelation.SAME_RUN, latest)
+        latest_time = _as_utc(latest.source_created_at)
+        if source_time < latest_time:
+            return VersionOrdering(VersionRelation.OLDER, latest)
+        if source_time == latest_time:
+            return VersionOrdering(VersionRelation.SAME_TIMESTAMP_DIFFERENT_RUN, latest)
+        return VersionOrdering(VersionRelation.NEWER, latest)
 
     def _promote(
         self, run_id: str, target: str, staging: str, previous: TableVersion | None
@@ -284,7 +309,7 @@ class DestinationProcessor:
                 raise DestinationError("SWAP_STATE_MISMATCH", "deterministic backup already exists")
         self._db.prepare_swapping(run_id, target_existed, backup)
         self._db.rename_for_promotion(database, staging, target, backup)
-        self._db.finalize_verified(run_id, previous)
+        self._db.finalize_verified(run_id, None if previous is None else previous.run_id)
 
     def _recover_swap(self, validated: ValidatedRun, run: RunRecord) -> ProcessResult:
         database = self._config.mysql.database
@@ -305,12 +330,27 @@ class DestinationProcessor:
                 or (run.target_existed is True and backup_type == "BASE TABLE")
             )
         )
-        previous = self._db.latest_version(run.source_database, run.table_name)
+        if not before and not after:
+            raise DestinationError("SWAP_STATE_MISMATCH", "unexpected target/staging/backup state")
+        if run.source_created_at is None:
+            raise DestinationError("SWAP_STATE_MISMATCH", "run source_created_at is missing")
+        ordering = self._ordering(
+            run.run_id,
+            run.source_database,
+            run.table_name,
+            _as_utc(run.source_created_at),
+        )
+        if ordering.relation is VersionRelation.OLDER:
+            current = self._require_run(run.run_id)
+            self._cleanup_superseded(current)
+            return self._result(self._require_run(run.run_id))
         if before:
             self._db.rename_for_promotion(
                 database, run.staging_table, run.table_name, run.backup_table
             )
-            self._db.finalize_verified(run.run_id, previous)
+            self._db.finalize_verified(
+                run.run_id, None if ordering.latest is None else ordering.latest.run_id
+            )
         elif after:
             summary = self._verifier.verify(run.table_name, validated.manifest.columns)
             expected = validated.manifest.verification
@@ -326,9 +366,9 @@ class DestinationProcessor:
             self._db.record_verification(run.run_id, summary, True)
             # Verification persistence returns STAGED; restore swap intent.
             self._db.prepare_swapping(run.run_id, bool(run.target_existed), run.backup_table)
-            self._db.finalize_verified(run.run_id, previous)
-        else:
-            raise DestinationError("SWAP_STATE_MISMATCH", "unexpected target/staging/backup state")
+            self._db.finalize_verified(
+                run.run_id, None if ordering.latest is None else ordering.latest.run_id
+            )
         current = self._require_run(run.run_id)
         self._retry_cleanup(current, validated)
         return self._result(self._require_run(run.run_id))
