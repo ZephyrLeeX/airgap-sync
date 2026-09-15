@@ -131,3 +131,75 @@ class TestPlatformSpecs:
         assert br.PLATFORM_SPECS["windows"]["minimum_glibc"] is None
         assert "manylinux2014_x86_64" in br.PLATFORM_SPECS["linux"]["pip_platforms"]
         assert "win_amd64" in br.PLATFORM_SPECS["windows"]["pip_platforms"]
+
+    def test_linux_download_platforms_reject_generic_linux_and_musl(self) -> None:
+        """generic linux_x86_64 / musllinux 不提供 glibc <= 2.17 ABI 承诺。"""
+        platforms = br.PLATFORM_SPECS["linux"]["pip_platforms"]
+        assert "linux_x86_64" not in platforms
+        assert not any(p.startswith("musllinux") for p in platforms)
+        for allowed in ("manylinux2014_x86_64", "manylinux_2_17_x86_64"):
+            assert allowed in platforms
+
+
+class TestLinuxWheelAbiGuard:
+    @pytest.mark.parametrize(
+        ("wheel", "compatible"),
+        [
+            # universal wheels run anywhere
+            ("foo-1.0-py3-none-any.whl", True),
+            ("foo-1.0-py2.py3-none-any.whl", True),
+            # CentOS 7 (glibc 2.17) compatible tags
+            ("foo-1.0-cp313-cp313-manylinux_2_17_x86_64.whl", True),
+            ("foo-1.0-cp313-cp313-manylinux2014_x86_64.whl", True),
+            ("foo-1.0-cp313-cp313-manylinux_2_12_x86_64.whl", True),
+            ("foo-1.0-cp313-cp313-manylinux2010_x86_64.whl", True),
+            ("foo-1.0-cp313-cp313-manylinux1_x86_64.whl", True),
+            ("foo-1.0-cp313-cp313-manylinux_2_5_x86_64.whl", True),
+            # multi-tag wheel: one glibc <= 2.17 tag is enough
+            (
+                "foo-1.0-cp313-cp313-manylinux_2_28_x86_64.manylinux_2_17_x86_64.whl",
+                True,
+            ),
+            # no ABI promise for glibc 2.17
+            ("foo-1.0-cp313-cp313-linux_x86_64.whl", False),
+            ("foo-1.0-cp313-cp313-manylinux_2_28_x86_64.whl", False),
+            ("foo-1.0-cp313-cp313-manylinux_2_18_x86_64.whl", False),
+            ("foo-1.0-cp313-cp313-manylinux_3_0_x86_64.whl", False),
+            ("foo-1.0-cp313-cp313-musllinux_1_2_x86_64.whl", False),
+            # wrong OS entirely: never a valid CentOS 7 runtime wheel
+            ("foo-1.0-cp313-cp313-win_amd64.whl", False),
+            ("foo-1.0-cp313-cp313-manylinux_2_28_x86_64.win_amd64.whl", False),
+        ],
+    )
+    def test_wheel_compat_table(self, wheel: str, compatible: bool) -> None:
+        assert (br.linux_abi_problems([wheel]) == []) is compatible
+
+    def test_problems_name_the_offending_wheel(self) -> None:
+        problems = br.linux_abi_problems(
+            [
+                "foo-1.0-py3-none-any.whl",
+                "foo-1.0-cp313-cp313-linux_x86_64.whl",
+                "foo-1.0-cp313-cp313-manylinux_2_28_x86_64.whl",
+            ]
+        )
+        assert len(problems) == 2
+        assert all("linux_x86_64" in p or "manylinux_2_28" in p for p in problems)
+
+    def test_malformed_wheel_filename_reported(self) -> None:
+        assert br.linux_abi_problems(["not-a-wheel.whl"]) != []
+
+    def test_wheel_platform_tags(self) -> None:
+        name = "foo-1.0-cp313-cp313-manylinux_2_28_x86_64.manylinux_2_17_x86_64.whl"
+        assert br.wheel_platform_tags(name) == ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64"]
+        assert br.is_universal_wheel(name) is False
+        assert br.is_universal_wheel("foo-1.0-py3-none-any.whl") is True
+
+    def test_non_universal_platform_tags_reporting(self) -> None:
+        tags = br.non_universal_platform_tags(
+            [
+                "foo-1.0-py3-none-any.whl",
+                "foo-1.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+                "bar-2.0-cp313-cp313-manylinux2014_x86_64.whl",
+            ]
+        )
+        assert tags == ["manylinux2014_x86_64", "manylinux_2_17_x86_64"]

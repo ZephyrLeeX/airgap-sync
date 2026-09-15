@@ -182,6 +182,32 @@ class TestSha256sums:
     def test_empty_sums_rejected(self, tmp_path: Path) -> None:
         assert rm.verify_sha256sums(tmp_path, []) == ["SHA256SUMS lists no files"]
 
+    @pytest.mark.parametrize(
+        "evil",
+        [
+            "../outside.file",
+            "/etc/passwd",
+            "C:\\Windows\\evil.dll",
+            "foo/../../bar.whl",
+            "..\\outside.whl",
+        ],
+    )
+    def test_path_traversal_rejected(self, tmp_path: Path, evil: str) -> None:
+        digest = "a" * 64
+        sums = tmp_path / rm.SHA256SUMS_NAME
+        sums.write_text(f"{digest}  {evil}\n", encoding="utf-8")
+        with pytest.raises(rm.ReleaseManifestError, match="not bundle-relative"):
+            rm.read_sha256sums(sums)
+
+    def test_bundle_relative_paths_accepted(self, tmp_path: Path) -> None:
+        (tmp_path / "wheelhouse").mkdir()
+        (tmp_path / "wheelhouse" / "a.whl").write_bytes(b"a")
+        sums = tmp_path / rm.SHA256SUMS_NAME
+        sums.write_text(f"{rm.sha256_file(tmp_path / 'wheelhouse' / 'a.whl')}  wheelhouse/a.whl\n")
+        entries = rm.read_sha256sums(sums)
+        assert [name for _, name in entries] == ["wheelhouse/a.whl"]
+        assert rm.verify_sha256sums(tmp_path, entries) == []
+
 
 class TestVerifyBundle:
     def test_valid_bundle(self, tmp_path: Path) -> None:
@@ -212,6 +238,66 @@ class TestVerifyBundle:
         (tmp_path / rm.RELEASE_ENV_NAME).unlink()
         problems = rm.verify_bundle(tmp_path)
         assert any("release.env" in problem for problem in problems)
+
+
+class TestReleaseEnvConsistency:
+    def test_parse_render_roundtrip(self) -> None:
+        manifest = make_manifest()
+        parsed = rm.parse_release_env_text(rm.render_release_env(manifest))
+        assert parsed["AIRGAP_RELEASE_ID"] == "0.1.0-cc8e17a"
+        assert parsed["AIRGAP_PYTHON_VERSION"] == "3.13.15"
+        assert parsed["AIRGAP_SOURCE_STATE_SCHEMA"] == "4"
+        assert parsed["AIRGAP_WHEEL_COUNT"] == "15"
+        assert parsed["AIRGAP_INCLUDE_TESTS"] == "0"
+        assert parsed["AIRGAP_MINIMUM_GLIBC"] == "2.17"
+
+    def test_parse_unescapes_quoted_values(self) -> None:
+        parsed = rm.parse_release_env_text('AIRGAP_RELEASE_ID="0.1.0-a\\$b"\nAIRGAP_X="q\\"uote"\n')
+        assert parsed["AIRGAP_RELEASE_ID"] == "0.1.0-a$b"
+        assert parsed["AIRGAP_X"] == 'q"uote'
+
+    def test_agreeing_env_has_no_problems(self, tmp_path: Path) -> None:
+        manifest = make_manifest()
+        rm.write_release_env(manifest, tmp_path / rm.RELEASE_ENV_NAME)
+        assert rm.release_env_problems(manifest, tmp_path / rm.RELEASE_ENV_NAME) == []
+
+    def test_disagreeing_env_reported(self, tmp_path: Path) -> None:
+        manifest = make_manifest()
+        text = rm.render_release_env(manifest).replace(
+            'AIRGAP_PYTHON_VERSION="3.13.15"', 'AIRGAP_PYTHON_VERSION="3.13.16"'
+        )
+        (tmp_path / rm.RELEASE_ENV_NAME).write_text(text, encoding="utf-8")
+        problems = rm.release_env_problems(manifest, tmp_path / rm.RELEASE_ENV_NAME)
+        assert any("AIRGAP_PYTHON_VERSION disagrees" in p for p in problems)
+
+    def test_missing_env_key_reported(self, tmp_path: Path) -> None:
+        manifest = make_manifest()
+        text = rm.render_release_env(manifest).replace("AIRGAP_APP_WHEEL", "AIRGAP_REMOVED_KEY")
+        (tmp_path / rm.RELEASE_ENV_NAME).write_text(text, encoding="utf-8")
+        problems = rm.release_env_problems(manifest, tmp_path / rm.RELEASE_ENV_NAME)
+        assert any("missing AIRGAP_APP_WHEEL" in p for p in problems)
+
+    def test_cli_check_env_exit_codes(self, tmp_path: Path) -> None:
+        write_fake_bundle(tmp_path)
+        helper = Path(rm.__file__)
+        ok = subprocess.run(
+            [sys.executable, str(helper), "check-env", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert ok.returncode == 0, ok.stdout + ok.stderr
+        env_path = tmp_path / rm.RELEASE_ENV_NAME
+        tampered = env_path.read_text(encoding="utf-8").replace(
+            'AIRGAP_APP_VERSION="0.1.0"', 'AIRGAP_APP_VERSION="9.9.9"'
+        )
+        env_path.write_text(tampered, encoding="utf-8")
+        bad = subprocess.run(
+            [sys.executable, str(helper), "check-env", str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert bad.returncode == 1
+        assert "AIRGAP_APP_VERSION disagrees" in bad.stdout
 
 
 class TestSchemaCompatibility:

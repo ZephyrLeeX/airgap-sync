@@ -37,6 +37,11 @@ dist/offline/
 
 - 依赖版本完全来自当前 `uv.lock`（`uv export --locked` 并与 lock 闭包交叉核对）；
 - 两个平台的 wheelhouse 只含 binary wheel，任何依赖只有 sdist 时构建失败；
+- Linux wheelhouse 只接受 CentOS 7 兼容 wheel：每个非 universal wheel 的
+  platform tag 中至少有一个 glibc <= 2.17 兼容 tag（manylinux2014 / 2_17 /
+  2_12 / 2010 / 1 / 2_5）。仅有 generic `linux_x86_64`、`musllinux` 或
+  `manylinux_2_18+` tag 的 wheel 会让构建失败（它们对 glibc 2.17 没有 ABI
+  承诺，加载即崩）；
 - Linux runtime（python-build-standalone）与上游 `SHA256SUMS` 逐一校验；
 - Windows installer（python.org）无自动可校验的上游 checksum，构建时输出
   WARNING，下载后自身 SHA256 写入 bundle 的 `SHA256SUMS`；
@@ -87,11 +92,20 @@ Bundle 不含任何真实密码 / Token；示例配置只引用 `password_env` /
 # 可选参数：-InstallRoot / -ConfigRoot / -DataRoot
 ```
 
-Install 顺序：Verify bundle → 平台检查 → 安装 Python runtime
+Install 顺序：Verify bundle → 平台检查 → 检查已有部署 → 安装 Python runtime
 （`runtimes\python-3.13.x`，静默官方 installer）→ 独立 release 目录 +
 venv → 离线 pip 安装（`--no-index --find-links wheelhouse`）→ import
 smoke test → `airgap-sync --version` → 写 `installed.json` → 建立
 `current` directory junction。**安装后不会自动启动 worker。**
+
+**Install 仅用于首次安装。**机器上已有 `current`（指向任何 release）时：
+
+- `current` 已指向本 bundle 的同一 release → 幂等 no-op（不重装、不切换）；
+- `current` 指向其他 release → `INSTALL_BLOCKED_EXISTING_DEPLOYMENT`，
+  提示 `Existing deployment detected. Use upgrade instead of install.`
+  不会安装新 release、不会修改 `current`、也不会自动转成 upgrade——
+  必须由操作员显式执行 `upgrade`（从而保留 worker 停止、config/SQLite
+  备份、schema 兼容检查与失败恢复的全部保障）。
 
 首次初始化配置（已存在则拒绝覆盖；升级永不修改现有 YAML）：
 
@@ -148,7 +162,12 @@ sudo ./airgap-sync-deploy.sh install
 #           --data-root /var/lib/airgap-sync
 ```
 
-`verify` / `install` 首先检查：
+`verify` / `install` / `upgrade` / `rollback` / `init-config` 首先通过
+checksum gate：确认 `SHA256SUMS` 与 `release.env` 存在，**在不 source
+`release.env` 的情况下** `sha256sum --check --strict` 全量校验，成功后才
+source `release.env` 并继续（后续 Verify 阶段会重复校验一次，成本可接受）。
+
+`verify` / `install` 还检查：
 
 ```text
 uname -m                  # 必须 x86_64
@@ -157,6 +176,10 @@ getconf GNU_LIBC_VERSION  # 必须 >= 2.17（bundle manifest 中的 minimum_glib
 
 不满足立即失败。绝不动 `/usr/bin/python`、`/usr/bin/python2`，也不清空
 incoming 目录（incoming 由外部 FTP Client 拥有）。
+
+Linux 端 Install 与 Windows 相同：仅首次安装。已有 `current` 指向其他
+release 时以 `INSTALL_BLOCKED_EXISTING_DEPLOYMENT` 拒绝，指向同一 release
+时幂等 no-op。
 
 Portable Python 来自 python-build-standalone
 （`x86_64-unknown-linux-gnu` / `install_only_stripped`，glibc >= 2.17
@@ -231,15 +254,52 @@ Windows 等价：
 - **side-by-side**：新版本安装到 `releases/<新 release-id>`，旧 release
   目录原样保留；
 - 切换 `current` 前依次完成：config 备份（`<config-root>/backups/<ts>/`）、
-  Source SQLite `state/meta.db` 备份（SQLite backup API，写入
+  **目标 Python runtime 安装**（side-by-side，见下）、Source SQLite
+  `state/meta.db` 备份（SQLite backup API，写入
   `<data-root>/backups/<ts>/meta.db`；Destination 端不做 mysqldump，
   数据库级备份由 DBA / 环境备份体系负责）、新 venv + 离线安装 + smoke
   test、**schema 兼容检查**（新 release 的 schema 低于当前 release 即失败）；
 - 任何发生在切换 `current` 之前的失败都不影响旧版本；脚本停止过的 service
   会在失败时尝试重新启动；
-- 同一 release 重复 upgrade / install 幂等：已完成 → no-op，未完成（无
+- 同一 release 重复 upgrade 幂等：已完成 → no-op，未完成（无
   `installed.json`）→ 安全重建；
-- 同一 Python patch 版本复用已有 runtime。
+- 同一 Python patch 版本复用已有 runtime；runtime 安装后校验
+  `release.env` 与 `release.json` 关键字段一致（`check-env`）。
+
+### Python runtime patch 升级（3.13.x → 3.13.y）
+
+新 bundle 的 Python patch 版本变化时（例如 `3.13.15 → 3.13.16`），升级顺序为：
+
+```text
+verify bundle → 平台检查 → stop worker → 确定 current → config 备份
+→ 安装目标 runtime（side-by-side，runtimes/python-3.13.16/）
+→ SQLite backup（此时目标 runtime 已存在，backup 不依赖未安装的解释器）
+→ 新 release venv → schema 兼容检查 → 切换 current
+```
+
+在 SQLite backup 之前安装 runtime 是安全的：安装 side-by-side runtime
+不会运行 Airgap Sync 应用代码，也不会迁移 metadata。所有触碰应用状态的
+步骤（新 venv、schema guard、current 切换）仍严格发生在 backup 之后。
+旧 runtime 目录（`runtimes/python-3.13.15/`）保留不删，回滚到旧 release
+时旧 venv 继续可用。
+
+SQLite backup 失败时（如 `meta.db` 损坏）：升级终止，`current` 仍指向旧
+release，新 release 目录不会创建。
+
+### Windows current 切换的失败恢复
+
+Windows 端切换 `current` 使用「临时 junction + GUID 唯一名」：
+
+```text
+创建 .current.new.<guid> junction 并确认可解析
+→ 旧 current 改名为 .current.old.<guid>
+→ .current.new.<guid> 改名为 current 并确认存在
+→ 删除 .current.old.<guid>（仅清理；失败只记 WARNING:
+   retired junction cleanup deferred，不回滚已成功的切换）
+```
+
+若最后一步改名失败：自动把 `.current.old.<guid>` 改回 `current` 恢复旧
+指针后抛错，upgrade/rollback 返回失败，`current` 仍指向原 release。
 
 ## 6. Rollback
 
@@ -288,12 +348,24 @@ Windows wrapper 始终调用 `<InstallRoot>\current\venv\Scripts\airgap-sync.exe
 
 ## 8. 安全要点
 
-- bundle 完整性：`verify` 阶段对 `SHA256SUMS` 全量校验，任何 mismatch
-  立即失败，不会继续安装；
+- bundle 完整性：需要 bundle 的动作（`verify` / `install` / `upgrade` /
+  `rollback` / `init-config`）先通过 checksum gate——`SHA256SUMS` 全量
+  校验通过后才 source `release.env`（Linux）或消费 manifest（Windows），
+  任何 mismatch 立即失败，不会继续安装；
+- SHA256SUMS 路径约束：清单中的路径必须是 bundle 内的相对路径，绝对路径、
+  盘符（`C:\...`）与 `..` 穿越（`../outside.file`）一律拒绝（共享
+  `release_manifest.py` 与 Windows 校验器同等强制）；
+- `release.env` 与 `release.json` 一致性：runtime 安装后用
+  `release_manifest.py check-env` 复核二者关键字段（release id、git
+  commit、版本、python 版本、平台、schema 版本、runtime/wheel 文件名）
+  一致，不一致拒绝使用该 bundle；
 - secrets 永远不进 bundle：示例配置只含 `password_env` / `token_env`
   变量名，部署脚本不询问也不保存密码；status 等输出不含任何 secret；
 - 离线 pip：安装始终 `--no-index --find-links <bundle>/wheelhouse` 且设置
   `PIP_NO_INDEX=1`，即使隔离机 DNS 可用也不会访问公网 PyPI；
+- Linux wheel ABI：构建期扫描 Linux wheelhouse，非 universal wheel 缺少
+  glibc <= 2.17 兼容 tag 即构建失败（generic `linux_x86_64` / `musllinux`
+  / `manylinux_2_18+` 不被接受为唯一 tag）；
 - 安装器不碰 MySQL：不建库、不建用户、不改表；安装后只提示下一步命令。
 
 ## 9. 离线集成测试（可选）
@@ -313,7 +385,8 @@ AIRGAP_TEST_MYSQL=... /tmp/testenv/bin/python -m pytest tests -m integration
 ## 10. 尚未在真实目标环境验证的事项
 
 - Windows Server 2019 实机安装（installer 静默参数、junction、PS 5.1
-  行为）需第一轮部署时实际验证；
+  行为）需第一轮部署时实际验证；`Switch-Current` 需在实机做故障注入
+  （临时 junction 创建失败、`current` 改名失败）确认旧指针恢复；
 - CentOS 7.9 实机 portable Python（glibc 2.17）运行需实机验证；
 - 真实离线 wheelhouse 安装（无 DNS / 无 PyPI）需实机验证。
 

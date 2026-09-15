@@ -9,7 +9,8 @@ Run from an elevated prompt when installing into the default locations.
 
 Actions:
   Verify           verify bundle integrity, platform and architecture
-  Install          install runtime + release and switch current
+  Install          FIRST INSTALL ONLY; refuses when a different release is
+                   already current (use Upgrade for that)
   Upgrade          install a new release side-by-side and switch current
   Rollback         re-point current to an earlier installed release
   Status           show install root, current release and installed releases
@@ -116,6 +117,12 @@ function Test-BundleChecksums {
         if ($parts.Count -ne 2) { Fail "malformed SHA256SUMS line: $trimmed" }
         $expected = $parts[0].ToLower()
         $relative = $parts[1].Trim().TrimStart('*') -replace '/', '\'
+        # Entries must stay inside the bundle root: no absolute paths, no
+        # drive letters, no ".." segments.
+        if ($relative -eq '' -or $relative.StartsWith('\') -or $relative.StartsWith('/') -or
+            ($relative -match '^[A-Za-z]:') -or ($relative.Split('\') -contains '..')) {
+            Fail "SHA256SUMS entry is not bundle-relative: $relative"
+        }
         $target = Join-Path $script:BundleRoot $relative
         if (-not (Test-Path -LiteralPath $target)) {
             Fail "missing file listed in SHA256SUMS: $relative"
@@ -197,19 +204,70 @@ function Get-CurrentReleaseId {
 }
 
 function Switch-Current([string] $ReleaseId) {
+    # Failure-recoverable current switch:
+    #   1. create a staged junction under a GUID name and confirm it resolves
+    #   2. retire the old current (rename, also under a GUID name)
+    #   3. rename staged -> current and confirm current exists
+    #   4. delete the retired junction (cleanup only; a failure here is a
+    #      WARNING, not a failed switch)
+    # If step 3 fails after step 2 retired the old current, the old junction
+    # is renamed back so `current` always points at a real release. GUID
+    # names avoid same-second collisions between consecutive switches.
     $target = Join-Path (Get-ReleasesDir) $ReleaseId
     if (-not (Test-Path -LiteralPath $target)) {
         Fail "cannot switch current: $target does not exist"
     }
     $current = Join-Path $InstallRoot 'current'
+    $unique = [Guid]::NewGuid().ToString('N')
+    $staged = Join-Path $InstallRoot ('.current.new.' + $unique)
     $retired = $null
-    if (Test-Path -LiteralPath $current) {
-        $retired = Join-Path $InstallRoot ('current.old.' + (Get-Date -Format 'yyyyMMddHHmmss'))
-        Rename-Item -LiteralPath $current -NewName (Split-Path -Leaf $retired)
+
+    New-Item -ItemType Junction -Path $staged -Value $target | Out-Null
+    if (-not (Test-Path -LiteralPath $staged)) {
+        Fail "staged junction was not created: $staged"
     }
-    New-Item -ItemType Junction -Path $current -Value $target | Out-Null
+    try {
+        if (Test-Path -LiteralPath $current) {
+            $retired = Join-Path $InstallRoot ('.current.old.' + $unique)
+            Rename-Item -LiteralPath $current -NewName (Split-Path -Leaf $retired)
+        }
+        Rename-Item -LiteralPath $staged -NewName 'current'
+        if (-not (Test-Path -LiteralPath $current)) {
+            Fail "current junction is missing after switch: $current"
+        }
+    } catch {
+        $restored = $false
+        if ($null -ne $retired) {
+            if (Test-Path -LiteralPath $current) {
+                $restored = $true
+            } else {
+                try {
+                    Rename-Item -LiteralPath $retired -NewName 'current'
+                    $restored = $true
+                } catch {
+                    $message = "CRITICAL: current switch failed and the previous current " +
+                        "could not be restored; repoint current to $retired manually"
+                    Write-Warning $message
+                }
+            }
+        }
+        if (Test-Path -LiteralPath $staged) {
+            try { Remove-Item -LiteralPath $staged -Force } catch { }
+        }
+        if ($null -ne $retired -and -not $restored) {
+            Fail ("current switch failed and the previous current junction was left at {0}" -f $retired)
+        }
+        throw
+    }
     if ($null -ne $retired) {
-        Remove-Item -LiteralPath $retired -Force
+        try {
+            Remove-Item -LiteralPath $retired -Force
+        } catch {
+            # The retired junction is only a leftover link; the active current
+            # already points at the new release. Do not fail a successful
+            # switch over cleanup.
+            Write-Warning "retired junction cleanup deferred: $retired"
+        }
     }
 }
 
@@ -373,17 +431,34 @@ function Write-NextSteps {
 }
 
 function Do-Install([object] $Manifest) {
-    Write-Stage '[1/6] Verify release bundle'
+    Write-Stage '[1/7] Verify release bundle'
     Invoke-VerifyBundle $Manifest
-    Write-Stage '[2/6] Check platform'
+    Write-Stage '[2/7] Check platform'
     Test-Platform $Manifest
-    Write-Stage '[3/6] Install Python runtime'
+    Write-Stage '[3/7] Check for existing deployment'
+    $current = Get-CurrentReleaseId
+    if ($null -ne $current) {
+        if ($current -eq $Manifest.release_id -and
+            (Get-ReleaseState (Join-Path (Get-ReleasesDir) $Manifest.release_id)) -eq 'complete') {
+            Write-Host "  release $($Manifest.release_id) is already installed and current; nothing to do"
+            Write-Host "Install complete (no-op): current -> $($Manifest.release_id)"
+            return
+        }
+        # Install is for first installs only: switching to a different
+        # release here would silently bypass worker stop, config/SQLite
+        # backups, the schema guard and upgrade failure recovery.
+        Write-Host 'Existing deployment detected.'
+        Write-Host 'Use upgrade instead of install.'
+        Fail ("INSTALL_BLOCKED_EXISTING_DEPLOYMENT: current -> {0}, this bundle installs {1}" -f $current, $Manifest.release_id)
+    }
+    Write-Host '  no existing deployment; proceeding with first install'
+    Write-Stage '[4/7] Install Python runtime'
     Install-Runtime $Manifest
-    Write-Stage ('[4/6] Create release directory {0}' -f (Join-Path (Get-ReleasesDir) $Manifest.release_id))
+    Write-Stage ('[5/7] Create release directory {0}' -f (Join-Path (Get-ReleasesDir) $Manifest.release_id))
     Ensure-ReleaseInstalled $Manifest
-    Write-Stage '[5/6] Switch current'
+    Write-Stage '[6/7] Switch current'
     Switch-Current $Manifest.release_id
-    Write-Stage '[6/6] Done'
+    Write-Stage '[7/7] Done'
     Write-Host "Install complete: current -> $($Manifest.release_id)"
     Write-NextSteps
 }
@@ -405,10 +480,17 @@ function Do-Upgrade([object] $Manifest) {
         }
         Write-Stage '[4/8] Backup config'
         Backup-Configs
-        Write-Stage '[5/8] Backup Source SQLite state (when present)'
-        Backup-Sqlite $Manifest
-        Write-Stage '[6/8] Install Python runtime (when needed)'
+        # Install the TARGET runtime before the SQLite backup: the backup runs
+        # under the target bundle's python, which does not exist yet on a
+        # Python patch upgrade (e.g. 3.13.15 -> 3.13.16). Installing this
+        # side-by-side runtime is safe before the backup: it runs no
+        # application code and migrates no metadata. Everything that touches
+        # application state (new venv, schema guard, current switch) still
+        # happens only after the backup.
+        Write-Stage '[5/8] Install target Python runtime (side-by-side, shared)'
         Install-Runtime $Manifest
+        Write-Stage '[6/8] Backup Source SQLite state (when present)'
+        Backup-Sqlite $Manifest
         Write-Stage '[7/8] Install new release + schema compatibility check'
         Ensure-ReleaseInstalled $Manifest
         if ($null -ne $current) {
@@ -421,7 +503,7 @@ function Do-Upgrade([object] $Manifest) {
         Write-Stage '[8/8] Switch current'
         Switch-Current $Manifest.release_id
     } catch {
-        Write-Host "ERROR: upgrade failed before switching current; current release is unchanged: $_" -ForegroundColor Red
+        Write-Host "ERROR: upgrade failed; any partial current switch was rolled back so the current release is unchanged: $_" -ForegroundColor Red
         if ($null -ne $script:StoppedService) {
             Write-Host "NOTE: attempting to restart $($script:StoppedService)"
             try { Start-Service -Name $script:StoppedService -ErrorAction Stop } catch { }
@@ -467,7 +549,7 @@ function Do-Rollback([object] $Manifest) {
         Write-Stage '[4/5] Switch current (new release directory is kept)'
         Switch-Current $ToRelease
     } catch {
-        Write-Host "ERROR: rollback failed before switching current: $_" -ForegroundColor Red
+        Write-Host "ERROR: rollback failed; any partial current switch was rolled back so the current release is unchanged: $_" -ForegroundColor Red
         if ($null -ne $script:StoppedService) {
             try { Start-Service -Name $script:StoppedService -ErrorAction Stop } catch { }
         }

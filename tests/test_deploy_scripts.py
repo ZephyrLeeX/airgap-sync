@@ -1,18 +1,35 @@
-"""部署脚本静态检查: bash 语法、(可选) PowerShell 语法、service 示例约束。"""
+"""部署脚本检查: bash 语法、Linux 真实功能测试、PowerShell 静态约束、service 示例约束。"""
 
 from __future__ import annotations
 
+import io
 import os
+import platform as python_platform
 import shutil
+import sqlite3
 import subprocess
+import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
+
+import release_manifest as rm
 
 OFFLINE_DIR = Path(__file__).resolve().parent.parent / "scripts" / "offline"
 DEPLOY_SH = OFFLINE_DIR / "airgap-sync-deploy.sh"
 DEPLOY_PS1 = OFFLINE_DIR / "airgap-sync-deploy.ps1"
 SERVICE_DIR = OFFLINE_DIR / "service-examples"
+
+APP_VERSION = "0.1.0"
+TEST_DIST = "airgapsynctestapp"
+COMMIT_A = "aa" * 20
+COMMIT_C = "bb" * 20
+RELEASE_A = f"{APP_VERSION}-{COMMIT_A[:7]}"
+RELEASE_C = f"{APP_VERSION}-{COMMIT_C[:7]}"
+PYTHON_15 = "3.13.15"
+PYTHON_16 = "3.13.16"
 
 
 class TestShellScript:
@@ -51,6 +68,392 @@ class TestPowerShellScript:
             text=True,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def ps1_function_body(name: str) -> str:
+    """Extract one top-level function definition from the deploy script."""
+    text = DEPLOY_PS1.read_text(encoding="utf-8")
+    start = text.index(f"function {name}")
+    following = text.find("\nfunction ", start + 1)
+    return text[start:] if following == -1 else text[start:following]
+
+
+class TestPowerShellStaticConstraints:
+    """无 Windows CI 时的静态约束: install guard / 升级顺序 / junction 切换可恢复。"""
+
+    def test_install_guard_blocks_existing_deployment(self) -> None:
+        body = ps1_function_body("Do-Install")
+        assert "Get-CurrentReleaseId" in body
+        assert "INSTALL_BLOCKED_EXISTING_DEPLOYMENT" in body
+        assert "Use upgrade instead of install." in body
+        assert "already installed and current; nothing to do" in body
+        # guard 必须发生在安装 runtime / release 之前
+        assert body.index("Get-CurrentReleaseId") < body.index("Install-Runtime $Manifest")
+
+    def test_upgrade_installs_target_runtime_before_sqlite_backup(self) -> None:
+        body = ps1_function_body("Do-Upgrade")
+        assert body.index("Install-Runtime $Manifest") < body.index("Backup-Sqlite $Manifest")
+
+    def test_switch_current_stages_junction_before_retiring_old(self) -> None:
+        body = ps1_function_body("Switch-Current")
+        assert body.index("New-Item -ItemType Junction") < body.index(
+            "Rename-Item -LiteralPath $current"
+        )
+        # 确认临时 junction 创建成功后才允许动旧 current
+        assert "staged junction was not created" in body
+        assert "current junction is missing after switch" in body
+
+    def test_switch_current_uses_guid_unique_names(self) -> None:
+        body = ps1_function_body("Switch-Current")
+        assert "[Guid]::NewGuid()" in body
+        assert ".current.new." in body and ".current.old." in body
+        assert "yyyyMMddHHmmss" not in body  # 时间戳命名有同秒冲突风险
+
+    def test_switch_current_restores_old_pointer_on_failure(self) -> None:
+        body = ps1_function_body("Switch-Current")
+        assert "Rename-Item -LiteralPath $retired -NewName 'current'" in body
+        assert "could not be restored" in body
+
+    def test_switch_current_cleanup_failure_is_warning_only(self) -> None:
+        body = ps1_function_body("Switch-Current")
+        assert "retired junction cleanup deferred" in body
+        # retired 清理在 try/catch 中, 不能让已成功的切换判回失败
+        cleanup_at = body.index("retired junction cleanup deferred")
+        remove_at = body.rindex("Remove-Item -LiteralPath $retired")
+        assert remove_at < cleanup_at
+
+    def test_checksum_verifier_rejects_paths_outside_bundle(self) -> None:
+        body = ps1_function_body("Test-BundleChecksums")
+        assert "-contains '..'" in body
+        assert "^[A-Za-z]:" in body
+
+
+# ---------------------------------------------------------------------------
+# Linux 真实功能测试: 在临时目录组装 checksum-valid 的假 bundle, 真跑部署脚本。
+# runtime 是一个指向测试解释器的 shim, app wheel 是带 console script 的真 wheel,
+# 因此 install/upgrade/rollback 走完整真实流程 (venv / pip / smoke / current)。
+# ---------------------------------------------------------------------------
+
+
+def _require_linux_x86_64_glibc() -> None:
+    if sys.platform != "linux" or shutil.which("bash") is None:
+        pytest.skip("requires Linux with bash")
+    if python_platform.machine() != "x86_64":
+        pytest.skip("deploy script requires an x86_64 host")
+    glibc = subprocess.run(["getconf", "GNU_LIBC_VERSION"], capture_output=True, text=True)
+    if glibc.returncode != 0 or "glibc" not in glibc.stdout:
+        pytest.skip("requires glibc (deploy script platform check)")
+
+
+SMOKE_APP_STUB_MODULES = (
+    "airgap_sync",
+    "click",
+    "pydantic",
+    "pymysql",
+    "yaml",
+    "requests",
+    "zstandard",
+)
+
+
+def make_app_wheel(directory: Path, app_version: str) -> str:
+    """A real, dependency-free wheel providing the smoke-test imports + CLI."""
+    wheel_name = f"{TEST_DIST}-{app_version}-py3-none-any.whl"
+    directory.mkdir(parents=True, exist_ok=True)
+    payload: list[tuple[str, str]] = [
+        (
+            f"{TEST_DIST}/__init__.py",
+            f"def main():\n    print('airgap-sync {app_version}')\n",
+        ),
+        *(
+            (f"{module}.py", "# test stub satisfying smoke-app imports\n")
+            for module in SMOKE_APP_STUB_MODULES
+        ),
+        (
+            f"{TEST_DIST}-{app_version}.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: {TEST_DIST}\nVersion: {app_version}\n",
+        ),
+        (
+            f"{TEST_DIST}-{app_version}.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        ),
+        (
+            f"{TEST_DIST}-{app_version}.dist-info/entry_points.txt",
+            f"[console_scripts]\nairgap-sync = {TEST_DIST}:main\n",
+        ),
+    ]
+    record_name = f"{TEST_DIST}-{app_version}.dist-info/RECORD"
+    record = "".join(f"{name},,\n" for name, _ in payload) + f"{record_name},,\n"
+    with zipfile.ZipFile(directory / wheel_name, "w") as archive:
+        for name, data in payload:
+            archive.writestr(name, data)
+        archive.writestr(record_name, record)
+    return wheel_name
+
+
+def make_runtime_tarball(path: Path) -> None:
+    """A tarball whose python/bin/python3 execs the test interpreter."""
+    shim = f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'
+    with tarfile.open(path, "w:gz") as archive:
+        info = tarfile.TarInfo("python/bin/python3")
+        info.size = len(shim.encode("utf-8"))
+        info.mode = 0o755
+        archive.addfile(info, io.BytesIO(shim.encode("utf-8")))
+
+
+def build_test_bundle(
+    bundle: Path,
+    *,
+    release_id: str,
+    git_commit: str,
+    python_version: str = PYTHON_15,
+    env_extra: str = "",
+) -> Path:
+    """Assemble a checksum-valid bundle that the real deploy script can install."""
+    for name in ("runtime", "app", "wheelhouse", "config"):
+        (bundle / name).mkdir(parents=True)
+    runtime_artifact = (
+        f"cpython-{python_version}+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
+    )
+    make_runtime_tarball(bundle / "runtime" / runtime_artifact)
+    app_wheel = make_app_wheel(bundle / "app", APP_VERSION)
+    shutil.copy(bundle / "app" / app_wheel, bundle / "wheelhouse" / app_wheel)
+    (bundle / "config" / "source.example.yaml").write_text("role: source\n")
+    (bundle / "config" / "destination.example.yaml").write_text("role: destination\n")
+    shutil.copy(OFFLINE_DIR / "airgap-sync-deploy.sh", bundle / "airgap-sync-deploy.sh")
+    shutil.copy(OFFLINE_DIR / rm.HELPER_SCRIPT_NAME, bundle / rm.HELPER_SCRIPT_NAME)
+    manifest = rm.ReleaseManifest(
+        release_id=release_id,
+        app_version=APP_VERSION,
+        git_commit=git_commit,
+        created_at="2026-09-15T00:00:00+00:00",
+        python_version=python_version,
+        platform_os="linux",
+        platform_arch="x86_64",
+        minimum_glibc="2.17",
+        source_state_schema=4,
+        destination_metadata_schema=3,
+        runtime_artifact=runtime_artifact,
+        app_wheel=app_wheel,
+        wheel_count=1,
+        include_tests=False,
+    )
+    manifest.dump(bundle / rm.MANIFEST_NAME)
+    rm.write_release_env(manifest, bundle / rm.RELEASE_ENV_NAME)
+    if env_extra:
+        env_path = bundle / rm.RELEASE_ENV_NAME
+        env_path.write_text(env_path.read_text(encoding="utf-8") + env_extra, encoding="utf-8")
+    rm.write_sha256sums(bundle, rm.bundle_payload_files(bundle))
+    return bundle
+
+
+def run_deploy(bundle: Path, *args: str, timeout: int = 600) -> subprocess.CompletedProcess:
+    script = bundle / "airgap-sync-deploy.sh"
+    return subprocess.run(
+        ["bash", str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+@pytest.fixture()
+def deploy_env(tmp_path: Path):
+    """Install/config/data roots + a bundle for release A (python 3.13.15)."""
+    _require_linux_x86_64_glibc()
+    return {
+        "install_root": tmp_path / "opt" / "airgap-sync",
+        "config_root": tmp_path / "etc" / "airgap-sync",
+        "data_root": tmp_path / "var" / "lib" / "airgap-sync",
+        "bundle_a": build_test_bundle(
+            tmp_path / "bundle-a", release_id=RELEASE_A, git_commit=COMMIT_A
+        ),
+    }
+
+
+def deploy_args(env: dict, *args: str) -> tuple[str, ...]:
+    return (
+        *args,
+        "--install-root",
+        str(env["install_root"]),
+        "--config-root",
+        str(env["config_root"]),
+        "--data-root",
+        str(env["data_root"]),
+    )
+
+
+def current_release(env: dict) -> str | None:
+    current = env["install_root"] / "current"
+    if not current.is_symlink():
+        return None
+    return current.resolve().name
+
+
+def write_state_db(env: dict, rows: list[int]) -> None:
+    db = env["data_root"] / "state" / "meta.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(x,) for x in rows])
+    conn.commit()
+    conn.close()
+
+
+class TestLinuxInstallGuard:
+    def test_first_install_allowed_and_switches_current(self, deploy_env: dict) -> None:
+        result = run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install"))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert current_release(deploy_env) == RELEASE_A
+        release_dir = deploy_env["install_root"] / "releases" / RELEASE_A
+        assert (release_dir / "installed.json").is_file()
+        assert (release_dir / "venv" / "bin" / "airgap-sync").is_file()
+        assert (deploy_env["install_root"] / "runtimes" / f"python-{PYTHON_15}").is_dir()
+
+    def test_install_same_release_is_idempotent_noop(self, deploy_env: dict) -> None:
+        assert (
+            run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install")).returncode == 0
+        )
+        result = run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install"))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "already installed and current" in result.stdout
+        assert current_release(deploy_env) == RELEASE_A
+
+    def test_install_different_release_blocked_and_current_unchanged(
+        self, deploy_env: dict, tmp_path: Path
+    ) -> None:
+        assert (
+            run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install")).returncode == 0
+        )
+        bundle_c = build_test_bundle(
+            tmp_path / "bundle-c", release_id=RELEASE_C, git_commit=COMMIT_C
+        )
+        result = run_deploy(bundle_c, *deploy_args(deploy_env, "install"))
+        assert result.returncode != 0
+        assert "INSTALL_BLOCKED_EXISTING_DEPLOYMENT" in result.stdout + result.stderr
+        assert "Use upgrade instead of install." in result.stdout + result.stderr
+        # current 不变, 新 release 未安装
+        assert current_release(deploy_env) == RELEASE_A
+        assert not (deploy_env["install_root"] / "releases" / RELEASE_C).exists()
+
+
+class TestLinuxUpgradeRuntimeOrdering:
+    def test_python_patch_upgrade_installs_runtime_before_sqlite_backup(
+        self, deploy_env: dict, tmp_path: Path
+    ) -> None:
+        assert (
+            run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install")).returncode == 0
+        )
+        write_state_db(deploy_env, [42])
+        new_runtime = deploy_env["install_root"] / "runtimes" / f"python-{PYTHON_16}"
+        assert not new_runtime.exists()  # 3.13.16 尚未安装
+
+        bundle_c = build_test_bundle(
+            tmp_path / "bundle-c",
+            release_id=RELEASE_C,
+            git_commit=COMMIT_C,
+            python_version=PYTHON_16,
+        )
+        result = run_deploy(
+            bundle_c, *deploy_args(deploy_env, "upgrade", "--assume-worker-stopped")
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        # 顺序: 目标 runtime 先装 → SQLite backup → 新 release → 切 current
+        order = [
+            result.stdout.index("Install target Python runtime"),
+            result.stdout.index("Backup Source SQLite state"),
+            result.stdout.index("Install new release"),
+            result.stdout.index("Switch current"),
+        ]
+        assert order == sorted(order), result.stdout
+
+        assert (new_runtime / ".runtime-installed").is_file()
+        backups = sorted((deploy_env["data_root"] / "backups").glob("*/meta.db"))
+        assert backups, "SQLite backup missing"
+        conn = sqlite3.connect(backups[-1])
+        assert [row[0] for row in conn.execute("SELECT x FROM t")] == [42]
+        conn.close()
+        assert current_release(deploy_env) == RELEASE_C
+
+    def test_sqlite_backup_failure_leaves_current_unchanged(
+        self, deploy_env: dict, tmp_path: Path
+    ) -> None:
+        assert (
+            run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install")).returncode == 0
+        )
+        corrupt = deploy_env["data_root"] / "state" / "meta.db"
+        corrupt.parent.mkdir(parents=True, exist_ok=True)
+        corrupt.write_bytes(b"definitely not a sqlite database")
+        bundle_c = build_test_bundle(
+            tmp_path / "bundle-c",
+            release_id=RELEASE_C,
+            git_commit=COMMIT_C,
+            python_version=PYTHON_16,
+        )
+        result = run_deploy(
+            bundle_c, *deploy_args(deploy_env, "upgrade", "--assume-worker-stopped")
+        )
+        assert result.returncode != 0
+        assert "SQLite backup failed" in result.stdout + result.stderr
+        assert current_release(deploy_env) == RELEASE_A
+        assert not (deploy_env["install_root"] / "releases" / RELEASE_C).exists()
+
+    def test_rollback_repoints_current(self, deploy_env: dict, tmp_path: Path) -> None:
+        first = run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install"))
+        assert first.returncode == 0, first.stdout + first.stderr
+        bundle_c = build_test_bundle(
+            tmp_path / "bundle-c",
+            release_id=RELEASE_C,
+            git_commit=COMMIT_C,
+            python_version=PYTHON_16,
+        )
+        upgrade = run_deploy(
+            bundle_c, *deploy_args(deploy_env, "upgrade", "--assume-worker-stopped")
+        )
+        assert upgrade.returncode == 0, upgrade.stdout + upgrade.stderr
+        rollback = run_deploy(
+            bundle_c,
+            *deploy_args(
+                deploy_env, "rollback", "--to-release", RELEASE_A, "--assume-worker-stopped"
+            ),
+        )
+        assert rollback.returncode == 0, rollback.stdout + rollback.stderr
+        assert current_release(deploy_env) == RELEASE_A
+
+
+class TestLinuxIntegrityGate:
+    def test_release_env_not_sourced_when_gate_fails(
+        self, deploy_env: dict, tmp_path: Path
+    ) -> None:
+        marker = tmp_path / "poison-marker"
+        poison = f'AIRGAP_POISON="x"; touch {marker}\n'
+        bundle = build_test_bundle(
+            tmp_path / "bundle-poison",
+            release_id=RELEASE_A,
+            git_commit=COMMIT_A,
+            env_extra=poison,
+        )
+        # 破坏一个 wheel → checksum gate 必须失败; release.env 不得被 source
+        wheel = next((bundle / "wheelhouse").glob("*.whl"))
+        wheel.write_bytes(b"corrupted")
+        result = run_deploy(bundle, *deploy_args(deploy_env, "verify"))
+        assert result.returncode != 0
+        assert "bundle integrity check failed" in result.stdout + result.stderr
+        assert not marker.exists()
+
+    def test_release_env_sourced_after_gate_passes(self, deploy_env: dict, tmp_path: Path) -> None:
+        marker = tmp_path / "poison-marker"
+        poison = f'AIRGAP_POISON="x"; touch {marker}\n'
+        bundle = build_test_bundle(
+            tmp_path / "bundle-poison-ok",
+            release_id=RELEASE_A,
+            git_commit=COMMIT_A,
+            env_extra=poison,
+        )
+        result = run_deploy(bundle, *deploy_args(deploy_env, "verify"))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert marker.exists()
 
 
 class TestServiceExamples:

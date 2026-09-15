@@ -3,7 +3,8 @@
 #
 # Actions:
 #   verify            verify bundle integrity, platform and architecture
-#   install           install runtime + release and switch current
+#   install           FIRST INSTALL ONLY; refuses when a different release
+#                     is already current (use upgrade for that)
 #   upgrade           install a new release side-by-side and switch current
 #   rollback          re-point current to an earlier installed release
 #   status            show install root, current release and installed releases
@@ -42,7 +43,8 @@ Usage: ./airgap-sync-deploy.sh <action> [options]
 
 Actions:
   verify            verify bundle integrity, platform and architecture
-  install           install runtime + release and switch current
+  install           FIRST INSTALL ONLY; refuses when a different release
+                    is already current (use upgrade for that)
   upgrade           install a new release side-by-side and switch current
   rollback          re-point current to an earlier installed release
   status            show install root, current release and installed releases
@@ -100,13 +102,33 @@ done
 
 [ -n "$ACTION" ] || { usage; die "an action is required"; }
 
-if [ -f "$BUNDLE_ROOT/release.env" ]; then
+# Bundle-consuming actions must pass the checksum gate BEFORE any bundle
+# metadata is read: SHA256SUMS is verified first and only then is release.env
+# (executable metadata from the bundle's point of view) sourced. status and
+# verify-installed operate on the installed tree only and merely use
+# release.env best-effort when it happens to be present.
+gate_bundle() {
+  [ -f "$BUNDLE_ROOT/SHA256SUMS" ] \
+    || die "SHA256SUMS not found next to this script; run from an extracted bundle"
+  [ -f "$BUNDLE_ROOT/release.env" ] \
+    || die "release.env not found next to this script; run from an extracted bundle"
+  stage "Verify bundle checksums (gate before reading release.env)"
+  (cd "$BUNDLE_ROOT" && sha256sum --check --quiet --strict SHA256SUMS) \
+    || die "bundle integrity check failed; do not use this bundle"
   # shellcheck disable=SC1091
   . "$BUNDLE_ROOT/release.env"
-else
-  [ "$ACTION" = "rollback" ] || [ "$ACTION" = "status" ] || [ "$ACTION" = "verify-installed" ] \
-    || die "release.env not found next to this script; run from an extracted bundle"
-fi
+}
+
+case "$ACTION" in
+  verify|install|upgrade|rollback|init-config)
+    gate_bundle ;;
+  status|verify-installed)
+    if [ -f "$BUNDLE_ROOT/release.env" ]; then
+      # shellcheck disable=SC1091
+      . "$BUNDLE_ROOT/release.env"
+    fi
+    ;;
+esac
 
 RUNTIME_DIR="$INSTALL_ROOT/runtimes/python-${AIRGAP_PYTHON_VERSION:-unknown}"
 RUNTIME_PY="$RUNTIME_DIR/python/bin/python3"
@@ -178,17 +200,22 @@ install_runtime() {
   stage "Install Python runtime $AIRGAP_PYTHON_VERSION (shared across releases)"
   if [ -f "$RUNTIME_DIR/.runtime-installed" ]; then
     echo "  runtime already installed at $RUNTIME_DIR, reusing"
-    return 0
+  else
+    if [ -d "$RUNTIME_DIR" ]; then
+      echo "  incomplete runtime found, re-extracting"
+      rm -rf "$RUNTIME_DIR"
+    fi
+    mkdir -p "$RUNTIME_DIR"
+    tar -xzf "$BUNDLE_ROOT/runtime/$AIRGAP_RUNTIME_ARTIFACT" -C "$RUNTIME_DIR"
+    [ -x "$RUNTIME_PY" ] || die "runtime python not found at $RUNTIME_PY after extraction"
+    "$RUNTIME_PY" "$BUNDLE_ROOT/release_manifest.py" smoke-runtime
+    touch "$RUNTIME_DIR/.runtime-installed"
   fi
-  if [ -d "$RUNTIME_DIR" ]; then
-    echo "  incomplete runtime found, re-extracting"
-    rm -rf "$RUNTIME_DIR"
-  fi
-  mkdir -p "$RUNTIME_DIR"
-  tar -xzf "$BUNDLE_ROOT/runtime/$AIRGAP_RUNTIME_ARTIFACT" -C "$RUNTIME_DIR"
-  [ -x "$RUNTIME_PY" ] || die "runtime python not found at $RUNTIME_PY after extraction"
-  "$RUNTIME_PY" "$BUNDLE_ROOT/release_manifest.py" smoke-runtime
-  touch "$RUNTIME_DIR/.runtime-installed"
+  # Always confirm this bundle's release.env and release.json agree, even when
+  # the shared runtime is reused: the bundle is new even though the runtime
+  # is not.
+  "$RUNTIME_PY" "$BUNDLE_ROOT/release_manifest.py" check-env "$BUNDLE_ROOT" \
+    || die "release.env and release.json disagree; this bundle is inconsistent"
 }
 
 # release_state DIR: missing | incomplete | complete (bash-only, no python).
@@ -316,15 +343,33 @@ print_next_steps() {
 }
 
 do_install() {
-  stage "[1/8] Verify release bundle"
+  stage "[1/6] Verify release bundle"
   verify_bundle_action
-  stage "[2/8] Check platform"
+  stage "[2/6] Check platform"
   check_platform
-  stage "[3/8] Install Python runtime"
+  stage "[3/6] Check for existing deployment"
+  if [ -e "$CURRENT" ] || [ -L "$CURRENT" ]; then
+    local current
+    current="$(current_release_id || true)"
+    if [ "$current" = "$AIRGAP_RELEASE_ID" ] \
+      && [ "$(release_state "$RELEASE_DIR")" = "complete" ]; then
+      echo "  release $AIRGAP_RELEASE_ID is already installed and current; nothing to do"
+      echo "Install complete (no-op): current -> $AIRGAP_RELEASE_ID"
+      return 0
+    fi
+    # Install is for first installs only: switching to a different release
+    # here would silently bypass worker stop, config/SQLite backups, the
+    # schema guard and upgrade failure recovery.
+    echo "Existing deployment detected." >&2
+    echo "Use upgrade instead of install." >&2
+    die "INSTALL_BLOCKED_EXISTING_DEPLOYMENT: current -> ${current:-<broken pointer>}, this bundle installs $AIRGAP_RELEASE_ID"
+  fi
+  echo "  no existing deployment; proceeding with first install"
+  stage "[4/6] Install Python runtime"
   install_runtime
-  stage "[4/8] Create release directory $RELEASE_DIR"
+  stage "[5/6] Create release directory $RELEASE_DIR"
   ensure_release_installed
-  stage "[5/8] Switch current"
+  stage "[6/6] Switch current"
   switch_current "$AIRGAP_RELEASE_ID"
   echo "Install complete: current -> $AIRGAP_RELEASE_ID"
   print_next_steps
@@ -350,10 +395,16 @@ do_upgrade() {
   fi
   stage "[4/9] Backup config"
   backup_configs
-  stage "[5/9] Backup Source SQLite state (when present)"
-  backup_sqlite
-  stage "[6/9] Install Python runtime (when needed)"
+  # Install the TARGET runtime before the SQLite backup: the backup runs under
+  # the target bundle's python, which does not exist yet on a Python patch
+  # upgrade (e.g. 3.13.15 -> 3.13.16). Installing this side-by-side runtime
+  # is safe before the backup: it runs no application code and migrates no
+  # metadata. Everything that touches application state (new venv, schema
+  # guard, current switch) still happens only after the backup.
+  stage "[5/9] Install target Python runtime (side-by-side, shared)"
   install_runtime
+  stage "[6/9] Backup Source SQLite state (when present)"
+  backup_sqlite
   stage "[7/9] Install new release"
   ensure_release_installed
   stage "[8/9] Schema compatibility check"

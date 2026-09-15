@@ -244,6 +244,52 @@ def write_release_env(manifest: ReleaseManifest, path: Path) -> None:
     path.write_text(render_release_env(manifest), encoding="utf-8")
 
 
+def parse_release_env_text(text: str) -> dict[str, str]:
+    """Parse a release.env into ``AIRGAP_* -> string value`` (unquoted).
+
+    Only understands the exact shape :func:`render_release_env` produces
+    (``KEY="escaped"`` or bare ``KEY=123``); anything else is reported as a
+    parse problem by the caller via a missing key, so no lenient fallback.
+    """
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, raw = line.partition("=")
+        if not separator or not key.startswith("AIRGAP_"):
+            continue
+        raw = raw.strip()
+        if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"'):
+            # single-pass inverse of render_release_env's escaping
+            raw = re.sub(r"\\(.)", r"\1", raw[1:-1])
+        values[key.strip()] = raw
+    return values
+
+
+def release_env_problems(manifest: ReleaseManifest, env_path: Path) -> list[str]:
+    """Compare release.env against release.json (must agree on every field).
+
+    The builder writes both from one in-memory manifest; this deploy-side
+    check makes sure a hand-edited or mixed-pair bundle is rejected instead
+    of half-trusted.
+    """
+    try:
+        actual = parse_release_env_text(env_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return [f"cannot read {env_path}: {exc}"]
+    expected = parse_release_env_text(render_release_env(manifest))
+    problems = []
+    for key in sorted(expected):
+        if key not in actual:
+            problems.append(f"release.env is missing {key}")
+        elif actual[key] != expected[key]:
+            problems.append(
+                f"{key} disagrees: release.env={actual[key]!r} vs release.json={expected[key]!r}"
+            )
+    return problems
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -259,6 +305,27 @@ def write_sha256sums(root: Path, relative_paths: Sequence[str]) -> None:
         digest = sha256_file(root / relative)
         entries.append(f"{digest}  {relative}")
     (root / SHA256SUMS_NAME).write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+
+def validate_sums_relative_path(relative: str) -> str | None:
+    """Return an error message when a SHA256SUMS path may escape the bundle.
+
+    Entries must be relative POSIX paths that stay inside the bundle root:
+    absolute paths, Windows drive letters, and any ``..`` segment are
+    rejected. Builder output is always safe; this guards against a tampered
+    checksum file pointing verification at files outside the bundle.
+    """
+    if not relative:
+        return "empty path"
+    normalized = relative.replace("\\", "/")
+    if normalized.startswith("/"):
+        return f"absolute paths are not allowed: {relative!r}"
+    if re.fullmatch(r"[A-Za-z]:.*", normalized):
+        return f"Windows drive paths are not allowed: {relative!r}"
+    segments = normalized.split("/")
+    if ".." in segments:
+        return f"path traversal (..) is not allowed: {relative!r}"
+    return None
 
 
 def read_sha256sums(path: Path) -> list[tuple[str, str]]:
@@ -279,7 +346,11 @@ def read_sha256sums(path: Path) -> list[tuple[str, str]]:
         relative = relative.strip().lstrip("*")
         if not HEX_SHA256_PATTERN.fullmatch(digest):
             raise ReleaseManifestError(f"malformed sha256 in SHA256SUMS: {digest!r}")
-        entries.append((digest, relative.replace("\\", "/")))
+        posix_relative = relative.replace("\\", "/")
+        problem = validate_sums_relative_path(posix_relative)
+        if problem:
+            raise ReleaseManifestError(f"SHA256SUMS entry is not bundle-relative: {problem}")
+        entries.append((digest, posix_relative))
     return entries
 
 
@@ -467,6 +538,9 @@ def _cli() -> int:
     state_parser = sub.add_parser("install-state", help="print release directory state")
     state_parser.add_argument("release_dir", type=Path)
 
+    env_parser = sub.add_parser("check-env", help="verify release.env agrees with release.json")
+    env_parser.add_argument("root", type=Path, help="extracted bundle root")
+
     marker_parser = sub.add_parser(
         "mark-installed", help="write the installed.json completion marker"
     )
@@ -497,6 +571,19 @@ def _cli() -> int:
         return 0
     if args.command == "install-state":
         print(install_state(args.release_dir))
+        return 0
+    if args.command == "check-env":
+        try:
+            manifest = ReleaseManifest.load(args.root / MANIFEST_NAME)
+        except ReleaseManifestError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        problems = release_env_problems(manifest, args.root / RELEASE_ENV_NAME)
+        for problem in problems:
+            print(f"ERROR: {problem}")
+        if problems:
+            return 1
+        print("release.env and release.json agree")
         return 0
     if args.command == "mark-installed":
         manifest = ReleaseManifest.load(args.release_json)

@@ -56,14 +56,31 @@ TRANSIENT_BUILD_ENTRIES = (
 
 # pip --platform expansion accepts these and resolves every manylinux wheel
 # compatible with glibc <= 2.17 (manylinux2014 == manylinux_2_17).
+# Generic linux_x86_64 is deliberately absent: such wheels carry no glibc ABI
+# promise and may be built against glibc > 2.17 (they would fail to load on
+# CentOS 7). The post-download ABI guard below rejects any wheel that slips
+# through with no glibc <= 2.17 tag at all.
 LINUX_DOWNLOAD_PLATFORMS = (
     "manylinux2014_x86_64",
     "manylinux_2_17_x86_64",
     "manylinux1_x86_64",
     "manylinux_2_5_x86_64",
-    "linux_x86_64",
 )
 WINDOWS_DOWNLOAD_PLATFORMS = ("win_amd64",)
+
+# Platform tags CentOS 7 (glibc 2.17) can load. manylinux_2_N with
+# (2, N) <= (2, 17) is accepted via MANYLINUX_TAG_PATTERN.
+CENTOS7_COMPATIBLE_PLATFORM_TAGS = frozenset(
+    {
+        "manylinux1_x86_64",
+        "manylinux2010_x86_64",
+        "manylinux2014_x86_64",
+        "manylinux_2_5_x86_64",
+        "manylinux_2_12_x86_64",
+        "manylinux_2_17_x86_64",
+    }
+)
+MANYLINUX_TAG_PATTERN = re.compile(r"^manylinux_2_(\d+)_(\d+)_x86_64$")
 
 PLATFORM_SPECS = {
     "windows": {
@@ -328,6 +345,63 @@ def validate_wheelhouse(directory: Path, pins: dict[str, str]) -> tuple[int, lis
     return len(wheel_names), unresolved, sdists
 
 
+def is_centos7_compatible_platform_tag(tag: str) -> bool:
+    """True when a single wheel platform tag promises glibc <= 2.17 x86_64."""
+    if tag in CENTOS7_COMPATIBLE_PLATFORM_TAGS:
+        return True
+    match = MANYLINUX_TAG_PATTERN.fullmatch(tag)
+    return bool(match) and (int(match.group(1)), int(match.group(2))) <= (2, 17)
+
+
+def wheel_platform_tags(wheel_name: str) -> list[str]:
+    """Platform tags from a wheel filename (``{...}-{py}-{abi}-{platform}.whl``)."""
+    stem = wheel_name[:-4] if wheel_name.endswith(".whl") else wheel_name
+    parts = stem.split("-")
+    if len(parts) < 5:
+        raise BuildError(f"malformed wheel filename: {wheel_name!r}")
+    return parts[-1].split(".")
+
+
+def is_universal_wheel(wheel_name: str) -> bool:
+    """py3-none-any style wheels run anywhere."""
+    return wheel_platform_tags(wheel_name) == ["any"]
+
+
+def linux_abi_problems(wheel_names: Sequence[str]) -> list[str]:
+    """Reject Linux wheels whose platform offers no glibc <= 2.17 tag.
+
+    A wheel with multiple platform tags is fine as long as ONE tag is
+    CentOS 7 compatible (pip picks the best tag at install time). Universal
+    ``*-any.whl`` wheels are always allowed. Generic ``linux_x86_64``,
+    ``musllinux_*`` and ``manylinux_2_18+``-only wheels must not enter the
+    CentOS 7 wheelhouse.
+    """
+    problems: list[str] = []
+    for name in wheel_names:
+        try:
+            tags = wheel_platform_tags(name)
+        except BuildError as exc:
+            problems.append(str(exc))
+            continue
+        if is_universal_wheel(name):
+            continue
+        if not any(is_centos7_compatible_platform_tag(tag) for tag in tags):
+            problems.append(
+                f"{name}: no CentOS 7 (glibc <= 2.17) compatible platform tag "
+                f"(tags: {', '.join(tags)})"
+            )
+    return problems
+
+
+def non_universal_platform_tags(wheel_names: Sequence[str]) -> list[str]:
+    """Sorted distinct platform tags of all non-universal wheels (reporting)."""
+    tags: set[str] = set()
+    for name in wheel_names:
+        if not is_universal_wheel(name):
+            tags.update(wheel_platform_tags(name))
+    return sorted(tags)
+
+
 def fetch_url(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".part")
@@ -568,14 +642,35 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
             )
         if unresolved:
             raise BuildError(f"{platform} wheelhouse is missing binary wheels for: {unresolved}")
+        wheel_names = [path.name for path in sorted(wheelhouses[platform].glob("*.whl"))]
+        abi_note = ""
+        if platform == "linux":
+            problems = linux_abi_problems(wheel_names)
+            if problems:
+                raise BuildError(
+                    "linux wheelhouse contains wheels CentOS 7 cannot load "
+                    "(no glibc <= 2.17 compatible tag): " + "; ".join(problems)
+                )
+            abi_note = "\n  non-universal wheel tags all glibc <= 2.17 compatible"
         print(
             f"{platform}:\n"
             f"  runtime dependencies: {len(runtime_pins)}\n"
             f"  wheels: {wheels}\n"
-            "  unresolved: 0"
+            f"  unresolved: 0{abi_note}"
         )
-        summary_platforms[platform] = {"wheels": wheels}
+        summary_platforms[platform] = {
+            "wheels": wheels,
+            "platform_tags": non_universal_platform_tags(wheel_names),
+        }
     if include_tests:
+        linux_test_problems = linux_abi_problems(
+            [path.name for path in sorted((build_dir / "wheelhouse-tests" / "linux").glob("*.whl"))]
+        )
+        if linux_test_problems:
+            raise BuildError(
+                "linux test wheelhouse contains wheels CentOS 7 cannot load: "
+                + "; ".join(linux_test_problems)
+            )
         wheels, unresolved, sdists = validate_wheelhouse(test_wheelhouse, test_pins)
         if sdists or unresolved:
             raise BuildError(f"test wheelhouse invalid: sdists={sdists} unresolved={unresolved}")
@@ -658,6 +753,7 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
                 windows_verified if platform == "windows" else linux_verified
             ),
             "runtime_wheel_count": summary_platforms[platform]["wheels"],
+            "non_universal_platform_tags": summary_platforms[platform]["platform_tags"],
         }
     if include_tests:
         summary["test_wheel_count"] = summary_platforms["tests"]["wheels"]
