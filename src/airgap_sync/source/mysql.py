@@ -33,6 +33,7 @@ from airgap_sync.common.config import resolve_password
 from airgap_sync.common.models import MySQLConfig, TableConfig
 
 _SET_SESSION_READ_ONLY_SQL = "SET SESSION TRANSACTION READ ONLY"
+_SET_SESSION_TIME_ZONE_SQL = "SET SESSION time_zone = '+00:00'"
 
 _CHECK_SESSION_READ_ONLY_SQL = "SELECT @@session.transaction_read_only"
 
@@ -111,10 +112,20 @@ class SourceMySQLConnection:
                 f"database '{self._config.database}' as user '{self._config.user}': {exc}"
             ) from exc
         try:
+            self._set_session_time_zone()
             self._enable_session_read_only()
         except BaseException:
             self.close()
             raise
+
+    def _set_session_time_zone(self) -> None:
+        """固定 TIMESTAMP 的会话解释时区；这是连接初始化的内部 SQL。"""
+        assert self._conn is not None
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.execute(_SET_SESSION_TIME_ZONE_SQL)
+        except pymysql.Error as exc:
+            raise SourceMySQLError(f"failed to set UTC session time zone: {exc}") from exc
 
     def _enable_session_read_only(self) -> None:
         """将当前 Session 设置为 READ ONLY 并验证生效。

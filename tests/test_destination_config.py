@@ -27,6 +27,8 @@ def test_destination_allows_omitted_tables_and_paths(tmp_path, write_config):
     assert config.destination is not None
     assert config.destination.metadata_database == "airgap_sync_meta"
     assert config.destination.insert_batch_rows == 1000
+    assert config.destination.verify_fetch_size == 2000
+    assert config.destination.report_timezone == "Asia/Shanghai"
     assert config.destination.settle_seconds == 2
 
 
@@ -50,4 +52,11 @@ def test_destination_parameters_are_validated(tmp_path, write_config):
     data = destination_config(tmp_path)
     data["destination"]["insert_batch_rows"] = 0
     with pytest.raises(ConfigError, match="insert_batch_rows"):
+        load_config(write_config(data))
+
+
+def test_report_timezone_is_validated(tmp_path, write_config):
+    data = destination_config(tmp_path)
+    data["destination"]["report_timezone"] = "Mars/Olympus"
+    with pytest.raises(ConfigError, match="report_timezone"):
         load_config(write_config(data))

@@ -17,6 +17,7 @@ from airgap_sync.common.manifest import (
 )
 from airgap_sync.common.row_codec import encode_row
 from airgap_sync.common.transport import transport_filename
+from airgap_sync.common.verification import MultisetDigest
 from airgap_sync.destination.incoming import DestinationError, discover_runs, validate_run
 
 RUN = "20260915T030000Z-a1b2c3d4"
@@ -34,6 +35,10 @@ def make_run(incoming: Path, rows=((1, "a"), (2, None))) -> Manifest:
     schema = b"CREATE TABLE `new_table` (`id` int, `name` text);\n"
     raw = b"".join(encode_row(row) + b"\n" for row in rows)
     compressed = zstandard.ZstdCompressor().compress(raw)
+    digest = MultisetDigest()
+    for row in rows:
+        digest.update(encode_row(row))
+    summary = digest.summary()
     _put(incoming, "schema.sql", schema)
     _put(incoming, "chunk-000001.jsonl.zst", compressed)
     manifest = Manifest(
@@ -59,8 +64,8 @@ def make_run(incoming: Path, rows=((1, "a"), (2, None))) -> Manifest:
         verification=VerificationMeta(
             algorithm="multiset_digest_v1",
             row_count=len(rows),
-            digest_a=SHA_ZERO,
-            digest_b=SHA_ZERO,
+            digest_a=summary.digest_a,
+            digest_b=summary.digest_b,
         ),
         created_at="2026-09-15T03:00:00+00:00",
     )
@@ -192,3 +197,15 @@ def test_manifest_internal_consistency(tmp_path, mutation, code):
     with pytest.raises(DestinationError) as error:
         validate_run(incoming, RUN, 0, sleeper=lambda _: None)
     assert error.value.code == code
+
+
+@pytest.mark.parametrize("created_at", ["not-a-time", "2026-09-15T03:00:00"])
+def test_source_created_at_must_be_iso8601_with_timezone(tmp_path, created_at):
+    incoming = tmp_path / "incoming"
+    manifest = make_run(incoming)
+    data = manifest.model_dump(mode="json", by_alias=True)
+    data["created_at"] = created_at
+    _put(incoming, "manifest.json", json.dumps(data).encode())
+    with pytest.raises(DestinationError) as error:
+        validate_run(incoming, RUN, 0, sleeper=lambda _: None)
+    assert error.value.code == "INVALID_SOURCE_TIMESTAMP"

@@ -6,6 +6,7 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from airgap_sync.common.manifest import (
@@ -94,6 +95,7 @@ def _validate_manifest(manifest: Manifest, filename_run_id: str) -> None:
             "MANIFEST_RUN_ID_MISMATCH",
             f"transport run_id {filename_run_id!r} != manifest run_id {manifest.run_id!r}",
         )
+    parse_source_created_at(manifest.created_at)
     if manifest.protocol_version != PROTOCOL_VERSION:
         raise DestinationError(
             "UNSUPPORTED_PROTOCOL", f"protocol_version={manifest.protocol_version}"
@@ -129,6 +131,17 @@ def _validate_manifest(manifest: Manifest, filename_run_id: str) -> None:
             "MANIFEST_ROW_COUNT_MISMATCH",
             f"sum(chunk.rows)={rows} != row_count={manifest.row_count}",
         )
+
+
+def parse_source_created_at(value: str) -> datetime:
+    """严格解析带时区的 ISO 8601 Source Snapshot 时间并转换成 UTC。"""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DestinationError("INVALID_SOURCE_TIMESTAMP", f"invalid ISO 8601: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DestinationError("INVALID_SOURCE_TIMESTAMP", "created_at must include a timezone")
+    return parsed.astimezone(UTC)
 
 
 def validate_run(

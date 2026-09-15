@@ -150,9 +150,16 @@ Phase 4 最高状态为 `STAGED`，不修改正式表，也不删除 incoming �
 
 # Phase 5：一致性验证 + 正式表切换
 
-* T401 Destination 复算 Multiset Digest 并与 Manifest 比对（VERIFIED / MISMATCH）；
-* T402 验证通过后原子替换正式表；
-* T403 MISMATCH 提示人工重新生成该表快照。
+✅ 已完成：
+
+* T401 SSCursor/fetchmany 从 staging 回读，复用 Row Codec + Multiset Digest；
+* T402 metadata schema v2、MISMATCH 明细与 table_versions；
+* T403 FK / Trigger / VIEW preflight 与单语句原子 RENAME；
+* T404 SWAPPING intent 与切换前/后 crash recovery；
+* T405 source_created_at 版本排序、SUPERSEDED 与同时间歧义保护；
+* T406 VERIFIED 后 manifest-first incoming 清理与 backup 清理；
+* T407 总行数、本次净增、自然月净增 stats CLI；
+* T408 Source / Destination Session UTC 与 InnoDB guard。
 
 ---
 

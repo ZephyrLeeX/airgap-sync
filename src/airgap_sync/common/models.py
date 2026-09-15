@@ -115,7 +115,22 @@ class DestinationConfig(BaseModel):
     incoming_dir: Path
     metadata_database: str = Field(default="airgap_sync_meta", min_length=1, max_length=64)
     insert_batch_rows: int = Field(default=1000, ge=1, le=1_000_000)
+    verify_fetch_size: int = Field(default=2000, ge=1, le=1_000_000)
+    report_timezone: str = Field(default="Asia/Shanghai", min_length=1)
     settle_seconds: float = Field(default=2, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def validate_report_timezone(self) -> Self:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(self.report_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"destination.report_timezone is not a valid IANA timezone: "
+                f"{self.report_timezone!r}"
+            ) from exc
+        return self
 
 
 class TableConfig(BaseModel):

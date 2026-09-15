@@ -597,3 +597,25 @@ V1 暂不要求：
 **严格单向网络无法解决的问题，不通过复杂设计强行绕过。**
 
 **通过源端可靠生成完整快照、文件可靠传输、目标端自动校验和简单人工重同步，保证系统最终数据一致。**
+# Phase 5 Destination 验证与应用要求
+
+Phase 5 的最终成功状态是 `VERIFIED = staging 数据库内容 digest 匹配 + 正式表切换成功`。
+验证必须从 staging MySQL 以 SSCursor / fetchmany 流式读取 manifest 明确列，禁止从传输 Chunk
+复算代替数据库验证，也禁止为摘要加入 ORDER BY。摘要必须复用公共 Row Codec 与
+`multiset_digest_v1`，并同时比较 row_count、digest_a、digest_b。
+
+正式表切换前必须拒绝 VIEW 等非 BASE TABLE 对象、任何 inbound/outbound FOREIGN KEY 和
+任何 Trigger。已有正式表必须通过一条 multi-table RENAME 同时改为 backup 并将 staging
+改为正式名；不得先 DROP live，也不得拆成两条 rename。部署方应给业务读取方 database-level
+privilege，不依赖 table-level GRANT 的 rename 行为。
+
+Run 以 manifest `created_at`（合法、带时区的 ISO 8601）排序。较旧 Run 是 `SUPERSEDED`，
+相同时刻的不同 run_id 是 `RUN_ORDER_AMBIGUOUS`。Source 和 Destination MySQL Session 均固定
+UTC；报告自然月则把 source_created_at 转换到配置的 report timezone。
+
+成功写入 table_versions 后才允许清理 incoming，并必须先删 manifest discovery marker，再删
+schema/chunks。backup 或 incoming 清理失败只记录错误，Run 保持 VERIFIED。统计使用版本历史
+中的 verified row_count，不扫描正式表；术语只使用“本次净增”和“月度净增”。
+
+外部 FTP Client 必须以临时文件名下载并在写入关闭后 rename 为正式 transport filename；临时
+后缀不属于协议，Airgap Sync 忽略所有不符合正式命名的文件。

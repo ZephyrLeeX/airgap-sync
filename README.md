@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-Phase 1 至 Phase 4（Destination staging 导入）已完成，当前支持：
+Phase 1 至 Phase 5（Destination 数据正确性闭环）已完成，当前支持：
 
 - YAML 配置加载与强类型校验（表配置只需 `name` + `enabled`，所有表统一 FULL_SNAPSHOT；旧 `mode` / `key` 字段已删除，配置中残留会明确报错）；
 - `airgap-sync config validate` 配置校验；
@@ -17,9 +17,10 @@ Phase 1 至 Phase 4（Destination staging 导入）已完成，当前支持：
 - `airgap-sync source relay-check`：只调用 `GET /health` 的诊断命令。
 - `airgap-sync destination check`：检查 incoming、目标 MySQL 与 metadata schema；
 - `airgap-sync destination process --run RUN_ID`：严格校验完整 Run，按 Chunk 流式导入
-  staging，最高状态为 `STAGED`；
+  staging，从 MySQL 回读验证后安全切换正式表并清理 incoming，最终状态为 `VERIFIED`；
 - `airgap-sync destination process-once`：扫描当前全部 manifest 一次；不完整 Run 跳过，
   不会阻断其他 Run。
+- `airgap-sync destination stats`：从轻量版本历史读取当前总行数、本次净增和月度净增。
 
 ### 源数据库只读保护
 
@@ -51,9 +52,8 @@ outbox/<table>/<run_id>/
 - 扫描前后各取一次 DDL，结构变化则 Run FAILED（`SCHEMA_CHANGED_DURING_SNAPSHOT`），不产生结构错配的快照；
 - 验证摘要是与行顺序无关的 multiset digest（`row_count` + `digest_a` + `digest_b`），供目标端导入后复算比对。
 
-以下能力**尚未实现**：staging 内容的最终 digest VERIFY、正式表切换、incoming Snapshot
-删除、总行数/本次净增/月度净增统计、Destination 常驻 Worker 和 Source fixed-delay
-Scheduler。FTP Client 是现有外部链路组件，不属于本项目。
+以下能力**尚未实现**：Destination 常驻 Worker、Source fixed-delay Scheduler 和 Web UI。
+FTP Client 是现有外部链路组件，不属于本项目。
 
 ## 环境要求
 
@@ -109,6 +109,8 @@ uv run airgap-sync source sync --config config/config.yaml --table std_scjgj_zhg
 uv run airgap-sync destination check --config config/config.yaml
 uv run airgap-sync destination process --config config/config.yaml --run 20260915T030000Z-a1b2c3d4
 uv run airgap-sync destination process-once --config config/config.yaml
+uv run airgap-sync destination stats --config config/config.yaml
+uv run airgap-sync destination stats --config config/config.yaml --table TABLE --source-database DB
 ```
 
 `source check` 输出示例：
@@ -163,7 +165,7 @@ HTTP worker 顺序上传，所以扫描/压缩可与 PUT 重叠，但不会并�
 
 `DELIVERED` 后清理本地 Run 文件；删除失败只作为本地 cleanup error 记录，不会重新 PUT。
 
-## Destination：incoming → STAGED
+## Destination：incoming → VERIFIED
 
 外部 FTP Client 把扁平 transport 文件下载到 `destination.incoming_dir`，文件名固定为
 `airgap-v1--<run_id>--<logical_name>`。Destination 只从 `manifest.json` transport 文件发现
@@ -175,20 +177,41 @@ Run：孤立 Chunk 不会建表。manifest 出现但预期文件缺失、文件�
 逻辑文件名、行数和 manifest 内部 row count 必须一致。SHA256 以固定缓冲流式计算，不把
 大 Chunk 整体读入内存。
 
-目标 MySQL 使用独立写连接，metadata 默认保存在 `airgap_sync_meta`（schema v1）。
+目标 MySQL 使用独立写连接，metadata 默认保存在 `airgap_sync_meta`（schema v2）。
 `schema.sql` 必须是与 manifest 表名一致的单条 `CREATE TABLE`；程序只重写 CREATE TABLE
 后的第一个 identifier 为确定、短且与源表长度无关的 `__airgap_stg_<run>_<hash>`。
 FOREIGN KEY / CONSTRAINT 当前明确报 `UNSUPPORTED_SCHEMA_FEATURE`。PK、UNIQUE、INDEX、
-AUTO_INCREMENT、charset、collation 和 comment 保持原样。正式表无论是否已存在都不会被
-CREATE、DROP、TRUNCATE、ALTER 或 INSERT。
+AUTO_INCREMENT、charset、collation 和 comment 保持原样。staging 只允许 InnoDB，确保
+Chunk rollback 合同成立。
 
 Chunk 使用 zstd streaming decompressor 逐行读取，复用公共 Row Codec 解码；INSERT 始终
 使用经过核对的显式列名，生成列从 INSERT 列表排除。`executemany` 受
 `destination.insert_batch_rows` 控制，但整个 Chunk 只有一个事务；staging 行和 Chunk
 `IMPORTED` metadata 在同一 MySQL 事务提交。失败会整 Chunk 回滚，已 `IMPORTED` Chunk
 重试时直接跳过。同 Run 和同一源表的不同 Run 都使用 MySQL advisory lock 避免并发。
-所有 Chunk 行数合计匹配后 Run 才成为 `STAGED`。incoming 文件保留，最终数据库 digest、
-正式表原子切换与清理属于 Phase 5。
+所有 Chunk 导入后进入 `STAGED`，随后以 SSCursor + `fetchmany` 明确 SELECT manifest.columns，
+复用公共 Row Codec 与 Multiset Digest 从数据库真实内容独立复算。行数或任一 digest 不同即
+`MISMATCH`，正式表、staging 与 incoming 均不动。
+
+验证匹配后检查版本顺序及目标对象。旧 Snapshot 标为 `SUPERSEDED`；相同 source 时间的不同
+Run 报 `RUN_ORDER_AMBIGUOUS`。目标若为 VIEW、存在 inbound/outbound FK 或 Trigger，拒绝自动
+切换。目标不存在时单次 rename staging；目标存在时用同一条 multi-table `RENAME TABLE` 将
+live 改为确定性 backup、staging 改为 live。切换 intent 先持久化为 `SWAPPING`；重试会检查
+真实对象组合，rename 已完成时重新扫描 live digest 后再完成 `VERIFIED`。
+
+`VERIFIED` 与 `table_versions` 在同一 metadata transaction 写入。随后先删除 manifest
+discovery marker，再删除 schema/chunks，最后尝试删除旧 backup；清理失败只记录 error，绝不
+回退成功状态。统计只读 `table_versions`，不对 live 执行 COUNT。Snapshot 月份以
+`source_created_at` 转换到 `destination.report_timezone` 后确定；“月度净增”严格对比上一个
+自然月的最后版本，没有该月 baseline 时显示 N/A。
+
+Source 与 Destination MySQL 连接均固定 `SET SESSION time_zone = '+00:00'`，保证 TIMESTAMP
+写入和回读合同一致。部署授权必须使用 database-level privilege，不依赖单表专属 GRANT 随
+rename 转移。
+
+外部 FTP Client 必须先用任意临时文件名下载，完整写入并关闭后再 rename 成正式 transport
+filename。临时后缀不是 Airgap Sync 协议的一部分；程序忽略不符合正式格式的文件，同时继续
+使用 settle time 与 SHA256 作为后续防线。
 
 ## 真实 Relay 手工测试
 

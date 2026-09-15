@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 import pymysql
@@ -30,6 +32,9 @@ import pytest
 from airgap_sync.common.manifest import read_manifest
 from airgap_sync.common.models import AppConfig, MySQLConfig, TableConfig
 from airgap_sync.common.row_codec import decode_row, encode_row
+from airgap_sync.common.transport import transport_filename
+from airgap_sync.destination.mysql import DestinationMySQLConnection
+from airgap_sync.destination.processor import DestinationProcessor
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
     SourceMySQLError,
@@ -92,6 +97,8 @@ def admin_connection():
         charset="utf8mb4",
         autocommit=True,
     )
+    with conn.cursor() as cursor:
+        cursor.execute("SET SESSION time_zone = '+00:00'")
     try:
         yield conn
     finally:
@@ -135,18 +142,26 @@ def snapshot_table(admin_connection: pymysql.Connection) -> str:
         "  name VARCHAR(64) DEFAULT NULL,"
         "  amount DECIMAL(12,4) DEFAULT NULL,"
         "  ts DATETIME(6) DEFAULT NULL,"
+        "  event_ts TIMESTAMP NULL DEFAULT NULL,"
+        "  event_ts6 TIMESTAMP(6) NULL DEFAULT NULL,"
         "  note TEXT,"
         "  payload VARBINARY(32) DEFAULT NULL"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
     )
     admin_exec(
         admin_connection,
-        f"INSERT INTO {SNAP_TABLE} (sid, name, amount, ts, note, payload) VALUES"
-        " (1, 'a', 12.3400, '2026-09-14 20:00:00.123456', 'first', 0x0001FF),"
-        " (1, 'a', 12.3400, '2026-09-14 20:00:00.123456', 'first', 0x0001FF),"  # 完全重复
-        " (2, NULL, NULL, NULL, NULL, NULL),"  # 全 NULL 行
-        " (3, '中文长文本测试', -0.5000, '2026-01-01 00:00:00.000001', '', 0x00),"  # 空串/0x00
-        " (4, '', 99999999.9999, '2026-12-31 23:59:59.999999', '中文身份证字段', 0xDeadBeef)",
+        f"INSERT INTO {SNAP_TABLE} "
+        "(sid,name,amount,ts,event_ts,event_ts6,note,payload) VALUES"
+        " (1,'a',12.3400,'2026-09-14 20:00:00.123456','2026-09-14 20:00:00',"
+        "'2026-09-14 20:00:00.123456','first',0x0001FF),"
+        " (1,'a',12.3400,'2026-09-14 20:00:00.123456','2026-09-14 20:00:00',"
+        "'2026-09-14 20:00:00.123456','first',0x0001FF),"  # 完全重复
+        " (2,NULL,NULL,NULL,NULL,NULL,NULL,NULL),"  # 全 NULL 行
+        " (3,'中文长文本测试',-0.5000,'2026-01-01 00:00:00.000001',"
+        "'2026-01-01 00:00:00','2026-01-01 00:00:00.000001','',0x00),"
+        " (4,'',99999999.9999,'2026-12-31 23:59:59.999999',"
+        "'2026-12-31 23:59:59','2026-12-31 23:59:59.999999',"
+        "'中文身份证字段',0xDeadBeef)",
     )
     admin_exec(admin_connection, f"CREATE VIEW {SNAP_VIEW} AS SELECT sid, name FROM {SNAP_TABLE}")
     try:
@@ -298,7 +313,16 @@ def test_snapshot_run_on_real_mysql(
     manifest = read_manifest(result.run_dir / "manifest.json")
     assert manifest.row_count == 5
     assert [c.sequence for c in manifest.chunks] == [1, 2, 3]
-    assert manifest.columns == ["sid", "name", "amount", "ts", "note", "payload"]
+    assert manifest.columns == [
+        "sid",
+        "name",
+        "amount",
+        "ts",
+        "event_ts",
+        "event_ts6",
+        "note",
+        "payload",
+    ]
 
     # 解压解码全部行, 与 admin 直读的行 multiset 比较 (顺序无关)
     dctx = zstandard.ZstdDecompressor()
@@ -320,8 +344,10 @@ def test_snapshot_run_on_real_mysql(
     assert len(duplicates) == 2
 
     # binary / Decimal / datetime 无损
-    binary_row = next(row for row in recovered if row[5] == b"\x00\x01\xff")
+    binary_row = next(row for row in recovered if row[7] == b"\x00\x01\xff")
     assert binary_row[2] is not None  # Decimal
+    assert binary_row[4] == datetime(2026, 9, 14, 20, 0)
+    assert binary_row[5] == datetime(2026, 9, 14, 20, 0, 0, 123456)
     decimal_row = next(row for row in recovered if row[0] == 3)
     from decimal import Decimal
 
@@ -336,3 +362,61 @@ def test_snapshot_run_on_real_mysql(
         assert row.current_run_id == result.run_id
     finally:
         state.close()
+
+
+def test_destination_verify_and_multi_table_promotion_on_real_mysql(
+    mysql_config: MySQLConfig,
+    admin_connection: pymysql.Connection,
+    snapshot_table: str,
+    tmp_path: Path,
+):
+    """完整真实路径：多 Chunk staging、DB 回读 digest、已有 live 原子替换。"""
+    source_config = AppConfig.model_validate(
+        {
+            "role": "source",
+            "mysql": mysql_config.model_dump(),
+            "paths": {"data_dir": str(tmp_path / "source")},
+            "snapshot": {"fetch_size": 2},
+            "chunk": {"max_rows": 2, "max_uncompressed_bytes": 4096},
+            "tables": [{"name": snapshot_table}],
+        }
+    )
+    with SourceMySQLConnection(mysql_config) as source:
+        state = SourceState(state_db_path(source_config.paths.data_dir))
+        try:
+            state.initialize()
+            snapshot = SnapshotRunner(source, state, source_config).snapshot(snapshot_table)
+        finally:
+            state.close()
+    assert snapshot.status == "COMPLETED"
+    manifest = read_manifest(snapshot.run_dir / "manifest.json")
+
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    logical_names = [manifest.schema_file.file, *(chunk.file for chunk in manifest.chunks)]
+    for logical in logical_names:
+        shutil.copyfile(
+            snapshot.run_dir / logical,
+            incoming / transport_filename(manifest.run_id, logical),
+        )
+    shutil.copyfile(
+        snapshot.run_dir / "manifest.json",
+        incoming / transport_filename(manifest.run_id, "manifest.json"),
+    )
+    destination_config = AppConfig.model_validate(
+        {
+            "role": "destination",
+            "mysql": mysql_config.model_dump(),
+            "destination": {"incoming_dir": str(incoming), "settle_seconds": 0},
+        }
+    )
+    assert destination_config.destination is not None
+    with DestinationMySQLConnection(mysql_config, destination_config.destination) as destination:
+        destination.initialize_metadata()
+        result = DestinationProcessor(destination, destination_config).process(manifest.run_id)
+
+    assert result.status == "VERIFIED", result.error
+    assert not list(incoming.iterdir())
+    with admin_connection.cursor() as cursor:
+        cursor.execute(f"SELECT COUNT(*) FROM {SNAP_TABLE}")
+        assert cursor.fetchone()[0] == 5

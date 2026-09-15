@@ -16,6 +16,10 @@ destination:
   # metadata 与 staging 位于同一 MySQL Server，保证 Chunk 数据和状态同事务提交。
   metadata_database: airgap_sync_meta
   insert_batch_rows: 1000
+  # VERIFY 使用 SSCursor + fetchmany；内存不随总行数增长。
+  verify_fetch_size: 2000
+  # source_created_at 转换到该时区后决定自然月归属。
+  report_timezone: Asia/Shanghai
   # 整组预期文件的 size + mtime 在两个观察点间不变，才开始读取。
   settle_seconds: 2
 

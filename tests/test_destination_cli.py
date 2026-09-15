@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
 from airgap_sync.cli import main
+from airgap_sync.destination.mysql import TableVersion
 from airgap_sync.destination.processor import ProcessResult
 from test_destination_config import destination_config
 
@@ -48,7 +50,7 @@ class FakeConnection:
         self.initialized = True
 
     def metadata_schema_version(self):
-        return 1
+        return 2
 
 
 def _config(tmp_path, password_env):
@@ -67,10 +69,10 @@ def test_destination_check_cli(tmp_path, write_config, password_env, run_cli, mo
 
     assert result.exit_code == 0, result.output
     assert "Incoming            OK" in result.output
-    assert "Metadata schema     OK (airgap_sync_meta, v1)" in result.output
+    assert "Metadata schema     OK (airgap_sync_meta, v2)" in result.output
 
 
-def test_destination_process_cli_prints_staged(
+def test_destination_process_cli_prints_verified(
     tmp_path, write_config, password_env, run_cli, monkeypatch
 ):
     import airgap_sync.cli as cli_module
@@ -83,14 +85,14 @@ def test_destination_process_cli_prints_staged(
             pass
 
         def process(self, run_id):
-            return ProcessResult(run_id, "STAGED", "new_table", "__airgap_stg_x", 2, 1)
+            return ProcessResult(run_id, "VERIFIED", "new_table", "__airgap_stg_x", 2, 1)
 
     monkeypatch.setattr(cli_module, "DestinationProcessor", FakeProcessor)
     result = run_cli(["destination", "process", "--config", str(path), "--run", "test-run"])
 
     assert result.exit_code == 0, result.output
     assert "Table           new_table" in result.output
-    assert "Status          STAGED" in result.output
+    assert "Status          VERIFIED" in result.output
 
 
 def test_process_once_incomplete_does_not_fail_process(
@@ -105,7 +107,7 @@ def test_process_once_incomplete_does_not_fail_process(
         "process_once",
         lambda connection, config: [
             ProcessResult("run-incomplete", "INCOMPLETE", error="RUN_INCOMPLETE: still copying"),
-            ProcessResult("run-ready", "STAGED", "new_table", "stg", 2, 1),
+            ProcessResult("run-ready", "VERIFIED", "new_table", "stg", 2, 1),
         ],
     )
 
@@ -113,4 +115,37 @@ def test_process_once_incomplete_does_not_fail_process(
 
     assert result.exit_code == 0, result.output
     assert "run-incomplete    INCOMPLETE" in result.output
-    assert "run-ready    STAGED" in result.output
+    assert "run-ready    VERIFIED" in result.output
+
+
+def test_destination_stats_cli_formats_deltas(
+    tmp_path, write_config, password_env, run_cli, monkeypatch
+):
+    import airgap_sync.cli as cli_module
+
+    stamp = datetime(2026, 9, 27, 3, 20, tzinfo=UTC)
+
+    class StatsConnection(FakeConnection):
+        def all_versions(self):
+            return [
+                TableVersion(
+                    "run-1",
+                    "source_db",
+                    "table_a",
+                    stamp,
+                    120,
+                    "run-0",
+                    100,
+                    20,
+                    stamp,
+                    stamp,
+                )
+            ]
+
+    path = write_config(_config(tmp_path, password_env))
+    monkeypatch.setattr(cli_module, "DestinationMySQLConnection", StatsConnection)
+    result = run_cli(["destination", "stats", "--config", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "Current rows             120" in result.output
+    assert "This run net             +20" in result.output
+    assert "Monthly net              N/A" in result.output

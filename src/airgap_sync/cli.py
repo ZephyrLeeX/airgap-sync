@@ -21,6 +21,7 @@ from airgap_sync.common.models import AppConfig, Role
 from airgap_sync.destination.incoming import DestinationError
 from airgap_sync.destination.mysql import DestinationMySQLConnection, DestinationMySQLError
 from airgap_sync.destination.processor import DestinationProcessor, ProcessResult, process_once
+from airgap_sync.destination.statistics import TableStatistics, calculate_statistics
 from airgap_sync.source.delivery import DeliveryRunner
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
@@ -129,7 +130,7 @@ def destination_check(config_path: Path) -> None:
 )
 @click.option("--run", "run_id", required=True, help="要处理的 transport Run ID。")
 def destination_process(config_path: Path, run_id: str) -> None:
-    """完整校验一个 Run 并流式导入 staging。"""
+    """完整处理 Run：staging、数据库回读验证、安全切换与清理。"""
     config = load_config(config_path)
     _require_destination_role(config)
     assert config.destination is not None
@@ -164,6 +165,40 @@ def destination_process_once(config_path: Path) -> None:
             click.echo(f"  {result.error}")
     if any(result.status == "FAILED" for result in results):
         raise click.ClickException("one or more runs failed permanently")
+
+
+@destination_group.command("stats")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--table", "table_name", help="只显示该表。")
+@click.option("--source-database", help="同名表存在时指定 Source database。")
+def destination_stats(
+    config_path: Path, table_name: str | None, source_database: str | None
+) -> None:
+    """显示 VERIFIED 正式版本的总行数、本次净增和月度净增。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    with DestinationMySQLConnection(config.mysql, config.destination) as connection:
+        connection.initialize_metadata()
+        stats = calculate_statistics(connection.all_versions(), config.destination.report_timezone)
+    if table_name is not None:
+        stats = [item for item in stats if item.table_name == table_name]
+    if source_database is not None:
+        stats = [item for item in stats if item.source_database == source_database]
+    databases = {item.source_database for item in stats}
+    if table_name and source_database is None and len(databases) > 1:
+        raise click.ClickException(
+            "multiple source databases contain this table; specify --source-database"
+        )
+    for index, item in enumerate(stats):
+        if index:
+            click.echo()
+        _print_statistics(item, config.destination.report_timezone)
 
 
 @source_group.command("check")
@@ -321,6 +356,26 @@ def _print_destination_result(result: ProcessResult) -> None:
     click.echo(f"Status          {result.status}")
     if result.error:
         click.echo(f"Detail          {result.error}")
+
+
+def _print_statistics(item: TableStatistics, timezone_name: str) -> None:
+    from zoneinfo import ZoneInfo
+
+    timezone = ZoneInfo(timezone_name)
+    snapshot = item.source_created_at.astimezone(timezone)
+    verified = item.verified_at.astimezone(timezone)
+    click.echo(f"Source database          {item.source_database}")
+    click.echo(f"Table                    {item.table_name}")
+    click.echo(f"Current rows             {item.current_rows:,}")
+    click.echo(f"This run net             {_format_delta(item.this_run_net)}")
+    click.echo(f"Monthly net              {_format_delta(item.monthly_net)}")
+    click.echo(f"Snapshot                 {snapshot:%Y-%m-%d %H:%M %z}")
+    click.echo(f"Verified                 {verified:%Y-%m-%d %H:%M %z}")
+    click.echo(f"Run                      {item.run_id}")
+
+
+def _format_delta(value: int | None) -> str:
+    return "N/A" if value is None else f"{value:+,}"
 
 
 def _print_table_report(

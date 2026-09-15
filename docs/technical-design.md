@@ -669,3 +669,19 @@ Phase 4 不计算最终 multiset digest、不切换正式表、不删除 incomin
 * 复杂 Web 管理后台。
 
 如果未来确有增量需求，重新设计。
+# Phase 5：数据库回读 VERIFY、promotion 与版本统计
+
+状态机为 `STAGED → VERIFYING → SWAPPING → VERIFIED`。摘要不匹配转 `MISMATCH`；已有更新
+source_created_at 时转 `SUPERSEDED`。VERIFY 构造
+`SELECT manifest.columns FROM quoted_staging`，使用 PyMySQL SSCursor 和 fetchmany，逐行
+`encode_row()` 后更新 `MultisetDigest`，内存复杂度为 O(verify_fetch_size)。
+
+metadata schema v2 在 runs 保存 source timestamp、expected/actual digest、验证/应用时间、
+swap intent 与 cleanup error；table_versions 以 run_id 为主键，并按 source database、table、
+source timestamp 建索引。正式切换前持久化 `SWAPPING + target_existed + backup_table`，然后
+执行单条 RENAME。恢复时只接受明确的切换前或切换后对象组合；后者再扫描 live digest，其他
+组合一律 `SWAP_STATE_MISMATCH`。
+
+table_versions 的 net_change 是当前 verified row_count 减前一 verified row_count；第一版为
+NULL。月度净增是报告时区内本月最后 Snapshot 减上一个自然月最后 Snapshot，缺少上月则为
+NULL。整个统计路径不运行 live `COUNT(*)`。

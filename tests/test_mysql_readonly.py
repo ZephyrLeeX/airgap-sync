@@ -192,7 +192,8 @@ class TestConnectEnablesSessionReadOnly:
 
         assert fake.connect_kwargs is not None
         assert fake.connect_kwargs["autocommit"] is True  # 不隐式持有长事务
-        assert fake.executed[0] == ("SET SESSION TRANSACTION READ ONLY", ())
+        assert fake.executed[0] == ("SET SESSION time_zone = '+00:00'", ())
+        assert fake.executed[1] == ("SET SESSION TRANSACTION READ ONLY", ())
         assert ("SELECT @@session.transaction_read_only", ()) in fake.executed
         assert fake.closed
 
@@ -207,7 +208,7 @@ class TestConnectEnablesSessionReadOnly:
             connection.connect()
 
         assert fake.closed  # 初始化失败的连接必须被关闭
-        assert fake.executed == []  # SET 失败, 不应继续执行验证查询
+        assert fake.executed == [("SET SESSION time_zone = '+00:00'", ())]
 
     def test_connect_fails_when_session_not_read_only(self, mysql_config, patched_connect):
         """验证查询返回 0 (未生效) 时必须失败, 不允许静默降级为可写连接。"""
@@ -220,6 +221,7 @@ class TestConnectEnablesSessionReadOnly:
 
         assert fake.closed
         assert fake.executed == [
+            ("SET SESSION time_zone = '+00:00'", ()),
             ("SET SESSION TRANSACTION READ ONLY", ()),
             ("SELECT @@session.transaction_read_only", ()),
         ]
