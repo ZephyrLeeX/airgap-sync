@@ -69,3 +69,30 @@ def test_orphan_cleanup_is_old_formal_manifestless_and_conservative(tmp_path):
     assert not old.exists()
     assert fresh.exists()
     assert temporary.exists()
+
+
+def test_orphan_cleanup_continues_after_permission_error(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    locked_run = "20260831T000000Z-12345678"
+    removable_run = "20260901T000000Z-12345678"
+    locked = tmp_path / transport_filename(locked_run, "schema.sql")
+    removable = tmp_path / transport_filename(removable_run, "schema.sql")
+    locked.write_text("locked")
+    removable.write_text("removable")
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    timestamp = (now - timedelta(days=31)).timestamp()
+    os.utime(locked, (timestamp, timestamp))
+    os.utime(removable, (timestamp, timestamp))
+    path_type = type(locked)
+    original_unlink = path_type.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == locked:
+            raise PermissionError("locked")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "unlink", unlink)
+
+    assert cleanup_orphan_artifacts(Database(), cfg, now=now) == 1
+    assert locked.exists()
+    assert not removable.exists()

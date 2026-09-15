@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from datetime import UTC, datetime, timedelta
 from threading import Event
 
@@ -192,6 +193,74 @@ def test_failed_run_retention_never_removes_active_cycle_run(tmp_path):
         state.abandon_active_cycle()
         assert cleanup_failed_runs(state, cfg, clock=lambda: now) == 1
         assert not run_dir.exists()
+
+
+def test_failed_run_cleanup_continues_after_permission_error(tmp_path, monkeypatch):
+    old = datetime(2026, 8, 1, tzinfo=UTC)
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    cfg = config(tmp_path, ("a", "b"))
+    run_dirs = {
+        table: cfg.paths.data_dir / "outbox" / table / f"old-{table}" for table in ("a", "b")
+    }
+    for run_dir in run_dirs.values():
+        run_dir.mkdir(parents=True)
+        (run_dir / "chunk").write_text("data")
+
+    original_rmtree = shutil.rmtree
+
+    def remove(path):
+        if path == run_dirs["a"]:
+            raise PermissionError("locked")
+        original_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", remove)
+    with SourceState(state_db_path(tmp_path / "data")) as state:
+        state.initialize()
+        for table in ("a", "b"):
+            state.register_table(table)
+            state.begin_run(table, f"old-{table}")
+            state.fail_run(table, f"old-{table}", "failed")
+        state._conn.execute("UPDATE sync_runs SET created_at=?", (old.isoformat(),))
+
+        assert cleanup_failed_runs(state, cfg, clock=lambda: now) == 1
+        assert run_dirs["a"].exists()
+        assert not run_dirs["b"].exists()
+
+
+def test_source_worker_continues_after_maintenance_oserror(tmp_path):
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    stop = Event()
+    maintenance_calls = 0
+    cycle_calls = 0
+
+    def maintenance():
+        nonlocal maintenance_calls
+        maintenance_calls += 1
+        if maintenance_calls == 1:
+            raise OSError("temporarily unavailable")
+
+    with SourceState(state_db_path(tmp_path / "data")) as state:
+        state.initialize()
+        state.create_cycle("cycle-a", ["a"], now.isoformat())
+        cycle = state.latest_cycle()
+
+        def run_cycle():
+            nonlocal cycle_calls
+            cycle_calls += 1
+            stop.set()
+            return cycle
+
+        SourceWorker(
+            state,
+            config(tmp_path, ("a",)),
+            run_cycle,
+            stop_event=stop,
+            clock=lambda: now,
+            maintenance=maintenance,
+        ).run()
+
+    assert cycle_calls == 1
+    assert maintenance_calls == 2
 
 
 def test_cli_cycle_delivery_honors_removed_captured_table(tmp_path, monkeypatch):

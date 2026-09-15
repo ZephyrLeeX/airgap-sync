@@ -43,10 +43,19 @@ def cleanup_orphan_artifacts(
             continue
         if logical == "manifest.json" or run_id in manifests or run_id in active:
             continue
-        modified = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-        if modified >= cutoff:
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+            if modified >= cutoff:
+                continue
+            path.unlink()
+        except OSError as exc:
+            logger.warning(
+                "destination orphan cleanup deferred: run_id=%s artifact=%s error=%s",
+                run_id,
+                logical,
+                exc,
+            )
             continue
-        path.unlink()
         removed += 1
         logger.info("destination orphan removed: run_id=%s artifact=%s", run_id, logical)
     return removed

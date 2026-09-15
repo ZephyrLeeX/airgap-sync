@@ -154,6 +154,12 @@ class SourceWorker:
         self.waiter = waiter or self.stop_event.wait
         self.maintenance = maintenance or (lambda: None)
 
+    def _run_maintenance(self) -> None:
+        try:
+            self.maintenance()
+        except OSError as exc:
+            logger.warning("source worker maintenance deferred: error=%s", exc)
+
     def tick(self) -> SyncCycle | None:
         now = self.clock()
         due = next_action_at(self.state, self.config, now)
@@ -163,7 +169,7 @@ class SourceWorker:
         if self.stop_event.is_set():
             return None
         cycle = self.run_cycle()
-        self.maintenance()
+        self._run_maintenance()
         logger.info(
             "source worker cycle result: cycle_id=%s cycle_status=%s next_action=%s",
             cycle.cycle_id,
@@ -173,7 +179,7 @@ class SourceWorker:
         return cycle
 
     def run(self) -> None:
-        self.maintenance()
+        self._run_maintenance()
         while not self.stop_event.is_set():
             self.tick()
 
@@ -187,6 +193,16 @@ def cleanup_failed_runs(state: SourceState, config: AppConfig, *, clock: Clock =
             continue
         run_dir = config.paths.data_dir / "outbox" / run.table_name / run.run_id
         if run_dir.exists():
-            shutil.rmtree(run_dir)
+            try:
+                shutil.rmtree(run_dir)
+            except OSError as exc:
+                logger.warning(
+                    "source failed-run cleanup deferred: table=%s run_id=%s path=%s error=%s",
+                    run.table_name,
+                    run.run_id,
+                    run_dir,
+                    exc,
+                )
+                continue
             removed += 1
     return removed
