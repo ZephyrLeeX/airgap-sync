@@ -104,6 +104,8 @@ class FakeSourceMySQL:
         self.table_types = table_types
         self.rows = rows if rows is not None else [(1, "a"), (2, None)]
         self.queries: list[tuple[str, tuple]] = []
+        self.ddl_count = 0
+        self.stream_count = 0
 
     def __enter__(self) -> FakeSourceMySQL:
         return self
@@ -122,12 +124,14 @@ class FakeSourceMySQL:
         raise AssertionError(f"unexpected query: {sql}")
 
     def get_create_table(self, table_name: str) -> str:
+        self.ddl_count += 1
         return (
             f"CREATE TABLE `{table_name}` (\n  `id` int(11) DEFAULT NULL,\n"
             "  `name` varchar(32) DEFAULT NULL\n) ENGINE=InnoDB"
         )
 
     def stream_table(self, table_name: str, fetch_size: int) -> FakeTableStream:
+        self.stream_count += 1
         batches = [self.rows[i : i + fetch_size] for i in range(0, len(self.rows), fetch_size)]
         return FakeTableStream(columns=["id", "name"], batches=batches)
 
@@ -255,6 +259,42 @@ class TestSourceSnapshot:
         assert (run_dir / "schema.sql").exists()
         chunks = sorted(run_dir.glob("chunk-*.jsonl.zst"))
         assert len(chunks) == 1
+
+    @pytest.mark.parametrize(
+        ("table_types", "error_code"),
+        [({}, "TABLE_NOT_FOUND"), ({"t_snapshot": "VIEW"}, "UNSUPPORTED_TABLE_TYPE")],
+    )
+    def test_metadata_rejection_does_not_start_run(
+        self,
+        run_cli,
+        config_data,
+        write_config,
+        password_env,
+        monkeypatch,
+        table_types,
+        error_code,
+    ):
+        import airgap_sync.cli as cli_module
+
+        source = FakeSourceMySQL(None, table_types)
+        monkeypatch.setattr(cli_module, "SourceMySQLConnection", lambda config: source)
+        path = write_config(config_data)
+
+        result = run_cli(["source", "snapshot", "--config", str(path), "--table", "t_snapshot"])
+
+        assert result.exit_code != 0
+        assert error_code in result.output
+        assert source.ddl_count == 0
+        assert source.stream_count == 0
+        assert not (path.parent / "data" / "outbox").exists()
+
+        from airgap_sync.source.state import SourceState, state_db_path
+
+        state = SourceState(state_db_path(path.parent / "data"))
+        try:
+            assert state.get_table_state("t_snapshot") is None
+        finally:
+            state.close()
 
     def test_current_run_id_recorded(
         self, run_cli, config_data, write_config, password_env, monkeypatch

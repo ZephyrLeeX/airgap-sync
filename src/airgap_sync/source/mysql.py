@@ -305,6 +305,8 @@ class TableCheckResult:
 
 
 BASE_TABLE_TYPE = "BASE TABLE"
+TABLE_NOT_FOUND = "TABLE_NOT_FOUND"
+UNSUPPORTED_TABLE_TYPE = "UNSUPPORTED_TABLE_TYPE"
 
 
 def fetch_table_info(executor: QueryExecutor, database: str, table: str) -> TableInfo | None:
@@ -326,12 +328,12 @@ def check_table(table: TableConfig, info: TableInfo | None) -> TableCheckResult:
     (UNSUPPORTED_TABLE_TYPE), 不静默处理。
     """
     if info is None:
-        return TableCheckResult(table=table, ok=False, error_code="TABLE_NOT_FOUND")
+        return TableCheckResult(table=table, ok=False, error_code=TABLE_NOT_FOUND)
     if info.table_type.upper() != BASE_TABLE_TYPE:
         return TableCheckResult(
             table=table,
             ok=False,
-            error_code="UNSUPPORTED_TABLE_TYPE",
+            error_code=UNSUPPORTED_TABLE_TYPE,
             table_type=info.table_type,
         )
     return TableCheckResult(table=table, ok=True, table_type=info.table_type)

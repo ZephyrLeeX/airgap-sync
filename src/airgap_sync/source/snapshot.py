@@ -46,6 +46,7 @@ from airgap_sync.common.manifest import (
 )
 from airgap_sync.common.models import AppConfig
 from airgap_sync.common.verification import DIGEST_ALGORITHM
+from airgap_sync.source.mysql import check_table, fetch_table_info
 from airgap_sync.source.scanner import ScanResult, SnapshotSource, scan_table
 from airgap_sync.source.state import SourceState, TableStatus
 
@@ -140,6 +141,18 @@ class SnapshotRunner:
             raise SnapshotError(TABLE_NOT_CONFIGURED, f"table '{table_name}' is not in config")
         if not table.enabled:
             raise SnapshotError(TABLE_NOT_ENABLED, f"table '{table_name}' is disabled in config")
+
+        table_check = check_table(
+            table,
+            fetch_table_info(self._source, self._config.mysql.database, table_name),
+        )
+        if not table_check.ok:
+            detail = (
+                f"table '{table_name}' has unsupported type {table_check.table_type!r}"
+                if table_check.table_type is not None
+                else f"table '{table_name}' does not exist"
+            )
+            raise SnapshotError(table_check.error_code or "TABLE_CHECK_FAILED", detail)
 
         run_id = generate_run_id()
         run_dir = outbox_run_dir(self._config.paths.data_dir, table_name, run_id)

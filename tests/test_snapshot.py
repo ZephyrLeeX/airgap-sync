@@ -19,6 +19,7 @@ from airgap_sync.common.manifest import read_manifest
 from airgap_sync.common.models import AppConfig
 from airgap_sync.common.row_codec import decode_row
 from airgap_sync.common.verification import MultisetDigest
+from airgap_sync.source.chunk_writer import ChunkWriter, ChunkWriterError
 from airgap_sync.source.snapshot import (
     SCHEMA_CHANGED_DURING_SNAPSHOT,
     TABLE_NOT_CONFIGURED,
@@ -82,6 +83,7 @@ class FakeSnapshotSource:
         ddl_change: str | None = None,
         stream_error_after_batches: int | None = None,
         missing_table: bool = False,
+        table_type: str = "BASE TABLE",
     ) -> None:
         self.ddl = ddl
         self.ddl_change = ddl_change
@@ -89,8 +91,13 @@ class FakeSnapshotSource:
         self.rows = rows if rows is not None else ROWS
         self.stream_error_after = stream_error_after_batches
         self.missing_table = missing_table
+        self.table_type = table_type
         self.ddl_read_count = 0
         self.stream_count = 0
+
+    def fetch_all(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        assert "information_schema.TABLES" in sql
+        return [] if self.missing_table else [(self.table_type,)]
 
     def get_create_table(self, table_name: str) -> str:
         if self.missing_table:
@@ -212,6 +219,7 @@ class TestSuccess:
         assert manifest.row_count == len(ROWS)
         assert [c.sequence for c in manifest.chunks] == [1, 2]
         assert manifest.schema_file.file == "schema.sql"
+        assert manifest.verification.algorithm == "multiset_digest_v1"
 
     def test_manifest_is_digest_of_files(self, tmp_path, password_env, state):
         """端到端: 从最终文件反算摘要与 manifest 一致 (Destination 视角)。"""
@@ -356,9 +364,47 @@ class TestScannerFailure:
         result = run_snapshot(tmp_path, password_env, source, state)
         assert not (result.run_dir / "manifest.json").exists()
 
-    def test_missing_table_fails_run(self, tmp_path, password_env, state):
-        result = run_snapshot(tmp_path, password_env, FakeSnapshotSource(missing_table=True), state)
+    def test_midway_stream_error_aborts_current_chunk(self, tmp_path, password_env, state):
+        source = FakeSnapshotSource(stream_error_after_batches=1)
+        result = run_snapshot(tmp_path, password_env, source, state)
         assert result.status == "FAILED"
+        assert not (result.run_dir / "manifest.json").exists()
+        assert list(result.run_dir.glob("*.part")) == []
+        assert list(result.run_dir.glob("chunk-*.jsonl.zst")) == []
+
+    def test_row_codec_error_aborts_current_chunk(self, tmp_path, password_env, state):
+        source = FakeSnapshotSource(rows=[(1, "valid", None), (2, object(), None)])
+        result = run_snapshot(tmp_path, password_env, source, state)
+        assert result.status == "FAILED"
+        assert "unsupported value type" in str(result.error)
+        assert not (result.run_dir / "manifest.json").exists()
+        assert list(result.run_dir.glob("*.part")) == []
+        assert list(result.run_dir.glob("chunk-*.jsonl.zst")) == []
+
+    def test_writer_error_aborts_current_chunk(self, tmp_path, password_env, state, monkeypatch):
+        original_write_row = ChunkWriter.write_row
+        calls = 0
+
+        def fail_second_write(writer, encoded):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ChunkWriterError("fake chunk write failure")
+            original_write_row(writer, encoded)
+
+        monkeypatch.setattr(ChunkWriter, "write_row", fail_second_write)
+        result = run_snapshot(tmp_path, password_env, FakeSnapshotSource(), state)
+        assert result.status == "FAILED"
+        assert "fake chunk write failure" in str(result.error)
+        assert not (result.run_dir / "manifest.json").exists()
+        assert list(result.run_dir.glob("*.part")) == []
+        assert list(result.run_dir.glob("chunk-*.jsonl.zst")) == []
+
+    def test_missing_table_fails_run(self, tmp_path, password_env, state):
+        with pytest.raises(SnapshotError, match="TABLE_NOT_FOUND"):
+            run_snapshot(tmp_path, password_env, FakeSnapshotSource(missing_table=True), state)
+        assert not (tmp_path / "data" / "outbox").exists()
+        assert state.get_table_state("t_demo") is None
 
     def test_failure_keeps_previous_current_run_id(self, tmp_path, password_env, state):
         ok = run_snapshot(tmp_path, password_env, FakeSnapshotSource(), state)

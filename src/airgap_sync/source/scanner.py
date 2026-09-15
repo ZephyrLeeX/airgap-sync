@@ -39,6 +39,8 @@ class TableStreamProtocol(Protocol):
 class SnapshotSource(Protocol):
     """Snapshot 需要的 Source MySQL 能力 (SourceMySQLConnection 或测试替身)。"""
 
+    def fetch_all(self, sql: str, params: tuple[Any, ...] = ...) -> list[tuple[Any, ...]]: ...
+
     def get_create_table(self, table_name: str) -> str: ...
 
     def stream_table(self, table_name: str, fetch_size: int) -> TableStreamProtocol: ...
@@ -66,15 +68,15 @@ def scan_table(
     摘要与行顺序无关。
     """
     digest = MultisetDigest()
-    writer = ChunkWriter(run_dir, chunk_config, log_context=f" table={table_name}")
-    with source.stream_table(table_name, snapshot_config.fetch_size) as stream:
-        columns = list(stream.columns)
-        for batch in stream:
-            for row in batch:
-                encoded = encode_row(row)
-                writer.write_row(encoded)
-                digest.update(encoded)
-    chunks = writer.finish()
+    with ChunkWriter(run_dir, chunk_config, log_context=f" table={table_name}") as writer:
+        with source.stream_table(table_name, snapshot_config.fetch_size) as stream:
+            columns = list(stream.columns)
+            for batch in stream:
+                for row in batch:
+                    encoded = encode_row(row)
+                    writer.write_row(encoded)
+                    digest.update(encoded)
+        chunks = writer.finish()
     logger.info(
         "scan finished: table=%s rows=%d chunks=%d", table_name, digest.row_count, len(chunks)
     )

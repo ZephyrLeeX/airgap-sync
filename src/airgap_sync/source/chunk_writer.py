@@ -83,6 +83,15 @@ class ChunkWriter:
         self._compressor_context = zstandard.ZstdCompressor(level=config.compression_level)
         self.chunks: list[ChunkMeta] = []
         self._current: _OpenChunk | None = None
+        self._finished = False
+        self._aborted = False
+
+    def __enter__(self) -> ChunkWriter:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        # finish() 后没有打开的 Chunk, abort() 是安全空操作。异常时不吞掉原异常。
+        self.abort()
 
     def write_row(self, encoded: bytes) -> None:
         """写入一行 (canonical JSON bytes, 不含换行)。
@@ -90,6 +99,10 @@ class ChunkWriter:
         写入后检查阈值: 达到任一阈值即封闭当前 Chunk。
         行本身超过字节阈值时仍会先完整写入, 封闭后形成单行超限 Chunk。
         """
+        if self._finished:
+            raise ChunkWriterError("cannot write after finish")
+        if self._aborted:
+            raise ChunkWriterError("cannot write after abort")
         if self._current is None:
             self._current = self._open_chunk()
         self._current.write_row(encoded)
@@ -110,9 +123,21 @@ class ChunkWriter:
 
     def finish(self) -> list[ChunkMeta]:
         """封闭最后一个 Chunk (如果还有), 返回全部 Chunk metadata。"""
+        if self._aborted:
+            raise ChunkWriterError("cannot finish an aborted chunk writer")
         if self._current is not None:
             self.close_current_chunk()
+        self._finished = True
         return list(self.chunks)
+
+    def abort(self) -> None:
+        """关闭并丢弃当前未完成 Chunk; 已封闭 Chunk 保留。可重复调用。"""
+        if self._aborted or self._finished:
+            return
+        self._aborted = True
+        current, self._current = self._current, None
+        if current is not None:
+            current.abort()
 
     def _open_chunk(self) -> _OpenChunk:
         # 只在 _current 为 None 时调用, 序号 = 已封闭 Chunk 数 + 1
@@ -145,7 +170,13 @@ class _OpenChunk:
         # 生命周期跨多个 write_row 调用, 不能用 with 包裹单次写入
         self._raw_fh = open(self._part_path, "wb")  # noqa: SIM115
         self._hashing = _HashingFile(self._raw_fh)
-        self._compressor = compressor_context.stream_writer(self._hashing, closefd=False)
+        try:
+            self._compressor = compressor_context.stream_writer(self._hashing, closefd=False)
+        except Exception:
+            self._raw_fh.close()
+            self._part_path.unlink(missing_ok=True)
+            raise
+        self._aborted = False
 
     def write_row(self, encoded: bytes) -> None:
         line = encoded + b"\n"
@@ -185,3 +216,24 @@ class _OpenChunk:
             meta.compressed_bytes,
         )
         return meta
+
+    def abort(self) -> None:
+        """Best-effort 关闭所有句柄并删除 .part; 从不 rename。"""
+        if self._aborted:
+            return
+        self._aborted = True
+        try:
+            self._compressor.close()
+        except Exception as exc:
+            logger.warning("cannot close aborted chunk %s: %s", self._part_path, exc)
+        finally:
+            try:
+                self._raw_fh.close()
+            except Exception as exc:
+                logger.warning(
+                    "cannot close raw file for aborted chunk %s: %s", self._part_path, exc
+                )
+        try:
+            self._part_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("cannot remove aborted chunk %s: %s", self._part_path, exc)

@@ -105,6 +105,29 @@ class TestAtomicity:
         with pytest.raises(ChunkWriterError, match="no open chunk"):
             writer.close_current_chunk()
 
+    def test_abort_is_idempotent_and_removes_current_part(self, tmp_path):
+        writer = make_writer(tmp_path)
+        writer.write_row(b"[1]")
+        writer.abort()
+        writer.abort()
+        assert list((tmp_path / "run").iterdir()) == []
+
+    def test_context_exception_aborts_current_but_keeps_closed_chunks(self, tmp_path):
+        writer = make_writer(tmp_path, max_rows=100)
+        with pytest.raises(RuntimeError, match="scan failed"), writer:
+            writer.write_row(b"[1]")
+            writer.close_current_chunk()  # 已正式封闭
+            writer.write_row(b"[2]")  # 当前未完成 .part
+            raise RuntimeError("scan failed")
+        assert sorted(p.name for p in (tmp_path / "run").iterdir()) == ["chunk-000001.jsonl.zst"]
+
+    def test_exit_after_finish_does_not_damage_chunks(self, tmp_path):
+        with make_writer(tmp_path) as writer:
+            writer.write_row(b"[1]")
+            chunks = writer.finish()
+        writer.abort()
+        assert (tmp_path / "run" / chunks[0].file).exists()
+
 
 class TestContentIntegrity:
     def test_sha256_matches_final_file(self, tmp_path):
