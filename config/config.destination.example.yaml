@@ -1,0 +1,23 @@
+# Destination 不配置同步表；表名、列和结构均来自 manifest + schema.sql。
+role: destination
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  database: target_database
+  user: airgap_sync
+  # 密码值只放在环境变量中。
+  password_env: AIRGAP_SYNC_MYSQL_PASSWORD
+  connect_timeout: 10
+
+destination:
+  # 外部 FTP Client 将 Relay 文件下载到这个扁平目录。
+  incoming_dir: D:/airgap-sync/incoming
+  # metadata 与 staging 位于同一 MySQL Server，保证 Chunk 数据和状态同事务提交。
+  metadata_database: airgap_sync_meta
+  insert_batch_rows: 1000
+  # 整组预期文件的 size + mtime 在两个观察点间不变，才开始读取。
+  settle_seconds: 2
+
+# 可省略；Destination 不用这个列表决定接收哪些表。
+tables: []

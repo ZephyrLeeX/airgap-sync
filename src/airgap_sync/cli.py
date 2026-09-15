@@ -18,6 +18,9 @@ from airgap_sync.common.config import (
 )
 from airgap_sync.common.logging import setup_logging
 from airgap_sync.common.models import AppConfig, Role
+from airgap_sync.destination.incoming import DestinationError
+from airgap_sync.destination.mysql import DestinationMySQLConnection, DestinationMySQLError
+from airgap_sync.destination.processor import DestinationProcessor, ProcessResult, process_once
 from airgap_sync.source.delivery import DeliveryRunner
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
@@ -66,6 +69,8 @@ def config_group() -> None:
 def config_validate(config_path: Path) -> None:
     """加载并校验 YAML 配置, 确认密码环境变量已设置。"""
     config = load_config(config_path)
+    if config.role is Role.DESTINATION:
+        _require_destination_role(config)
     resolve_password(config.mysql)
     logger.debug("config validated: %s", config_path)
     click.echo("Configuration OK")
@@ -80,6 +85,85 @@ def config_validate(config_path: Path) -> None:
 @cli.group("source")
 def source_group() -> None:
     """Source 端命令。"""
+
+
+@cli.group("destination")
+def destination_group() -> None:
+    """Destination 端命令。"""
+
+
+@destination_group.command("check")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def destination_check(config_path: Path) -> None:
+    """检查 Destination 配置、incoming、目标 MySQL 与 metadata schema。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    resolve_password(config.mysql)
+    _ensure_incoming(config.destination.incoming_dir)
+    click.echo("Configuration       OK")
+    click.echo(f"Incoming            OK ({config.destination.incoming_dir})")
+    with DestinationMySQLConnection(config.mysql, config.destination) as connection:
+        version = connection.ping()
+        connection.initialize_metadata()
+        metadata_version = connection.metadata_schema_version()
+    click.echo("MySQL connection    OK")
+    click.echo(f"MySQL server        {version}")
+    click.echo(f"Target database     {config.mysql.database}")
+    click.echo(
+        f"Metadata schema     OK ({config.destination.metadata_database}, v{metadata_version})"
+    )
+
+
+@destination_group.command("process")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--run", "run_id", required=True, help="要处理的 transport Run ID。")
+def destination_process(config_path: Path, run_id: str) -> None:
+    """完整校验一个 Run 并流式导入 staging。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    _ensure_incoming(config.destination.incoming_dir)
+    with DestinationMySQLConnection(config.mysql, config.destination) as connection:
+        connection.initialize_metadata()
+        result = DestinationProcessor(connection, config).process(run_id)
+    _print_destination_result(result)
+    if result.status == "FAILED":
+        raise click.ClickException(result.error or "destination processing failed")
+
+
+@destination_group.command("process-once")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def destination_process_once(config_path: Path) -> None:
+    """扫描当前所有 manifest，各尝试一次，然后退出。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    _ensure_incoming(config.destination.incoming_dir)
+    with DestinationMySQLConnection(config.mysql, config.destination) as connection:
+        connection.initialize_metadata()
+        results = process_once(connection, config)
+    for result in results:
+        click.echo(f"{result.run_id}    {result.status}")
+        if result.error:
+            click.echo(f"  {result.error}")
+    if any(result.status == "FAILED" for result in results):
+        raise click.ClickException("one or more runs failed permanently")
 
 
 @source_group.command("check")
@@ -209,6 +293,36 @@ def _require_source_role(config: AppConfig) -> None:
         )
 
 
+def _require_destination_role(config: AppConfig) -> None:
+    if config.role is not Role.DESTINATION:
+        raise ConfigError(
+            "'destination' commands require role=destination, "
+            f"but config has role={config.role.value}"
+        )
+    if config.destination is None:
+        raise ConfigError("destination configuration is required for destination commands")
+
+
+def _ensure_incoming(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DestinationError("INCOMING_DIR_ERROR", str(exc)) from exc
+
+
+def _print_destination_result(result: ProcessResult) -> None:
+    click.echo(f"Run             {result.run_id}")
+    if result.table is not None:
+        click.echo(f"Table           {result.table}")
+    if result.staging_table is not None:
+        click.echo(f"Staging         {result.staging_table}")
+    click.echo(f"Rows            {result.rows:,}")
+    click.echo(f"Chunks          {result.chunks}")
+    click.echo(f"Status          {result.status}")
+    if result.error:
+        click.echo(f"Detail          {result.error}")
+
+
 def _print_table_report(
     config: AppConfig, results: list[TableCheckResult], state: SourceState
 ) -> None:
@@ -272,7 +386,15 @@ def main() -> None:
     except click.Abort:
         click.echo("Aborted.", err=True)
         sys.exit(130)
-    except (ConfigError, SourceMySQLError, StateError, SnapshotError, UploadError) as exc:
+    except (
+        ConfigError,
+        DestinationError,
+        DestinationMySQLError,
+        SourceMySQLError,
+        StateError,
+        SnapshotError,
+        UploadError,
+    ) as exc:
         click.echo(f"ERROR: {exc}", err=True)
         sys.exit(1)
 

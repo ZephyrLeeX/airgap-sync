@@ -118,15 +118,31 @@ filename/size/sha256 与本地完全一致、request_id 非空才算确认。409
 manifest；manifest 必须最后提交。`DELIVERED` 仅表示 Relay 已可靠接收，不表示
 Destination 已 Apply 或 VERIFIED。
 
-## 3.2 后续阶段已确定的行为
+## 3.2 Destination Phase 4 已实现行为
+
+外部 FTP Client 把 Relay 文件下载到 Destination `incoming/`；本项目不实现 FTP 客户端。
+Destination 只以 transport manifest 为 Run 候选，等待 manifest 声明的 schema 和全部 Chunk
+存在且整组文件稳定，再严格检查 protocol v1、FULL_SNAPSHOT、multiset_digest_v1、run_id、
+Chunk 序号/逻辑名/行数、文件 size/SHA256 与 schema 表名。
+
+Destination 不要求表级策略配置。源端新增同步表后，目标端从 `manifest.source.table`、
+`manifest.columns` 与 `schema.sql` 自动创建 staging。Phase 4 只把完整数据导入确定命名的
+staging 并标记 `STAGED`；正式业务表不被创建、修改、清空或删除，incoming 文件也保留。
+
+Chunk 使用 zstd/Row Codec 流式解码和有限 batch `executemany`，一个 Chunk 是一个 MySQL
+事务，staging 数据与 `IMPORTED` metadata 同事务提交。已导入 Chunk 重试时跳过。
+
+## 3.3 后续阶段已确定的行为
 
 Phase 6 的 Source 调度采用 fixed-delay：一个 Cycle 可靠交付完成后等待可配置间隔
 （建议默认 `delay_after_success=7d`）再启动下一 Cycle；失败使用独立较短重试间隔。
 本阶段不实现 Scheduler。
 
-Phase 4/5 的 Destination 在完整 Run 到达后立即处理：staging → VERIFY → 正式表切换
-→ VERIFIED，随后删除本地 Snapshot 文件。失败时保留文件和上一版正式表，不采用
-Destination 定时导入。
+Phase 5 对 Phase 4 的 staging 从 MySQL 重新读取并复算 digest，验证通过后才原子切换
+正式表、删除本地 Snapshot 文件并记录统计。失败时保留文件和上一版正式表。
+
+Phase 6 的 Destination Worker 在完整 Run 到达后立即调用 Phase 4 的 discover / validate /
+stage-import 核心，不采用每天固定时刻批量导入。
 
 V1 领导统计只提供：总行数、本次净增、月度净增。总行数是最近 VERIFIED Snapshot
 的 row_count；本次净增是本次减上次 VERIFIED row_count；月度净增是本月最后一次

@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-Phase 1、Phase 2 与 Phase 3（HTTP Relay 可靠交付）已完成，当前支持：
+Phase 1 至 Phase 4（Destination staging 导入）已完成，当前支持：
 
 - YAML 配置加载与强类型校验（表配置只需 `name` + `enabled`，所有表统一 FULL_SNAPSHOT；旧 `mode` / `key` 字段已删除，配置中残留会明确报错）；
 - `airgap-sync config validate` 配置校验；
@@ -15,6 +15,11 @@ Phase 1、Phase 2 与 Phase 3（HTTP Relay 可靠交付）已完成，当前支�
 - `airgap-sync source sync --table TABLE`：扫描与单路 HTTP PUT 并行，Relay 严格确认每个
   Chunk 后即释放 Source 文件，最后依次提交 schema 和 manifest；
 - `airgap-sync source relay-check`：只调用 `GET /health` 的诊断命令。
+- `airgap-sync destination check`：检查 incoming、目标 MySQL 与 metadata schema；
+- `airgap-sync destination process --run RUN_ID`：严格校验完整 Run，按 Chunk 流式导入
+  staging，最高状态为 `STAGED`；
+- `airgap-sync destination process-once`：扫描当前全部 manifest 一次；不完整 Run 跳过，
+  不会阻断其他 Run。
 
 ### 源数据库只读保护
 
@@ -46,8 +51,9 @@ outbox/<table>/<run_id>/
 - 扫描前后各取一次 DDL，结构变化则 Run FAILED（`SCHEMA_CHANGED_DURING_SNAPSHOT`），不产生结构错配的快照；
 - 验证摘要是与行顺序无关的 multiset digest（`row_count` + `digest_a` + `digest_b`），供目标端导入后复算比对。
 
-以下能力**尚未实现**：FTP Client、Destination 端、staging/VERIFY/正式表切换、领导统计
-和 fixed-delay Scheduler。
+以下能力**尚未实现**：staging 内容的最终 digest VERIFY、正式表切换、incoming Snapshot
+删除、总行数/本次净增/月度净增统计、Destination 常驻 Worker 和 Source fixed-delay
+Scheduler。FTP Client 是现有外部链路组件，不属于本项目。
 
 ## 环境要求
 
@@ -65,6 +71,8 @@ uv sync           # 创建虚拟环境并安装依赖
 
 ```bash
 cp config/config.example.yaml config/config.yaml
+# Destination 使用：
+cp config/config.destination.example.yaml config/config.yaml
 ```
 
 按实际环境修改 `mysql`、`paths`、`snapshot`、`chunk`、`relay`、`spool`、`tables` 配置。注意：
@@ -73,6 +81,7 @@ cp config/config.example.yaml config/config.yaml
 - Relay Token 也**不写入 YAML**，只通过 `relay.token_env` 指定的环境变量提供；
 - `paths.data_dir` 支持 Windows 风格路径，例如 `D:/airgap-sync/data`；
 - 每张同步表只需要 `name` 和 `enabled`，所有表统一 FULL_SNAPSHOT，不需要配置主键或同步模式。
+- Destination 可省略 `tables`（或写 `tables: []`），新表会随完整 Snapshot 自动进入 staging。
 
 ## 设置数据库密码环境变量
 
@@ -97,6 +106,9 @@ uv run airgap-sync source check --config config/config.yaml
 uv run airgap-sync source snapshot --config config/config.yaml --table std_scjgj_zhgsxt_qyjbxx_all
 uv run airgap-sync source relay-check --config config/config.yaml
 uv run airgap-sync source sync --config config/config.yaml --table std_scjgj_zhgsxt_qyjbxx_all
+uv run airgap-sync destination check --config config/config.yaml
+uv run airgap-sync destination process --config config/config.yaml --run 20260915T030000Z-a1b2c3d4
+uv run airgap-sync destination process-once --config config/config.yaml
 ```
 
 `source check` 输出示例：
@@ -150,6 +162,33 @@ HTTP worker 顺序上传，所以扫描/压缩可与 PUT 重叠，但不会并�
 阻塞数据库读取。全部 Chunk 确认且 DDL 二次检查通过后才上传 schema，manifest 永远最后。
 
 `DELIVERED` 后清理本地 Run 文件；删除失败只作为本地 cleanup error 记录，不会重新 PUT。
+
+## Destination：incoming → STAGED
+
+外部 FTP Client 把扁平 transport 文件下载到 `destination.incoming_dir`，文件名固定为
+`airgap-v1--<run_id>--<logical_name>`。Destination 只从 `manifest.json` transport 文件发现
+Run：孤立 Chunk 不会建表。manifest 出现但预期文件缺失、文件小于声明大小，或整组文件在
+`settle_seconds` 两个观察点间发生变化时，本次结果为可重试的 `INCOMPLETE`；稳定后的协议、
+结构、大小或 SHA256 矛盾是永久 `FAILED`。
+
+只接受 protocol v1、`FULL_SNAPSHOT` 和 `multiset_digest_v1`。Chunk 序号必须从 1 连续，
+逻辑文件名、行数和 manifest 内部 row count 必须一致。SHA256 以固定缓冲流式计算，不把
+大 Chunk 整体读入内存。
+
+目标 MySQL 使用独立写连接，metadata 默认保存在 `airgap_sync_meta`（schema v1）。
+`schema.sql` 必须是与 manifest 表名一致的单条 `CREATE TABLE`；程序只重写 CREATE TABLE
+后的第一个 identifier 为确定、短且与源表长度无关的 `__airgap_stg_<run>_<hash>`。
+FOREIGN KEY / CONSTRAINT 当前明确报 `UNSUPPORTED_SCHEMA_FEATURE`。PK、UNIQUE、INDEX、
+AUTO_INCREMENT、charset、collation 和 comment 保持原样。正式表无论是否已存在都不会被
+CREATE、DROP、TRUNCATE、ALTER 或 INSERT。
+
+Chunk 使用 zstd streaming decompressor 逐行读取，复用公共 Row Codec 解码；INSERT 始终
+使用经过核对的显式列名，生成列从 INSERT 列表排除。`executemany` 受
+`destination.insert_batch_rows` 控制，但整个 Chunk 只有一个事务；staging 行和 Chunk
+`IMPORTED` metadata 在同一 MySQL 事务提交。失败会整 Chunk 回滚，已 `IMPORTED` Chunk
+重试时直接跳过。同 Run 和同一源表的不同 Run 都使用 MySQL advisory lock 避免并发。
+所有 Chunk 行数合计匹配后 Run 才成为 `STAGED`。incoming 文件保留，最终数据库 digest、
+正式表原子切换与清理属于 Phase 5。
 
 ## 真实 Relay 手工测试
 

@@ -1,1 +1,1 @@
-"""Destination 端模块(后续 Phase 实现)。"""
+"""Destination incoming 校验与 staging 导入。"""

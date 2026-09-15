@@ -133,11 +133,18 @@ outbox/<table>/<run_id>/schema.sql + chunk-*.jsonl.zst + manifest.json
 
 # Phase 4：Destination 接收 + staging 导入
 
-* T301 incoming 文件管理（incoming / pending / processing / applied / failed）；
-* T302 文件与 Manifest 校验（SHA256、缺失文件、顺序）；
-* T303 目标同步元数据（runs / chunks / table_versions）；
-* T304 基于 schema.sql 创建 staging 表并按 manifest columns 完整导入；
-* T305 Chunk 幂等（重复文件不重复写入）。
+✅ 已完成：
+
+* T301 manifest-as-commit-marker 的 incoming 发现与整组文件稳定性检查；
+* T302 严格协议、内部一致性、size、流式 SHA256 与 schema 校验；
+* T303 目标 MySQL metadata schema v1（runs / chunks）与 advisory lock；
+* T304 安全重写 schema.sql 目标名、创建 staging、识别 generated columns；
+* T305 zstd + Row Codec 流式批量导入，一个 Chunk 一个原子事务；
+* T306 Chunk metadata 与数据同事务、IMPORTED 跳过、崩溃状态可重试；
+* T307 `destination check/process/process-once` CLI。
+
+Phase 4 最高状态为 `STAGED`，不修改正式表，也不删除 incoming 文件。Destination 不要求
+表级配置，新表由 manifest.source.table + schema.sql 自动接收。
 
 ---
 

@@ -597,16 +597,69 @@ raw bytes, compressed bytes, elapsed time, status, error
 
 ---
 
-# 17. 后续阶段
+# 17. Destination Phase 4：incoming → STAGED
+
+## 17.1 配置与发现
+
+`role=destination` 允许省略 `tables` 和 Source 专用 `paths`。`destination` 包含
+`incoming_dir`、`metadata_database`（默认 `airgap_sync_meta`）、`insert_batch_rows`
+（默认 1000）与 `settle_seconds`（默认 2）。密码仍只从 `mysql.password_env` 读取。
+
+incoming 是扁平 transport namespace。`discover_runs()` 复用公共
+`parse_transport_filename()`，只识别 logical name 为 `manifest.json` 的文件；孤立 schema /
+Chunk 被忽略。`process-once` 按带 UTC 时间前缀的 run_id 排序，串行尝试所有候选。
+
+manifest 给出预期文件集。第一次收集整组 `(size, mtime_ns)`，统一等待一次 settle interval，
+第二次全部不变才继续。缺文件、文件变化或 Chunk 小于声明 size 是可重试 `INCOMPLETE`；
+稳定后超长、SHA256 错误和协议矛盾是永久 `FAILED`。SHA256 固定 buffer 流式读取。
+
+## 17.2 DDL 与 staging
+
+`rewrite_create_table_target()` 解析 CREATE TABLE 后第一个 MySQL identifier（含反引号转义），
+核对其与 manifest source table 一致，只替换该 token。拒绝多 statement、schema-qualified
+target 和 FOREIGN KEY / CONSTRAINT；其余 DDL 文本逐字保留。staging 名称由 run_id 与短
+hash 确定生成，不依赖原表长度且不超过 MySQL 64 字符。
+
+即使正式表不存在也只 CREATE staging。创建后从 `information_schema.COLUMNS` 读取列顺序、
+EXTRA 与 GENERATION_EXPRESSION；全列顺序必须与 manifest 完全一致。生成列不进入 INSERT
+column list，由 MySQL 计算。
+
+## 17.3 Metadata、事务与恢复
+
+Destination 使用独立 `DestinationMySQLConnection`，不复用强制只读的 Source wrapper，
+也不提供 CLI 可调用的 arbitrary SQL。metadata schema v1 只有简单 SQL migration，核心表为
+`runs` 与 `chunks`。同一 MySQL Server 上的 metadata 和 staging 允许如下原子边界：
+
+```text
+BEGIN
+chunk → IMPORTING
+stream decode → executemany(batch) ...
+核对实际 Chunk rows
+chunk → IMPORTED
+COMMIT
+```
+
+任意解压、decode、行宽、INSERT 或连接错误都会 rollback 整个 Chunk；FAILED 标记在回滚后
+单独记录。重启后 `IMPORTED` 直接跳过，PENDING / FAILED / 残留 IMPORTING 重做整 Chunk。
+staging 与 metadata 矛盾时返回 `STAGING_STATE_MISMATCH`，绝不自动 DROP staging。
+
+每个 Chunk 用 zstandard stream reader 逐行调用公共 `decode_row()`，只保留当前行和最多
+`insert_batch_rows` 行。所有 Chunk 均 IMPORTED 且 imported_rows 合计等于 manifest.row_count
+后 Run 才成为 `STAGED`。MySQL advisory lock 同时约束同 run_id 以及同 source database/table，
+避免并行处理同一 Run 或同一业务表的不同 Run。
+
+Phase 4 不计算最终 multiset digest、不切换正式表、不删除 incoming、不生成领导统计。
+
+# 18. 后续阶段
 
 * **Phase 3**：HTTP 上传 + Source 磁盘流水线（已实现）；
-* **Phase 4**：Destination 接收 + staging 导入；
+* **Phase 4**：Destination 接收 + staging 导入（已实现）；
 * **Phase 5**：一致性验证（复算 Multiset Digest）+ 正式表切换；
 * **Phase 6**：调度、状态、异常恢复、大表压力测试。
 
 ---
 
-# 18. V1 不实现
+# 19. V1 不实现
 
 * Binlog CDC；
 * 增量同步 / Diff / 逻辑键 / 行级 Hash 状态；

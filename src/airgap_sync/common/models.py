@@ -107,6 +107,17 @@ class SpoolConfig(BaseModel):
     min_free_bytes: int = Field(default=10 * 1024**3, ge=0)
 
 
+class DestinationConfig(BaseModel):
+    """Destination 接收目录与导入参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    incoming_dir: Path
+    metadata_database: str = Field(default="airgap_sync_meta", min_length=1, max_length=64)
+    insert_batch_rows: int = Field(default=1000, ge=1, le=1_000_000)
+    settle_seconds: float = Field(default=2, ge=0, le=3600)
+
+
 class TableConfig(BaseModel):
     """单张同步表的配置。
 
@@ -134,15 +145,21 @@ class AppConfig(BaseModel):
 
     role: Role
     mysql: MySQLConfig
-    paths: PathsConfig
+    paths: PathsConfig | None = None
     snapshot: SnapshotConfig = SnapshotConfig()
     chunk: ChunkConfig = ChunkConfig()
     relay: RelayConfig | None = None
     spool: SpoolConfig = SpoolConfig()
-    tables: list[TableConfig] = Field(min_length=1)
+    destination: DestinationConfig | None = None
+    tables: list[TableConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_table_names(self) -> Self:
+        if self.role is Role.SOURCE:
+            if self.paths is None:
+                raise ValueError("paths is required when role=source")
+            if not self.tables:
+                raise ValueError("at least one table is required when role=source")
         names = [table.name for table in self.tables]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
