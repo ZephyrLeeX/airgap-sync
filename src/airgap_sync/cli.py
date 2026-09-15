@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import signal
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import click
 from click.exceptions import Exit as ClickExit
@@ -17,11 +20,14 @@ from airgap_sync.common.config import (
     resolve_relay_token,
 )
 from airgap_sync.common.logging import setup_logging
-from airgap_sync.common.models import AppConfig, Role
-from airgap_sync.destination.incoming import DestinationError
+from airgap_sync.common.models import AppConfig, Role, TableConfig
+from airgap_sync.common.runtime import ProcessLock, WorkerAlreadyRunning
+from airgap_sync.destination.incoming import DestinationError, discover_runs
 from airgap_sync.destination.mysql import DestinationMySQLConnection, DestinationMySQLError
 from airgap_sync.destination.processor import DestinationProcessor, ProcessResult, process_once
 from airgap_sync.destination.statistics import TableStatistics, calculate_statistics
+from airgap_sync.destination.worker import DestinationWorker, cleanup_orphan_artifacts
+from airgap_sync.source.cycle import CycleRunner, SourceWorker, cleanup_failed_runs, next_action_at
 from airgap_sync.source.delivery import DeliveryRunner
 from airgap_sync.source.mysql import (
     SourceMySQLConnection,
@@ -165,6 +171,63 @@ def destination_process_once(config_path: Path) -> None:
             click.echo(f"  {result.error}")
     if any(result.status == "FAILED" for result in results):
         raise click.ClickException("one or more runs failed permanently")
+
+
+@destination_group.command("worker")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def destination_worker(config_path: Path) -> None:
+    """前台轮询 incoming，处理 ready Run 并重试维护任务。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    _ensure_incoming(config.destination.incoming_dir)
+    stop = Event()
+    _install_stop_handlers(stop)
+    lock_path = config.destination.incoming_dir / ".airgap-sync-destination-worker.lock"
+    with (
+        ProcessLock(lock_path),
+        DestinationMySQLConnection(config.mysql, config.destination) as connection,
+    ):
+        connection.initialize_metadata()
+        cleanup_orphan_artifacts(connection, config)
+        DestinationWorker(connection, config, stop_event=stop).run()
+
+
+@destination_group.command("status")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def destination_status(config_path: Path) -> None:
+    """显示 incoming、cleanup pending、最新 VERIFIED 与异常 Run。"""
+    config = load_config(config_path)
+    _require_destination_role(config)
+    assert config.destination is not None
+    candidates = discover_runs(config.destination.incoming_dir)
+    with DestinationMySQLConnection(config.mysql, config.destination) as connection:
+        connection.initialize_metadata()
+        pending = connection.cleanup_pending_runs()
+        verified = connection.latest_verified_runs(20)
+        problems = connection.recent_problem_runs(20)
+    click.echo(f"Incoming candidate runs  {len(candidates)}")
+    for run_id in candidates[:20]:
+        click.echo(f"  {run_id}")
+    click.echo(f"Cleanup pending          {len(pending)}")
+    for run in pending[:20]:
+        click.echo(f"  {run.run_id}  {run.table_name}  {run.status}")
+    click.echo("Latest VERIFIED tables")
+    for run in verified:
+        click.echo(f"  {run.table_name:<24} {run.run_id}")
+    click.echo("MISMATCH/FAILED runs")
+    for run in problems:
+        click.echo(f"  {run.status:<10} {run.table_name:<24} {run.run_id}")
 
 
 @destination_group.command("stats")
@@ -321,6 +384,145 @@ def source_sync(config_path: Path, table_name: str) -> None:
         sys.exit(1)
 
 
+def _cycle_runner(config: AppConfig, state: SourceState, stop: Event | None = None) -> CycleRunner:
+    if config.relay is None:
+        raise ConfigError("relay configuration is required for source cycle")
+    token = resolve_relay_token(config.relay)
+
+    def sync_table(table_name: str) -> SnapshotResult:
+        captured = config.table(table_name)
+        if captured is None:
+            tables = [*config.tables, TableConfig(name=table_name, enabled=True)]
+            effective_config = config.model_copy(update={"tables": tables})
+        elif not captured.enabled:
+            tables = [
+                table.model_copy(update={"enabled": True}) if table.name == table_name else table
+                for table in config.tables
+            ]
+            effective_config = config.model_copy(update={"tables": tables})
+        else:
+            effective_config = config
+        with SourceMySQLConnection(config.mysql) as connection:
+            uploader = RelayUploader(config.relay, token)
+            return DeliveryRunner(connection, state, effective_config, uploader).sync(table_name)
+
+    return CycleRunner(state, config, sync_table, stop_event=stop)
+
+
+@source_group.group("cycle")
+def source_cycle_group() -> None:
+    """Source persisted Cycle 管理。"""
+
+
+@source_cycle_group.command("run")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_cycle_run(config_path: Path) -> None:
+    """立即创建或恢复一个完整 Cycle。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    resolve_password(config.mysql)
+    assert config.paths is not None
+    lock_path = config.paths.data_dir / "state" / "source-worker.lock"
+    with ProcessLock(lock_path), SourceState(state_db_path(config.paths.data_dir)) as state:
+        state.initialize()
+        cycle = _cycle_runner(config, state).run()
+    click.echo(f"Cycle       {cycle.cycle_id}")
+    click.echo(f"Status      {cycle.status}")
+    if cycle.next_attempt_at:
+        click.echo(f"Next retry  {cycle.next_attempt_at}")
+
+
+@source_cycle_group.command("abandon")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_cycle_abandon(config_path: Path) -> None:
+    """显式放弃当前 RUNNING/RETRY_WAIT Cycle。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    assert config.paths is not None
+    lock_path = config.paths.data_dir / "state" / "source-worker.lock"
+    with ProcessLock(lock_path), SourceState(state_db_path(config.paths.data_dir)) as state:
+        state.initialize()
+        cycle = state.abandon_active_cycle()
+    click.echo(f"Abandoned   {cycle.cycle_id}")
+
+
+@source_group.command("worker")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_worker(config_path: Path) -> None:
+    """前台运行 completion-driven fixed-delay Source worker。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    if not config.schedule.enabled:
+        raise ConfigError("schedule.enabled must be true for source worker")
+    resolve_password(config.mysql)
+    assert config.paths is not None
+    stop = Event()
+    _install_stop_handlers(stop)
+    lock_path = config.paths.data_dir / "state" / "source-worker.lock"
+    with ProcessLock(lock_path), SourceState(state_db_path(config.paths.data_dir)) as state:
+        state.initialize()
+        SourceWorker(
+            state,
+            config,
+            lambda: _cycle_runner(config, state, stop).run(),
+            stop_event=stop,
+            maintenance=lambda: cleanup_failed_runs(state, config),
+        ).run()
+
+
+@source_group.command("status")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_status(config_path: Path) -> None:
+    """显示最新 Cycle、下一动作和捕获的表状态。"""
+    config = load_config(config_path)
+    _require_source_role(config)
+    assert config.paths is not None
+    with SourceState(state_db_path(config.paths.data_dir)) as state:
+        state.initialize()
+        cycle = state.latest_cycle()
+        if cycle is None:
+            click.echo("Latest Cycle  none")
+            click.echo("Next action   now")
+            return
+        tables = state.cycle_tables(cycle.cycle_id)
+        due = next_action_at(state, config, datetime.now(UTC))
+    click.echo(f"Latest Cycle  {cycle.cycle_id}")
+    click.echo(f"Status        {cycle.status}")
+    click.echo(f"Started       {cycle.started_at or '-'}")
+    click.echo(f"Completed     {cycle.completed_at or '-'}")
+    click.echo(f"Next action   {due.isoformat(timespec='seconds')}")
+    click.echo(
+        "Table                    Status       Attempts  Last run                    Delivered"
+    )
+    for table in tables:
+        click.echo(
+            f"{table.table_name:<24} {table.status:<12} {table.attempts:<9} "
+            f"{table.last_run_id or '-':<27} {table.delivered_at or '-'}"
+        )
+        if table.last_error:
+            click.echo(f"  Last error: {table.last_error}")
+
+
 def _require_source_role(config: AppConfig) -> None:
     if config.role is not Role.SOURCE:
         raise ConfigError(
@@ -429,6 +631,15 @@ def _format_size(size: int) -> str:
     return f"{size} B"  # pragma: no cover - 循环必在 TiB 内返回
 
 
+def _install_stop_handlers(stop: Event) -> None:
+    def request_shutdown(signum: int, _frame: object) -> None:
+        logger.info("shutdown requested: signal=%s", signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
+
 def main() -> None:
     """airgap-sync 命令入口 (pyproject 脚本指向这里)。"""
     try:
@@ -449,6 +660,7 @@ def main() -> None:
         StateError,
         SnapshotError,
         UploadError,
+        WorkerAlreadyRunning,
     ) as exc:
         click.echo(f"ERROR: {exc}", err=True)
         sys.exit(1)

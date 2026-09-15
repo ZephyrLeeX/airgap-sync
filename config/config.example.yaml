@@ -48,6 +48,18 @@ spool:
   max_pending_bytes: 10737418240 # 10 GiB
   min_free_bytes: 10737418240 # 10 GiB
 
+schedule:
+  # Completion-driven fixed delay：整个 Cycle DELIVERED 后再等待 7 天。
+  enabled: true
+  delay_after_success: 7d
+  retry_after_failure: 6h
+
+maintenance:
+  # 仅删除 SQLite 中明确 FAILED/DISK_PRESSURE、且不属于 active Cycle 的本地 Run 文件。
+  failed_run_retention: 30d
+  # Source 不使用此项；保留默认值便于两端配置结构一致。
+  destination_orphan_retention: 30d
+
 tables:
   # 所有表统一 FULL_SNAPSHOT: 只需要 name 和 enabled。
   # 不需要配置主键、逻辑键或同步模式。

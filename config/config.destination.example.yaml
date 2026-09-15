@@ -23,5 +23,12 @@ destination:
   # 整组预期文件的 size + mtime 在两个观察点间不变，才开始读取。
   settle_seconds: 2
 
+destination_worker:
+  poll_interval: 30s
+
+maintenance:
+  failed_run_retention: 30d # Destination 不使用此项。
+  destination_orphan_retention: 30d
+
 # 可省略；Destination 不用这个列表决定接收哪些表。
 tables: []

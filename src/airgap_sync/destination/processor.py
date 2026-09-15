@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -190,6 +191,7 @@ class DestinationProcessor:
         return self._result(run)
 
     def _stage(self, validated: ValidatedRun, staging: str, existing: RunRecord | None) -> None:
+        started = time.monotonic()
         manifest = validated.manifest
         try:
             ddl = validated.schema_path.read_text(encoding="utf-8")
@@ -242,10 +244,25 @@ class DestinationProcessor:
                 insert_indices,
             )
         self._db.complete_staged(manifest.run_id, manifest.row_count)
+        elapsed = max(time.monotonic() - started, 0.000001)
+        logger.info(
+            "destination import metrics: run_id=%s rows_per_second=%.1f duration_seconds=%.3f",
+            manifest.run_id,
+            manifest.row_count / elapsed,
+            elapsed,
+        )
 
     def _verify(self, run_id: str, table: str, columns: list[str]) -> VerificationSummary:
+        started = time.monotonic()
         self._db.set_verifying(run_id)
         summary = self._verifier.verify(table, columns)
+        elapsed = max(time.monotonic() - started, 0.000001)
+        logger.info(
+            "destination verify metrics: run_id=%s rows_per_second=%.1f duration_seconds=%.3f",
+            run_id,
+            summary.row_count / elapsed,
+            elapsed,
+        )
         # Expected fields stay in metadata; comparison is made by the caller against Manifest.
         return summary
 
@@ -289,6 +306,7 @@ class DestinationProcessor:
     def _promote(
         self, run_id: str, target: str, staging: str, previous: TableVersion | None
     ) -> None:
+        started = time.monotonic()
         database = self._config.mysql.database
         object_type = self._db.object_type(database, target)
         if object_type is not None and object_type != "BASE TABLE":
@@ -310,6 +328,11 @@ class DestinationProcessor:
         self._db.prepare_swapping(run_id, target_existed, backup)
         self._db.rename_for_promotion(database, staging, target, backup)
         self._db.finalize_verified(run_id, None if previous is None else previous.run_id)
+        logger.info(
+            "destination promotion metrics: run_id=%s duration_seconds=%.3f",
+            run_id,
+            time.monotonic() - started,
+        )
 
     def _recover_swap(self, validated: ValidatedRun, run: RunRecord) -> ProcessResult:
         database = self._config.mysql.database
@@ -421,6 +444,8 @@ class DestinationProcessor:
             raise DestinationError("CHUNK_IMPORT_FAILED", f"chunk {sequence}: {exc}") from exc
 
     def _cleanup_superseded(self, run: RunRecord) -> None:
+        if getattr(run, "incoming_cleanup_completed_at", None) is not None:
+            return
         try:
             if self._db.table_exists(self._config.mysql.database, run.staging_table):
                 self._db.drop_table(self._config.mysql.database, run.staging_table)
@@ -432,19 +457,21 @@ class DestinationProcessor:
     def _retry_cleanup(self, run: RunRecord, validated: ValidatedRun | None = None) -> None:
         if run.status != "VERIFIED":
             return
-        try:
-            if run.backup_table and self._db.table_exists(
-                self._config.mysql.database, run.backup_table
-            ):
-                self._db.drop_table(self._config.mysql.database, run.backup_table)
-            self._db.record_backup_cleanup_error(run.run_id, None)
-        except DestinationMySQLError as exc:
-            self._db.record_backup_cleanup_error(run.run_id, str(exc))
-        try:
-            _cleanup_incoming(self._destination.incoming_dir, run.run_id, validated)
-            self._db.record_cleanup_error(run.run_id, None)
-        except OSError as exc:
-            self._db.record_cleanup_error(run.run_id, str(exc))
+        if getattr(run, "backup_cleanup_completed_at", None) is None:
+            try:
+                if run.backup_table and self._db.table_exists(
+                    self._config.mysql.database, run.backup_table
+                ):
+                    self._db.drop_table(self._config.mysql.database, run.backup_table)
+                self._db.record_backup_cleanup_error(run.run_id, None)
+            except DestinationMySQLError as exc:
+                self._db.record_backup_cleanup_error(run.run_id, str(exc))
+        if getattr(run, "incoming_cleanup_completed_at", None) is None:
+            try:
+                _cleanup_incoming(self._destination.incoming_dir, run.run_id, validated)
+                self._db.record_cleanup_error(run.run_id, None)
+            except OSError as exc:
+                self._db.record_cleanup_error(run.run_id, str(exc))
 
     def _require_run(self, run_id: str) -> RunRecord:
         run = self._db.get_run(run_id)
@@ -499,3 +526,10 @@ def process_once(connection: DestinationMySQLConnection, config: AppConfig) -> l
     assert config.destination is not None
     processor = DestinationProcessor(connection, config)
     return [processor.process(run_id) for run_id in discover_runs(config.destination.incoming_dir)]
+
+
+def retry_pending_cleanup(
+    connection: DestinationMySQLConnection, config: AppConfig
+) -> list[ProcessResult]:
+    processor = DestinationProcessor(connection, config)
+    return [processor.process(run.run_id) for run in connection.cleanup_pending_runs()]

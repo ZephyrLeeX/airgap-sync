@@ -15,6 +15,8 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from airgap_sync.common.runtime import parse_duration
+
 
 class Role(StrEnum):
     """运行角色。Source 和 Destination 共用同一套代码。"""
@@ -107,6 +109,44 @@ class SpoolConfig(BaseModel):
     min_free_bytes: int = Field(default=10 * 1024**3, ge=0)
 
 
+class ScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    delay_after_success: str = "7d"
+    retry_after_failure: str = "6h"
+
+    @model_validator(mode="after")
+    def validate_durations(self) -> Self:
+        parse_duration(self.delay_after_success)
+        parse_duration(self.retry_after_failure)
+        return self
+
+
+class DestinationWorkerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    poll_interval: str = "30s"
+
+    @model_validator(mode="after")
+    def validate_duration(self) -> Self:
+        parse_duration(self.poll_interval)
+        return self
+
+
+class MaintenanceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failed_run_retention: str = "30d"
+    destination_orphan_retention: str = "30d"
+
+    @model_validator(mode="after")
+    def validate_durations(self) -> Self:
+        parse_duration(self.failed_run_retention)
+        parse_duration(self.destination_orphan_retention)
+        return self
+
+
 class DestinationConfig(BaseModel):
     """Destination 接收目录与导入参数。"""
 
@@ -165,6 +205,9 @@ class AppConfig(BaseModel):
     chunk: ChunkConfig = ChunkConfig()
     relay: RelayConfig | None = None
     spool: SpoolConfig = SpoolConfig()
+    schedule: ScheduleConfig = ScheduleConfig()
+    destination_worker: DestinationWorkerConfig = DestinationWorkerConfig()
+    maintenance: MaintenanceConfig = MaintenanceConfig()
     destination: DestinationConfig | None = None
     tables: list[TableConfig] = Field(default_factory=list)
 

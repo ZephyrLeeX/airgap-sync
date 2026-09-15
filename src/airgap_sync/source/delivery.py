@@ -7,6 +7,7 @@ import logging
 import queue
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,6 +80,7 @@ class DeliveryRunner:
         self._uploader = uploader
 
     def sync(self, table_name: str) -> SnapshotResult:
+        started = time.monotonic()
         table = self._config.table(table_name)
         if table is None:
             raise SnapshotError("TABLE_NOT_CONFIGURED", f"table '{table_name}' is not in config")
@@ -104,6 +106,7 @@ class DeliveryRunner:
         fatal: list[Exception] = []
         pending_lock = threading.Lock()
         pending_bytes = 0
+        peak_pending_bytes = 0
 
         def set_fatal(exc: Exception) -> None:
             with fatal_lock:
@@ -147,6 +150,8 @@ class DeliveryRunner:
                         try:
                             item.path.unlink(missing_ok=True)
                             worker_state.mark_cleanup_error(run_id, item.logical_name, None)
+                            with pending_lock:
+                                pending_bytes -= item.size
                         except OSError as exc:
                             worker_state.mark_cleanup_error(run_id, item.logical_name, str(exc))
                             logger.warning(
@@ -155,8 +160,6 @@ class DeliveryRunner:
                                 item.logical_name,
                                 exc,
                             )
-                        with pending_lock:
-                            pending_bytes -= item.size
                         logger.info(
                             "upload completed: table=%s run_id=%s artifact=%s bytes=%d "
                             "request_id=%s attempt=%d",
@@ -182,7 +185,7 @@ class DeliveryRunner:
         self._state.set_run_status(run_id, RunStatus.UPLOADING)
 
         def on_chunk_closed(chunk: ChunkMeta) -> None:
-            nonlocal pending_bytes
+            nonlocal peak_pending_bytes, pending_bytes
             check_fatal()
             path = run_dir / chunk.file
             transport_name = transport_filename(run_id, chunk.file)
@@ -198,6 +201,7 @@ class DeliveryRunner:
             )
             with pending_lock:
                 pending_bytes += chunk.compressed_bytes
+                peak_pending_bytes = max(peak_pending_bytes, pending_bytes)
                 current_pending = pending_bytes
             free = shutil.disk_usage(self._config.paths.data_dir).free
             if current_pending > self._config.spool.max_pending_bytes:
@@ -217,6 +221,7 @@ class DeliveryRunner:
             )
 
         scan = None
+        scan_completed_at: float | None = None
         error: Exception | None = None
         try:
             ddl_before = self._source.get_create_table(table_name)
@@ -235,6 +240,7 @@ class DeliveryRunner:
                     SCHEMA_CHANGED_DURING_SNAPSHOT,
                     f"table '{table_name}' DDL changed during snapshot scan",
                 )
+            scan_completed_at = time.monotonic()
         except Exception as exc:
             error = exc
             set_fatal(exc)
@@ -314,6 +320,25 @@ class DeliveryRunner:
                 compressed_bytes=compressed_bytes,
             )
             self._cleanup_delivered_run(run_id, run_dir)
+            finished = time.monotonic()
+            snapshot_seconds = max((scan_completed_at or finished) - started, 0.000001)
+            upload_seconds = max(finished - (scan_completed_at or finished), 0.0)
+            ratio = compressed_bytes / raw_bytes if raw_bytes else 0.0
+            logger.info(
+                "source benchmark metrics: table=%s run_id=%s rows_per_second=%.1f "
+                "raw_mib_per_second=%.2f compressed_mib_per_second=%.2f "
+                "compression_ratio=%.4f snapshot_seconds=%.3f upload_finalize_seconds=%.3f "
+                "peak_spool_bytes=%d",
+                table_name,
+                run_id,
+                scan.verification.row_count / snapshot_seconds,
+                raw_bytes / 1024**2 / snapshot_seconds,
+                compressed_bytes / 1024**2 / snapshot_seconds,
+                ratio,
+                snapshot_seconds,
+                upload_seconds,
+                peak_pending_bytes,
+            )
             return SnapshotResult(
                 table_name,
                 run_id,

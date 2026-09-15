@@ -1,4 +1,4 @@
-"""Source SQLite schema v3：表、Run 与 artifact 传输状态。"""
+"""Source SQLite schema v4：表、Run、artifact 与 persisted Cycle 状态。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STATE_DIR_NAME = "state"
 STATE_DB_NAME = "meta.db"
 
@@ -42,6 +42,20 @@ class UploadStatus(StrEnum):
     PENDING = "PENDING"
     UPLOADING = "UPLOADING"
     UPLOADED = "UPLOADED"
+    FAILED = "FAILED"
+
+
+class CycleStatus(StrEnum):
+    RUNNING = "RUNNING"
+    RETRY_WAIT = "RETRY_WAIT"
+    COMPLETED = "COMPLETED"
+    ABANDONED = "ABANDONED"
+
+
+class CycleTableStatus(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    DELIVERED = "DELIVERED"
     FAILED = "FAILED"
 
 
@@ -110,6 +124,28 @@ class RunArtifact:
     created_at: str
 
 
+@dataclass(frozen=True)
+class SyncCycle:
+    cycle_id: str
+    status: str
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+    next_attempt_at: str | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class CycleTable:
+    cycle_id: str
+    table_name: str
+    status: str
+    attempts: int
+    last_run_id: str | None
+    last_error: str | None
+    delivered_at: str | None
+
+
 _CREATE_TABLE_STATE = """
 CREATE TABLE table_state (
     table_name TEXT PRIMARY KEY,
@@ -154,6 +190,28 @@ CREATE TABLE run_artifacts (
     PRIMARY KEY (run_id, logical_name),
     UNIQUE (transport_name)
 )"""
+_CREATE_CYCLES = """
+CREATE TABLE sync_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    next_attempt_at TEXT,
+    last_error TEXT
+)"""
+_CREATE_CYCLE_TABLES = """
+CREATE TABLE cycle_tables (
+    cycle_id TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_run_id TEXT,
+    last_error TEXT,
+    delivered_at TEXT,
+    PRIMARY KEY (cycle_id, table_name),
+    FOREIGN KEY (cycle_id) REFERENCES sync_cycles(cycle_id)
+)"""
 
 
 class SourceState:
@@ -174,7 +232,7 @@ class SourceState:
                 )
                 row = self._conn.execute("SELECT version FROM schema_version").fetchone()
                 if row is None:
-                    self._create_v3()
+                    self._create_v4()
                     self._conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
                     return
                 version = int(row["version"])
@@ -182,21 +240,29 @@ class SourceState:
                     self._migrate_v2_to_v3()
                 elif version == 1:
                     self._conn.execute("DROP TABLE IF EXISTS table_state")
-                    self._create_v3()
-                    self._conn.execute("UPDATE schema_version SET version = 3")
+                    self._create_v4()
+                    self._conn.execute("UPDATE schema_version SET version = 4")
+                elif version == 3:
+                    self._migrate_v3_to_v4()
                 elif version != SCHEMA_VERSION:
                     raise StateError(
                         f"state database {self.db_path} has schema version {version}, "
                         f"but this program expects {SCHEMA_VERSION}"
                     )
                 else:
-                    self._create_v3(if_not_exists=True)
+                    self._create_v4(if_not_exists=True)
         except sqlite3.Error as exc:
             raise StateError(f"failed to initialize state database {self.db_path}: {exc}") from exc
 
-    def _create_v3(self, *, if_not_exists: bool = False) -> None:
+    def _create_v4(self, *, if_not_exists: bool = False) -> None:
         suffix = " IF NOT EXISTS" if if_not_exists else ""
-        for sql in (_CREATE_TABLE_STATE, _CREATE_SYNC_RUNS, _CREATE_ARTIFACTS):
+        for sql in (
+            _CREATE_TABLE_STATE,
+            _CREATE_SYNC_RUNS,
+            _CREATE_ARTIFACTS,
+            _CREATE_CYCLES,
+            _CREATE_CYCLE_TABLES,
+        ):
             self._conn.execute(sql.replace("CREATE TABLE ", f"CREATE TABLE{suffix} ", 1))
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sync_runs_table_status ON sync_runs(table_name, status)"
@@ -204,7 +270,7 @@ class SourceState:
 
     def _migrate_v2_to_v3(self) -> None:
         self._conn.execute("ALTER TABLE table_state RENAME TO table_state_v2")
-        self._create_v3()
+        self._create_v4()
         self._conn.execute(
             "INSERT INTO table_state "
             "(table_name,last_snapshot_run_id,last_delivered_run_id,status,last_run_id,"
@@ -214,7 +280,12 @@ class SourceState:
             "FROM table_state_v2"
         )
         self._conn.execute("DROP TABLE table_state_v2")
-        self._conn.execute("UPDATE schema_version SET version = 3")
+        self._conn.execute("UPDATE schema_version SET version = 4")
+
+    def _migrate_v3_to_v4(self) -> None:
+        for sql in (_CREATE_CYCLES, _CREATE_CYCLE_TABLES):
+            self._conn.execute(sql)
+        self._conn.execute("UPDATE schema_version SET version = 4")
 
     def schema_version(self) -> int:
         try:
@@ -406,6 +477,147 @@ class SourceState:
         except sqlite3.Error as exc:
             raise StateError(f"failed to read artifacts: {exc}") from exc
         return [RunArtifact(**dict(row)) for row in rows]
+
+    def create_cycle(self, cycle_id: str, table_names: list[str], now: str) -> None:
+        with self._transaction():
+            active = self._conn.execute(
+                "SELECT cycle_id FROM sync_cycles WHERE status IN ('RUNNING','RETRY_WAIT') LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                raise StateError(f"active cycle already exists: {active['cycle_id']}")
+            self._conn.execute(
+                "INSERT INTO sync_cycles VALUES (?,'RUNNING',?,?,NULL,NULL,NULL)",
+                (cycle_id, now, now),
+            )
+            self._conn.executemany(
+                "INSERT INTO cycle_tables (cycle_id,table_name,status) VALUES (?,?,'PENDING')",
+                [(cycle_id, name) for name in table_names],
+            )
+
+    def active_cycle(self) -> SyncCycle | None:
+        row = self._fetchone(
+            "SELECT * FROM sync_cycles WHERE status IN ('RUNNING','RETRY_WAIT') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (),
+        )
+        return SyncCycle(**dict(row)) if row is not None else None
+
+    def latest_cycle(self) -> SyncCycle | None:
+        row = self._fetchone("SELECT * FROM sync_cycles ORDER BY created_at DESC LIMIT 1", ())
+        return SyncCycle(**dict(row)) if row is not None else None
+
+    def latest_completed_cycle(self) -> SyncCycle | None:
+        row = self._fetchone(
+            "SELECT * FROM sync_cycles WHERE status='COMPLETED' ORDER BY completed_at DESC LIMIT 1",
+            (),
+        )
+        return SyncCycle(**dict(row)) if row is not None else None
+
+    def cycle_tables(self, cycle_id: str) -> list[CycleTable]:
+        rows = self._conn.execute(
+            "SELECT * FROM cycle_tables WHERE cycle_id=? ORDER BY rowid", (cycle_id,)
+        ).fetchall()
+        return [CycleTable(**dict(row)) for row in rows]
+
+    def start_cycle_table(self, cycle_id: str, table_name: str) -> None:
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE sync_cycles SET status='RUNNING',next_attempt_at=NULL,last_error=NULL "
+                "WHERE cycle_id=?",
+                (cycle_id,),
+            )
+            self._conn.execute(
+                "UPDATE cycle_tables SET status='RUNNING',attempts=attempts+1,last_error=NULL "
+                "WHERE cycle_id=? AND table_name=?",
+                (cycle_id, table_name),
+            )
+
+    def deliver_cycle_table(self, cycle_id: str, table_name: str, run_id: str, now: str) -> None:
+        self._execute(
+            "UPDATE cycle_tables SET status='DELIVERED',last_run_id=?,last_error=NULL,"
+            "delivered_at=? WHERE cycle_id=? AND table_name=?",
+            (run_id, now, cycle_id, table_name),
+        )
+
+    def fail_cycle_table(
+        self, cycle_id: str, table_name: str, run_id: str | None, error: str, retry_at: str
+    ) -> None:
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE cycle_tables SET status='FAILED',last_run_id=?,last_error=? "
+                "WHERE cycle_id=? AND table_name=?",
+                (run_id, error, cycle_id, table_name),
+            )
+            self._conn.execute(
+                "UPDATE sync_cycles SET status='RETRY_WAIT',next_attempt_at=?,last_error=? "
+                "WHERE cycle_id=?",
+                (retry_at, error, cycle_id),
+            )
+
+    def complete_cycle(self, cycle_id: str, now: str) -> None:
+        self._execute(
+            "UPDATE sync_cycles SET status='COMPLETED',completed_at=?,next_attempt_at=NULL,"
+            "last_error=NULL WHERE cycle_id=?",
+            (now, cycle_id),
+        )
+
+    def abandon_active_cycle(self) -> SyncCycle:
+        active = self.active_cycle()
+        if active is None:
+            raise StateError("no RUNNING or RETRY_WAIT cycle to abandon")
+        self._execute(
+            "UPDATE sync_cycles SET status='ABANDONED',next_attempt_at=NULL WHERE cycle_id=?",
+            (active.cycle_id,),
+        )
+        return active
+
+    def recover_interrupted_cycle(self) -> None:
+        """A RUNNING table never resumes a partial Snapshot; mark it retryable."""
+        now = _utcnow_iso()
+        error = "INTERRUPTED: process stopped before delivery completed"
+        with self._transaction():
+            tables = self._conn.execute(
+                "SELECT ct.table_name FROM cycle_tables ct JOIN sync_cycles c "
+                "ON c.cycle_id=ct.cycle_id WHERE c.status IN ('RUNNING','RETRY_WAIT') "
+                "AND ct.status='RUNNING'"
+            ).fetchall()
+            for table in tables:
+                runs = self._conn.execute(
+                    "SELECT run_id FROM sync_runs WHERE table_name=? AND status IN (?,?,?)",
+                    (table["table_name"], *_ACTIVE_RUN_STATUSES),
+                ).fetchall()
+                for run in runs:
+                    self._conn.execute(
+                        "UPDATE sync_runs SET status='FAILED',last_error=? WHERE run_id=?",
+                        (error, run["run_id"]),
+                    )
+                    self._conn.execute(
+                        "UPDATE table_state SET status='FAILED',last_error=?,updated_at=? "
+                        "WHERE table_name=? AND last_run_id=?",
+                        (error, now, table["table_name"], run["run_id"]),
+                    )
+            self._conn.execute(
+                "UPDATE cycle_tables SET status='FAILED',last_error=COALESCE(last_error,"
+                "'INTERRUPTED: worker stopped during table sync') WHERE status='RUNNING' "
+                "AND cycle_id IN (SELECT cycle_id FROM sync_cycles WHERE status IN "
+                "('RUNNING','RETRY_WAIT'))"
+            )
+
+    def failed_runs_before(self, cutoff: str) -> list[SyncRun]:
+        rows = self._conn.execute(
+            "SELECT * FROM sync_runs WHERE status IN ('FAILED','DISK_PRESSURE') "
+            "AND created_at<? ORDER BY created_at",
+            (cutoff,),
+        ).fetchall()
+        return [SyncRun(**dict(row)) for row in rows]
+
+    def active_cycle_run_ids(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT ct.last_run_id FROM cycle_tables ct JOIN sync_cycles c "
+            "ON c.cycle_id=ct.cycle_id WHERE c.status IN ('RUNNING','RETRY_WAIT') "
+            "AND ct.last_run_id IS NOT NULL"
+        ).fetchall()
+        return {str(row[0]) for row in rows}
 
     def _execute(self, sql: str, params: tuple[object, ...]) -> None:
         try:

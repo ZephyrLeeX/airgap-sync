@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -149,6 +150,44 @@ def test_confirmed_chunk_cleanup_failure_is_not_reuploaded(tmp_path, monkeypatch
     chunk = next(a for a in artifacts if a.logical_name == "chunk-000001.jsonl.zst")
     assert chunk.upload_status == "UPLOADED"
     assert "locked by test" in chunk.cleanup_error
+
+
+def test_unlink_failure_keeps_resident_chunk_in_pending_byte_account(tmp_path, monkeypatch):
+    cleaned = threading.Event()
+    original_unlink = Path.unlink
+
+    def fail_first_chunk(self, *args, **kwargs):
+        if self.name == "chunk-000001.jsonl.zst":
+            cleaned.set()
+            raise PermissionError("locked by test")
+        return original_unlink(self, *args, **kwargs)
+
+    class WaitingSource(Source):
+        def stream_table(self, table, fetch_size):
+            class WaitingStream:
+                columns = ["id"]
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+                def __iter__(self):
+                    yield [(os.urandom(1024),)]
+                    assert cleaned.wait(5)
+                    yield [(os.urandom(1024),)]
+
+            return WaitingStream()
+
+    monkeypatch.setattr(Path, "unlink", fail_first_chunk)
+    cfg = config(tmp_path)
+    cfg.spool.max_pending_bytes = 1500
+    with SourceState(state_db_path(tmp_path / "data")) as state:
+        state.initialize()
+        result = DeliveryRunner(WaitingSource(), state, cfg, Uploader()).sync("t")
+        assert result.status == "DISK_PRESSURE"
+        assert "pending bytes" in result.error
 
 
 def test_chunk_failure_prevents_manifest(tmp_path):

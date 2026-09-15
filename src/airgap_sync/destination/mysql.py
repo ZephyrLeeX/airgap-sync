@@ -16,7 +16,7 @@ from airgap_sync.common.config import resolve_password
 from airgap_sync.common.manifest import Manifest
 from airgap_sync.common.models import DestinationConfig, MySQLConfig
 
-METADATA_SCHEMA_VERSION = 2
+METADATA_SCHEMA_VERSION = 3
 _SET_SESSION_TIME_ZONE_SQL = "SET SESSION time_zone = '+00:00'"
 
 
@@ -82,6 +82,8 @@ class RunRecord:
     backup_table: str | None = None
     cleanup_error: str | None = None
     backup_cleanup_error: str | None = None
+    incoming_cleanup_completed_at: datetime | None = None
+    backup_cleanup_completed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +197,8 @@ class DestinationMySQLConnection:
             "digest_verified_at DATETIME(6) NULL, target_existed BOOLEAN NULL,"
             "backup_table VARCHAR(64) NULL, applied_at DATETIME(6) NULL,"
             "cleanup_error TEXT NULL, backup_cleanup_error TEXT NULL,"
+            "incoming_cleanup_completed_at DATETIME(6) NULL,"
+            "backup_cleanup_completed_at DATETIME(6) NULL,"
             "manifest_received_at DATETIME(6) NOT NULL, validated_at DATETIME(6) NULL,"
             "import_started_at DATETIME(6) NULL, import_completed_at DATETIME(6) NULL,"
             "last_error TEXT NULL, created_at DATETIME(6) NOT NULL, "
@@ -222,13 +226,16 @@ class DestinationMySQLConnection:
             "KEY idx_versions_table_time "
             "(source_database,table_name,source_created_at)) ENGINE=InnoDB"
         )
-        self._execute(f"INSERT IGNORE INTO {self._metadata}.schema_version VALUES (1,2)")
+        self._execute(f"INSERT IGNORE INTO {self._metadata}.schema_version VALUES (1,3)")
         row = self._fetchone(
             f"SELECT version FROM {self._metadata}.schema_version WHERE singleton=1"
         )
         if row is not None and int(row[0]) == 1:
             self._migrate_v1_to_v2()
             row = (2,)
+        if row is not None and int(row[0]) == 2:
+            self._migrate_v2_to_v3()
+            row = (3,)
         if row is None or int(row[0]) != METADATA_SCHEMA_VERSION:
             got = "missing" if row is None else str(row[0])
             raise DestinationMySQLError(
@@ -263,6 +270,23 @@ class DestinationMySQLConnection:
                 self._execute(f"ALTER TABLE {self._metadata}.runs ADD COLUMN {definition}")
         self._execute(f"ALTER TABLE {self._metadata}.runs MODIFY status VARCHAR(24) NOT NULL")
         self._execute(f"UPDATE {self._metadata}.schema_version SET version=2 WHERE singleton=1")
+
+    def _migrate_v2_to_v3(self) -> None:
+        existing = {
+            str(row[0]).lower()
+            for row in self._fetchall(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='runs'",
+                (self._destination.metadata_database,),
+            )
+        }
+        for definition in (
+            "incoming_cleanup_completed_at DATETIME(6) NULL",
+            "backup_cleanup_completed_at DATETIME(6) NULL",
+        ):
+            if definition.split(None, 1)[0].lower() not in existing:
+                self._execute(f"ALTER TABLE {self._metadata}.runs ADD COLUMN {definition}")
+        self._execute(f"UPDATE {self._metadata}.schema_version SET version=3 WHERE singleton=1")
 
     def metadata_schema_version(self) -> int:
         row = self._fetchone(
@@ -308,7 +332,8 @@ class DestinationMySQLConnection:
     def get_run(self, run_id: str) -> RunRecord | None:
         row = self._fetchone(
             f"SELECT run_id,source_database,table_name,status,row_count,chunk_count,staging_table,"
-            "source_created_at,target_existed,backup_table,cleanup_error,backup_cleanup_error "
+            "source_created_at,target_existed,backup_table,cleanup_error,backup_cleanup_error,"
+            "incoming_cleanup_completed_at,backup_cleanup_completed_at "
             f"FROM {self._metadata}.runs WHERE run_id=%s",
             (run_id,),
         )
@@ -327,6 +352,8 @@ class DestinationMySQLConnection:
             None if row[9] is None else str(row[9]),
             None if row[10] is None else str(row[10]),
             None if row[11] is None else str(row[11]),
+            row[12],
+            row[13],
         )
 
     def register_validated_run(
@@ -717,16 +744,51 @@ class DestinationMySQLConnection:
 
     def record_cleanup_error(self, run_id: str, error: str | None) -> None:
         self._execute(
-            f"UPDATE {self._metadata}.runs SET cleanup_error=%s,updated_at=%s WHERE run_id=%s",
-            (error, _utcnow(), run_id),
+            f"UPDATE {self._metadata}.runs SET cleanup_error=%s,"
+            "incoming_cleanup_completed_at=%s,updated_at=%s WHERE run_id=%s",
+            (error, _utcnow() if error is None else None, _utcnow(), run_id),
         )
 
     def record_backup_cleanup_error(self, run_id: str, error: str | None) -> None:
         self._execute(
-            f"UPDATE {self._metadata}.runs SET backup_cleanup_error=%s,updated_at=%s "
+            f"UPDATE {self._metadata}.runs SET backup_cleanup_error=%s,"
+            "backup_cleanup_completed_at=%s,updated_at=%s "
             "WHERE run_id=%s",
-            (error, _utcnow(), run_id),
+            (error, _utcnow() if error is None else None, _utcnow(), run_id),
         )
+
+    def cleanup_pending_runs(self) -> list[RunRecord]:
+        rows = self._fetchall(
+            f"SELECT run_id FROM {self._metadata}.runs WHERE "
+            "(status='VERIFIED' AND (incoming_cleanup_completed_at IS NULL OR "
+            "backup_cleanup_completed_at IS NULL)) OR "
+            "(status='SUPERSEDED' AND incoming_cleanup_completed_at IS NULL) "
+            "ORDER BY updated_at LIMIT 100"
+        )
+        return [run for (run_id,) in rows if (run := self.get_run(str(run_id))) is not None]
+
+    def active_run_ids(self) -> set[str]:
+        rows = self._fetchall(
+            f"SELECT run_id FROM {self._metadata}.runs WHERE status IN "
+            "('VALIDATED','IMPORTING','STAGED','VERIFYING','SWAPPING')"
+        )
+        return {str(row[0]) for row in rows}
+
+    def recent_problem_runs(self, limit: int = 20) -> list[RunRecord]:
+        rows = self._fetchall(
+            f"SELECT run_id FROM {self._metadata}.runs WHERE status IN ('MISMATCH','FAILED') "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (limit,),
+        )
+        return [run for (run_id,) in rows if (run := self.get_run(str(run_id))) is not None]
+
+    def latest_verified_runs(self, limit: int = 20) -> list[RunRecord]:
+        rows = self._fetchall(
+            f"SELECT run_id FROM {self._metadata}.runs WHERE status='VERIFIED' "
+            "ORDER BY applied_at DESC LIMIT %s",
+            (limit,),
+        )
+        return [run for (run_id,) in rows if (run := self.get_run(str(run_id))) is not None]
 
     def fail_run(self, run_id: str, error: str) -> None:
         self._execute(

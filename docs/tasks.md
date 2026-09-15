@@ -163,12 +163,12 @@ Phase 4 最高状态为 `STAGED`，不修改正式表，也不删除 incoming �
 
 ---
 
-# Phase 6：调度、状态、异常恢复、大表压力测试
+# Phase 6：调度、状态、异常恢复、大表压力测试（已完成）
 
-* T501 Source 表级 fixed-delay 调度（整个 Cycle 交付后等待，默认成功间隔建议 7d；
+* T501 Source Cycle 级 fixed-delay 调度（整个 Cycle 交付后等待，默认成功间隔建议 7d；
   失败使用独立较短间隔；同表不并发）；
 * T502 Destination Worker（自动发现文件、按 Run 处理）；
-* T503 状态命令（表 / Run / 状态 / Chunk / 错误）；
+* T503 Source / Destination 状态命令（Cycle、表、Run、cleanup 与错误）；
 * T504 大表性能测试（700 万行：内存、耗时、压缩比、磁盘占用）；
 * T505 故障测试（杀进程、写一半的文件、上传失败、MySQL 中断、验证失败；不允许静默漏数据）。
 

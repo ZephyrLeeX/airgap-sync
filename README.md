@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-Phase 1 至 Phase 5（Destination 数据正确性闭环）已完成，当前支持：
+Phase 1 至 Phase 6（无人值守运行）已完成，当前支持：
 
 - YAML 配置加载与强类型校验（表配置只需 `name` + `enabled`，所有表统一 FULL_SNAPSHOT；旧 `mode` / `key` 字段已删除，配置中残留会明确报错）；
 - `airgap-sync config validate` 配置校验；
@@ -15,12 +15,15 @@ Phase 1 至 Phase 5（Destination 数据正确性闭环）已完成，当前支�
 - `airgap-sync source sync --table TABLE`：扫描与单路 HTTP PUT 并行，Relay 严格确认每个
   Chunk 后即释放 Source 文件，最后依次提交 schema 和 manifest；
 - `airgap-sync source relay-check`：只调用 `GET /health` 的诊断命令。
+- `airgap-sync source cycle run|abandon`：创建/恢复完整 Cycle，或显式放弃 active Cycle；
+- `airgap-sync source worker|status`：completion-driven fixed-delay 常驻调度与状态观测；
 - `airgap-sync destination check`：检查 incoming、目标 MySQL 与 metadata schema；
 - `airgap-sync destination process --run RUN_ID`：严格校验完整 Run，按 Chunk 流式导入
   staging，从 MySQL 回读验证后安全切换正式表并清理 incoming，最终状态为 `VERIFIED`；
 - `airgap-sync destination process-once`：扫描当前全部 manifest 一次；不完整 Run 跳过，
   不会阻断其他 Run。
 - `airgap-sync destination stats`：从轻量版本历史读取当前总行数、本次净增和月度净增。
+- `airgap-sync destination worker|status`：常驻轮询、可恢复 cleanup 与运行状态观测。
 
 ### 源数据库只读保护
 
@@ -52,7 +55,7 @@ outbox/<table>/<run_id>/
 - 扫描前后各取一次 DDL，结构变化则 Run FAILED（`SCHEMA_CHANGED_DURING_SNAPSHOT`），不产生结构错配的快照；
 - 验证摘要是与行顺序无关的 multiset digest（`row_count` + `digest_a` + `digest_b`），供目标端导入后复算比对。
 
-以下能力**尚未实现**：Destination 常驻 Worker、Source fixed-delay Scheduler 和 Web UI。
+以下能力**尚未实现**：Web UI（它不是 V1 数据同步正确性的必要组成）。
 FTP Client 是现有外部链路组件，不属于本项目。
 
 ## 环境要求
@@ -120,7 +123,7 @@ Configuration       OK
 MySQL connection    OK
 MySQL server        5.7.35-log
 Database            sgaj_data
-SQLite state        OK (D:/airgap-sync/data/state/meta.db, schema v3)
+SQLite state        OK (D:/airgap-sync/data/state/meta.db, schema v4)
 
 Tables:
 std_scjgj_zhgsxt_qyjbxx_all   OK
@@ -252,3 +255,94 @@ export AIRGAP_TEST_MYSQL_USER=root
 export AIRGAP_TEST_MYSQL_PASSWORD=...
 uv run pytest -m integration
 ```
+# Phase 6: unattended operation
+
+Airgap Sync V1 now supports persisted Source cycles and independent foreground workers:
+
+```bash
+airgap-sync source cycle run --config config.yaml
+airgap-sync source cycle abandon --config config.yaml
+airgap-sync source worker --config config.yaml
+airgap-sync source status --config config.yaml
+
+airgap-sync destination worker --config config.destination.yaml
+airgap-sync destination status --config config.destination.yaml
+```
+
+The Source schedule is completion-driven fixed delay. A Cycle captures the enabled table list at
+creation, processes it serially, stops on the first failure, and retries that same Cycle after the
+configured delay while skipping tables already `DELIVERED`. A completed Cycle means only that all
+Source snapshots reached the HTTP Relay; it does not imply FTP transfer or Destination verification.
+Manual single-table `source sync` never changes the Cycle clock. On a first worker start, or when the
+last completed Cycle is due, work starts immediately.
+
+The Destination worker polls `incoming` every 30 seconds by default. Each candidate is isolated, so
+a mismatch or malformed Run does not block later candidates. It separately queries metadata v3 for
+pending VERIFIED/SUPERSEDED cleanup, which allows cleanup to resume after the manifest was removed
+or after a process restart. Formal manifestless artifacts are removed only after the configured
+retention, when no active metadata Run exists. Unknown FTP temporary filenames are always ignored.
+
+Both workers stay in the foreground, hold distinct process locks, and use interruptible waits.
+SIGINT/SIGTERM requests a graceful stop: idle workers exit immediately; a Source worker lets the
+current table operation finish and does not start the next table. Use systemd, Task Scheduler, NSSM,
+or another service manager rather than daemonizing Airgap Sync itself.
+
+## Service deployment
+
+Example systemd unit (create separate units/configs for Source and Destination):
+
+```ini
+[Unit]
+Description=Airgap Sync Source Worker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/airgap-sync
+EnvironmentFile=/etc/airgap-sync/source.env
+ExecStart=/opt/airgap-sync/.venv/bin/airgap-sync source worker --config /etc/airgap-sync/source.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Keep the environment file mode `0600`; put the MySQL password and Relay token there, never in the
+unit or YAML. On Windows, configure the same foreground command through Task Scheduler or a service
+wrapper and provide secrets through system environment/service-manager environment configuration.
+
+Relay orphan deletion is deliberately not implemented: the current Relay API has PUT only, with no
+safe LIST/HEAD/DELETE contract. Configure retention on the Relay server or an external operations
+job.
+
+## Large-table benchmark
+
+Only use a disposable MySQL database. The generator drops and recreates the named table and requires
+two independent acknowledgements:
+
+```bash
+export AIRGAP_BENCHMARK_DISPOSABLE=YES
+export BENCH_MYSQL_PASSWORD='...'
+python scripts/benchmark_large_table.py --host 127.0.0.1 --database airgap_bench \
+  --user bench --password-env BENCH_MYSQL_PASSWORD --rows 7000000 --confirm-destructive
+```
+
+The fixture covers BIGINT, VARCHAR, DECIMAL, DATETIME(6), TIMESTAMP(6), NULL, binary values, and
+duplicate rows. Run `source sync` and `destination process` against this table while recording:
+Source rows/s, raw and compressed MiB/s, compression ratio, snapshot/upload duration and peak spool;
+Destination import rows/s/duration, verify rows/s/duration and promotion duration. Process RSS may
+be captured with the operating system. Tune `snapshot.fetch_size`, `chunk.max_rows`,
+`chunk.max_uncompressed_bytes`, `chunk.compression_level`, `destination.insert_batch_rows`, and
+`destination.verify_fetch_size` only from real measurements. Default table and PUT processing stays
+serial.
+
+## Production-readiness checklist
+
+- [ ] Source: `source check`, `relay-check`, a small-table `source sync`, full `source cycle run`
+- [ ] Destination: `destination check`, small-table VERIFIED, correct stats, successful cleanup
+- [ ] Integration: MySQL 5.7, TIMESTAMP, multi-table RENAME, failure rollback
+- [ ] Load: large-table benchmark; observe Source DB load, disk use, and HTTP throughput
+
+Phase 1–5 provide the complete Full Snapshot transport, import, verification, promotion, cleanup,
+and statistics path. Phase 6 adds unattended operation. V1 core functionality is complete; a Web UI
+is not required for synchronization correctness.

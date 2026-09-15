@@ -73,7 +73,7 @@ src/airgap_sync/
 │   └── manifest.py        # Manifest 模型与原子读写
 └── source/
     ├── mysql.py           # 只读连接 + identifier quoting + DDL + 流式扫描
-    ├── state.py           # SQLite 状态库 (schema v3)
+    ├── state.py           # SQLite 状态库 (schema v4，含 persisted Cycle)
     ├── scanner.py         # 单表扫描 (流式读取 → 编码 → chunk/digest)
     ├── chunk_writer.py    # zstd Chunk 原子写入
     ├── snapshot.py        # 本地 Snapshot 生命周期编排
@@ -283,7 +283,7 @@ RUNNING → FAILED      (任何失败: 连接错误 / 扫描异常 / DDL 变化 
 
 ---
 
-# 8. Source State (SQLite schema v3)
+# 8. Source State (SQLite schema v4)
 
 ```sql
 CREATE TABLE table_state (
@@ -627,7 +627,7 @@ column list，由 MySQL 计算。
 ## 17.3 Metadata、事务与恢复
 
 Destination 使用独立 `DestinationMySQLConnection`，不复用强制只读的 Source wrapper，
-也不提供 CLI 可调用的 arbitrary SQL。metadata schema v1 只有简单 SQL migration，核心表为
+也不提供 CLI 可调用的 arbitrary SQL。metadata schema v3 使用简单 SQL migration，核心表为
 `runs` 与 `chunks`。同一 MySQL Server 上的 metadata 和 staging 允许如下原子边界：
 
 ```text
@@ -654,8 +654,8 @@ Phase 4 不计算最终 multiset digest、不切换正式表、不删除 incomin
 
 * **Phase 3**：HTTP 上传 + Source 磁盘流水线（已实现）；
 * **Phase 4**：Destination 接收 + staging 导入（已实现）；
-* **Phase 5**：一致性验证（复算 Multiset Digest）+ 正式表切换；
-* **Phase 6**：调度、状态、异常恢复、大表压力测试。
+* **Phase 5**：一致性验证（复算 Multiset Digest）+ 正式表切换（已实现）；
+* **Phase 6（完成）**：fixed-delay Cycle、两端 Worker、状态、异常恢复、大表压力测试工具。
 
 ---
 
@@ -685,3 +685,19 @@ source timestamp 建索引。正式切换前持久化 `SWAPPING + target_existed
 table_versions 的 net_change 是当前 verified row_count 减前一 verified row_count；第一版为
 NULL。月度净增是报告时区内本月最后 Snapshot 减上一个自然月最后 Snapshot，缺少上月则为
 NULL。整个统计路径不运行 live `COUNT(*)`。
+
+# Phase 6：无人值守运行
+
+Source SQLite schema v4 增加 `sync_cycles` 与 `cycle_tables`。Cycle 创建时复制当时的 enabled
+tables，之后配置变化不改变 active Cycle。表按捕获顺序串行运行；首个失败使 Cycle 进入
+`RETRY_WAIT` 并停止后续扫描。恢复时 `DELIVERED` 表跳过，RUNNING/半截 Snapshot 记为失败，
+失败表用新 run_id 完整重扫。自动调度的下一动作分别为 `completed_at + success delay` 或
+`failure time + retry delay`；手工完整 Cycle 可立即恢复并重置成功时钟，单表 sync 不影响它。
+
+Source 和 Destination worker 都是持有独立文件锁的前台进程，使用 Event 可中断等待。
+SIGINT/SIGTERM 在 idle 时立即退出；Source 当前表完成后停止，不强杀扫描/上传线程。
+Destination 以固定间隔轮询 manifest，单个坏 Run 不终止一轮，并独立查询 metadata v3 的
+cleanup completion fields，以便在 manifest-first cleanup 后重启仍能继续清理 incoming 和
+backup。无 manifest artifact 只有在合法正式命名、超过 retention 且 metadata 无 active Run
+时才删除；未知 FTP 临时文件不参与清理。Relay 无 LIST/HEAD/DELETE API，因此远端 orphan
+retention 属于 Relay/外部运维职责。

@@ -175,3 +175,13 @@ def test_destination_connect_sets_utc_session(tmp_path, monkeypatch, password_en
     connection = DestinationMySQLConnection(mysql, destination)
     connection.connect()
     assert fake.executed == [("SET SESSION time_zone = '+00:00'", ())]
+
+
+def test_v2_to_v3_adds_explicit_cleanup_completion_columns(tmp_path):
+    connection = RecordingConnection(*configs(tmp_path))
+    connection._fetchall = lambda sql, params=(): []
+    connection._migrate_v2_to_v3()
+    sql = [statement for statement, _ in connection.sql]
+    assert any("ADD COLUMN incoming_cleanup_completed_at" in statement for statement in sql)
+    assert any("ADD COLUMN backup_cleanup_completed_at" in statement for statement in sql)
+    assert sql[-1].endswith("SET version=3 WHERE singleton=1")

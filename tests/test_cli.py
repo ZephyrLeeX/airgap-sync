@@ -171,7 +171,7 @@ class TestSourceCheckFullFlow:
         assert "MySQL server        5.7.35-log" in result.output
         assert "Database            sgaj_data" in result.output
         assert "SQLite state        OK" in result.output
-        assert "schema v3" in result.output
+        assert "schema v4" in result.output
         assert "t_snapshot" in result.output and "OK" in result.output
         assert "t_legacy" in result.output and "SKIP (disabled)" in result.output
 
