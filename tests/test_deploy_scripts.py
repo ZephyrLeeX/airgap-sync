@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import platform as python_platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -69,6 +70,95 @@ class TestPowerShellScript:
         )
         assert result.returncode == 0, result.stdout + result.stderr
 
+    def test_external_python_payload_and_temporary_venv_execute(self, tmp_path: Path) -> None:
+        if os.name != "nt":
+            pytest.skip("requires Windows PowerShell/pwsh and Windows python.exe")
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if powershell is None:
+            pytest.skip("PowerShell unavailable")
+        python = Path(sys.executable)
+        if python.name.lower() != "python.exe":
+            pytest.skip("test interpreter is not python.exe")
+        version = python_platform.python_version()
+        command = (
+            f". '{DEPLOY_PS1}' -Action Status -InstallRoot '{tmp_path}'; "
+            f"$manifest = [pscustomobject]@{{python_version = '{version}'}}; "
+            "Test-ExternalPython $manifest"
+        )
+        env = os.environ.copy()
+        env["PATH"] = str(python.parent) + os.pathsep + env.get("PATH", "")
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Python architecture: 64-bit" in result.stdout
+        assert "temporary venv" not in result.stderr.lower()
+
+    @pytest.mark.parametrize("mode", ["normal", "cleanup-failure", "rename-failure"])
+    def test_switch_current_real_junction_and_recovery(self, tmp_path: Path, mode: str) -> None:
+        if os.name != "nt":
+            pytest.skip("requires Windows junction semantics")
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if powershell is None:
+            pytest.skip("PowerShell unavailable")
+        root = tmp_path / mode
+        quoted_script = str(DEPLOY_PS1).replace("'", "''")
+        quoted_root = str(root).replace("'", "''")
+        setup = rf"""
+. '{quoted_script}' -Action Status -InstallRoot '{quoted_root}'
+$releases = Join-Path $InstallRoot 'releases'
+$a = Join-Path $releases 'release-A'
+$b = Join-Path $releases 'release-B'
+New-Item -ItemType Directory -Path (Join-Path $a 'nested') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $b 'nested') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $a 'nested\a.txt') -Value 'A'
+Set-Content -LiteralPath (Join-Path $b 'nested\b.txt') -Value 'B'
+New-Item -ItemType Junction -Path (Join-Path $InstallRoot 'current') -Value $a | Out-Null
+"""
+        if mode == "cleanup-failure":
+            action = """
+function Remove-JunctionSafely([string] $Path) { throw 'simulated cleanup failure' }
+Switch-Current 'release-B'
+if ((Get-CurrentReleaseId) -ne 'release-B') { exit 20 }
+"""
+        elif mode == "rename-failure":
+            action = r"""
+function Rename-Item {
+    param([string] $LiteralPath, [string] $NewName)
+    if ($LiteralPath -like '*.current.new.*') { throw 'simulated staged rename failure' }
+    Microsoft.PowerShell.Management\Rename-Item -LiteralPath $LiteralPath -NewName $NewName
+}
+try { Switch-Current 'release-B'; exit 21 } catch { }
+if ((Get-CurrentReleaseId) -ne 'release-A') { exit 22 }
+"""
+        else:
+            action = """
+Switch-Current 'release-B'
+if ((Get-CurrentReleaseId) -ne 'release-B') { exit 23 }
+if (Get-ChildItem -LiteralPath $InstallRoot -Filter '.current.old.*') { exit 24 }
+"""
+        assertions = r"""
+if (-not (Test-Path -LiteralPath (Join-Path $a 'nested\a.txt'))) { exit 25 }
+if (-not (Test-Path -LiteralPath (Join-Path $b 'nested\b.txt'))) { exit 26 }
+"""
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                setup + action + assertions,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
 
 def ps1_function_body(name: str) -> str:
     """Extract one top-level function definition from the deploy script."""
@@ -99,13 +189,19 @@ class TestPowerShellStaticConstraints:
         assert "Get-Command python" in body
         assert "--version" in body
         assert "-ne $Manifest.python_version" in body
-        assert 'struct.calcsize("P") * 8' in body
+        assert "struct.calcsize('P') * 8" in body
         assert "Windows Python must be 64-bit" in body
         for module in ("ssl", "sqlite3", "ctypes", "zlib", "venv"):
             assert module in body
         assert "airgap-sync-python-smoke-" in body
         assert "'-m', 'venv'" in body
         assert "Scripts\\python.exe" in body
+
+    def test_python_c_payloads_do_not_backslash_escape_quotes_in_single_quoted_ps(self) -> None:
+        for path in [DEPLOY_PS1, *SERVICE_DIR.glob("*.ps1")]:
+            text = path.read_text(encoding="utf-8")
+            dangerous = re.compile(r"(?:-c|'-c'\s*,)\s*'[^'\r\n]*\\\"")
+            assert dangerous.search(text) is None, path
 
     def test_windows_script_contains_no_python_installer_logic(self) -> None:
         text = DEPLOY_PS1.read_text(encoding="utf-8")
@@ -150,8 +246,15 @@ class TestPowerShellStaticConstraints:
         assert "retired junction cleanup deferred" in body
         # retired 清理在 try/catch 中, 不能让已成功的切换判回失败
         cleanup_at = body.index("retired junction cleanup deferred")
-        remove_at = body.rindex("Remove-Item -LiteralPath $retired")
+        remove_at = body.rindex("Remove-JunctionSafely $retired")
         assert remove_at < cleanup_at
+
+    def test_junction_removal_is_non_recursive_and_type_checked(self) -> None:
+        helper = ps1_function_body("Remove-JunctionSafely")
+        assert "FileAttributes]::ReparsePoint" in helper
+        assert "Directory]::Delete($item.FullName, $false)" in helper
+        assert "-Recurse" not in helper
+        assert "refusing junction-only removal for non-junction path" in helper
 
     def test_checksum_verifier_rejects_paths_outside_bundle(self) -> None:
         body = ps1_function_body("Test-BundleChecksums")
@@ -504,3 +607,99 @@ class TestServiceExamples:
         assert "current\\venv\\Scripts\\airgap-sync.exe" in cmd_text
         assert "current" in ps1_text and "venv\\Scripts\\airgap-sync.exe" in ps1_text
         assert "0.1.0" not in cmd_text and "0.1.0" not in ps1_text
+
+    def test_windows_wrapper_combines_output_and_preserves_native_exit_code(self) -> None:
+        text = (SERVICE_DIR / "run-source-worker.ps1").read_text(encoding="utf-8")
+        assert "$ErrorActionPreference = 'Continue'" in text
+        assert "2>&1 |" in text
+        assert "Out-File -FilePath $LogFile -Append -Encoding utf8" in text
+        assert "$workerExitCode = $LASTEXITCODE" in text
+        assert "exit $workerExitCode" in text
+        assert "Test-Path -LiteralPath $Config -PathType Leaf" in text
+        assert "current\\venv\\Scripts\\airgap-sync.exe" in text
+
+    @pytest.mark.parametrize("native_exit", [0, 1])
+    def test_windows_wrapper_real_native_streams_and_exit_code(
+        self, tmp_path: Path, native_exit: int
+    ) -> None:
+        if os.name != "nt":
+            pytest.skip("requires Windows native stderr behavior")
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if powershell is None:
+            pytest.skip("PowerShell unavailable")
+        root = tmp_path / f"worker-{native_exit}"
+        scripts_dir = root / "current" / "venv" / "Scripts"
+        scripts_dir.mkdir(parents=True)
+        wrapper = root / "run-source-worker.ps1"
+        shutil.copy(SERVICE_DIR / "run-source-worker.ps1", wrapper)
+        config = root / "source.yaml"
+        config.write_text("role: source\n", encoding="utf-8")
+        log = root / "logs" / "worker.log"
+        exe = scripts_dir / "airgap-sync.exe"
+        compile_script = root / "compile-fake-worker.ps1"
+        compile_script.write_text(
+            """
+$source = @'
+using System;
+public class Worker {
+    public static int Main(string[] args) {
+        Console.Out.WriteLine("STDOUT test");
+        Console.Error.WriteLine("INFO test");
+        return Int32.Parse(Environment.GetEnvironmentVariable("FAKE_WORKER_EXIT"));
+    }
+}
+'@
+Add-Type -TypeDefinition $source -Language CSharp -OutputType ConsoleApplication `
+    -OutputAssembly $args[0]
+""",
+            encoding="utf-8",
+        )
+        compiled = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-File", compile_script, exe],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        env = os.environ.copy()
+        env["FAKE_WORKER_EXIT"] = str(native_exit)
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                wrapper,
+                "-Config",
+                config,
+                "-LogFile",
+                log,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        assert result.returncode == native_exit, result.stdout + result.stderr
+        logged = log.read_text(encoding="utf-8-sig")
+        assert "STDOUT test" in logged
+        assert "INFO test" in logged
+
+    def test_windows_wrapper_missing_executable_fails(self, tmp_path: Path) -> None:
+        if os.name != "nt":
+            pytest.skip("requires Windows PowerShell")
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if powershell is None:
+            pytest.skip("PowerShell unavailable")
+        root = tmp_path / "missing-worker"
+        root.mkdir()
+        wrapper = root / "run-source-worker.ps1"
+        shutil.copy(SERVICE_DIR / "run-source-worker.ps1", wrapper)
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-File", wrapper],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0
+        assert "airgap-sync not found" in result.stdout + result.stderr

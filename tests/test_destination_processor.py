@@ -300,6 +300,43 @@ def test_verified_retry_does_not_reinsert_or_rename(tmp_path):
     assert len(database.renames) == 1
 
 
+def test_failed_capability_query_retries_same_run_with_existing_empty_staging(tmp_path):
+    class CapabilityQueryOnceDB(FakeDestinationDB):
+        def __init__(self):
+            super().__init__()
+            self.fail_capability_query = True
+            self.create_calls = 0
+
+        def create_staging_table(self, ddl):
+            self.create_calls += 1
+            super().create_staging_table(ddl)
+
+        def staging_columns(self, staging):
+            if self.fail_capability_query:
+                self.fail_capability_query = False
+                raise DestinationMySQLError("Destination MySQL query failed: unknown capability")
+            return super().staging_columns(staging)
+
+    app_config = config(tmp_path)
+    make_run(app_config.destination.incoming_dir, rows=((1, "retry"),))
+    database = CapabilityQueryOnceDB()
+    processor = DestinationProcessor(database, app_config)
+
+    failed = processor.process(RUN)
+    assert failed.status == "FAILED"
+    assert database.run.status == "FAILED"
+    assert database.create_calls == 1
+    assert database.rows == []
+    assert database.chunk_statuses == {1: "PENDING"}
+    assert list(app_config.destination.incoming_dir.iterdir())
+
+    retried = processor.process(RUN)
+    assert retried.status == "VERIFIED"
+    assert database.create_calls == 1
+    assert database.batch_calls == 1
+    assert database.target_rows == [(1, "retry")]
+
+
 def test_non_innodb_fails_before_any_insert(tmp_path):
     app_config = config(tmp_path)
     make_run(app_config.destination.incoming_dir)

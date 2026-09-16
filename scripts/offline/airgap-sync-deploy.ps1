@@ -168,16 +168,16 @@ function Test-ExternalPython([object] $Manifest) {
         Fail ("Python version mismatch.`nRequired: {0}`nFound:    {1}`nPath:     {2}" -f $Manifest.python_version, $foundVersion, $python)
     }
 
-    $architecture = (& $python -c 'import struct; print(struct.calcsize("P") * 8)' 2>&1) -join ' '
+    $architecture = (& $python -c "import struct; print(struct.calcsize('P') * 8)" 2>&1) -join ' '
     if ($LASTEXITCODE -ne 0 -or $architecture.Trim() -ne '64') {
         Fail 'Windows Python must be 64-bit.'
     }
-    $smoke = 'import ctypes, ssl, sqlite3, struct, sys, venv, zlib; ' +
-        'print("Python version: " + sys.version.replace("\n", " ")); ' +
-        'print("Python executable: " + sys.executable); ' +
-        'print("Python architecture: " + str(struct.calcsize("P") * 8) + "-bit"); ' +
-        'print("OpenSSL version: " + ssl.OPENSSL_VERSION); ' +
-        'print("SQLite version: " + sqlite3.sqlite_version)'
+    $smoke = "import ctypes, ssl, sqlite3, struct, sys, venv, zlib; " +
+        "print('Python version: ' + sys.version.replace('\n', ' ')); " +
+        "print('Python executable: ' + sys.executable); " +
+        "print('Python architecture: ' + str(struct.calcsize('P') * 8) + '-bit'); " +
+        "print('OpenSSL version: ' + ssl.OPENSSL_VERSION); " +
+        "print('SQLite version: ' + sqlite3.sqlite_version)"
     Invoke-Checked $python @('-c', $smoke) 'Python runtime smoke test'
 
     $smokeVenv = Join-Path ([System.IO.Path]::GetTempPath()) `
@@ -213,6 +213,18 @@ function Get-CurrentReleaseId {
     $item = Get-Item -LiteralPath $current
     if ($null -eq $item.Target) { return $null }
     return (Split-Path -Leaf ($item.Target | Select-Object -First 1))
+}
+
+function Remove-JunctionSafely([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or
+        -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Fail "refusing junction-only removal for non-junction path: $Path"
+    }
+    # Directory.Delete(path, false) removes the directory reparse point itself.
+    # It neither enumerates nor recursively deletes anything in its target.
+    [System.IO.Directory]::Delete($item.FullName, $false)
 }
 
 function Switch-Current([string] $ReleaseId) {
@@ -264,7 +276,7 @@ function Switch-Current([string] $ReleaseId) {
             }
         }
         if (Test-Path -LiteralPath $staged) {
-            try { Remove-Item -LiteralPath $staged -Force } catch { }
+            try { Remove-JunctionSafely $staged } catch { }
         }
         if ($null -ne $retired -and -not $restored) {
             Fail ("current switch failed and the previous current junction was left at {0}" -f $retired)
@@ -273,7 +285,7 @@ function Switch-Current([string] $ReleaseId) {
     }
     if ($null -ne $retired) {
         try {
-            Remove-Item -LiteralPath $retired -Force
+            Remove-JunctionSafely $retired
         } catch {
             # The retired junction is only a leftover link; the active current
             # already points at the new release. Do not fail a successful

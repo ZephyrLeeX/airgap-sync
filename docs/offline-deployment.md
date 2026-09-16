@@ -258,9 +258,19 @@ Windows 等价：
 
 ```powershell
 .\airgap-sync-deploy.ps1 -Action Upgrade -ServiceName <name>          # NSSM 等 wrapper
-.\airgap-sync-deploy.ps1 -Action Upgrade -ScheduledTaskName <name>    # 计划任务
+.\airgap-sync-deploy.ps1 `
+  -Action Upgrade `
+  -InstallRoot "D:\AirgapApp" `
+  -ConfigRoot "C:\ProgramData\AirgapSync\config" `
+  -DataRoot "D:\airgap-sync\data" `
+  -ScheduledTaskName "Airgap Sync Source Worker"
 .\airgap-sync-deploy.ps1 -Action Upgrade -AssumeWorkerStopped         # 手工停止
 ```
+
+长期生产环境优先传 `-ScheduledTaskName`（或实际 service 名），使脚本执行
+Stop Scheduled Task → backup → install → schema guard → switch current →
+restart task。`-AssumeWorkerStopped` 只用于操作员明确自行管理、且已经停止
+worker 的场景。
 
 升级安全设计：
 
@@ -318,6 +328,12 @@ Windows 端切换 `current` 使用「临时 junction + GUID 唯一名」：
    retired junction cleanup deferred，不回滚已成功的切换）
 ```
 
+删除前脚本验证该路径是目录型 reparse point，再调用
+`.NET Directory.Delete(path, false)`。`false` 表示非递归，只解除 junction
+本身，不枚举或删除 target 内的任何文件，也不会出现 `Remove-Item` 的
+“item has children / Recurse not specified”交互确认。若类型异常或清理失败，
+已完成的 active `current` 切换仍保持成功并输出 warning。
+
 若最后一步改名失败：自动把 `.current.old.<guid>` 改回 `current` 恢复旧
 指针后抛错，upgrade/rollback 返回失败，`current` 仍指向原 release。
 
@@ -366,6 +382,72 @@ Windows wrapper 始终调用 `<InstallRoot>\current\venv\Scripts\airgap-sync.exe
 如用 NSSM 或 Windows Service wrapper，把 service 示例中的程序路径指向
 `run-source-worker.cmd` / `.ps1` 即可，升级时用 `-ServiceName` 协调。
 
+### Windows Task Scheduler（推荐）
+
+把 `run-source-worker.ps1` 复制到 `<InstallRoot>`，配置：
+
+```text
+Task name:          Airgap Sync Source Worker
+Account:            SYSTEM
+RunLevel:           Highest
+Trigger:            AtStartup
+MultipleInstances:  IgnoreNew
+Restart on failure: 2 minutes
+ExecutionTimeLimit: unlimited
+```
+
+Action 示例（按现场路径调整，wrapper 不内置盘符）：
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+  -File "D:\AirgapApp\run-source-worker.ps1" `
+  -Config "C:\ProgramData\AirgapSync\config\source.yaml" `
+  -LogFile "D:\AirgapApp\logs\source-worker.log"
+```
+
+计划任务只在开机时启动一个常驻 Source Worker，不要另设“每 7 天”触发。
+同步周期与失败重试由配置控制：
+
+```yaml
+schedule:
+  enabled: true
+  delay_after_success: 7d
+  retry_after_failure: 6h
+```
+
+wrapper 在 PowerShell 5.1 下临时把 native stderr 的 error preference 设为
+Continue，将 stdout 与 stderr 一并追加到日志，再立即保存 `$LASTEXITCODE`。
+因此 Python 的 INFO/WARNING stderr 不会终止 wrapper，而真正非零 native
+exit code 仍原样返回；CLI、config 缺失或日志目录创建失败则明确非零退出。
+
+### CentOS systemd 升级后加载新代码
+
+Upgrade 切换 `current` 后必须重启 worker，Python 才会重新 import 新 release：
+
+```bash
+sudo systemctl restart airgap-sync-destination
+```
+
+只修改 venv 中 Python 文件不需要 `daemon-reload`。只有 `.service` 文件有
+修改时才执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart airgap-sync-destination
+```
+
+### 6117c6d 现场问题与修复
+
+- Windows PowerShell 5.1：`Test-ExternalPython` 的 `python -c` 双重 quoting
+  会生成非法 Python 源码；现改为 PowerShell 双引号、Python 单引号。
+- Windows current：旧版 retired junction cleanup 可能弹出
+  `item has children / Recurse not specified`；现使用上文的非递归 helper。
+- 阿里私有云 RDS MySQL 5.6：旧版查询不存在的
+  `GENERATION_EXPRESSION`，报 1054；现按 information_schema 字段能力探测，
+  缺失时使用不含该列的 SQL。探测数据库错误不会静默降级。
+- Windows Source wrapper：native stderr 在 `$ErrorActionPreference=Stop` 下
+  会被包装为 `NativeCommandError`；现合并写日志并以 native exit code 判定。
+
 ## 8. 安全要点
 
 - bundle 完整性：需要 bundle 的动作（`verify` / `install` / `upgrade` /
@@ -402,15 +484,19 @@ cd <bundle>
 AIRGAP_TEST_MYSQL=... /tmp/testenv/bin/python -m pytest tests -m integration
 ```
 
-## 10. 尚未在真实目标环境验证的事项
+## 10. 本修复尚需真实目标环境回归的事项
 
-- Windows Server 2019 external PATH Python 首次安装、现有
-  `D:\AirgapApp` upgrade、junction 与 PS 5.1 行为需第一轮部署时实际验证；
-  `Switch-Current` 需在实机做故障注入
-  （临时 junction 创建失败、`current` 改名失败）确认旧指针恢复；
-- 真实 Defender/EDR 触发的 WinError 32/33，以及真实大表数百 Chunk 运行
-  尚未验证；
-- CentOS 7.9 实机 portable Python（glibc 2.17）运行需实机验证；
-- 真实离线 wheelhouse 安装（无 DNS / 无 PyPI）需实机验证。
+- Windows Server 2019 PATH Python preflight；
+- Windows Server 2019 noninteractive junction cleanup；
+- Windows Task Scheduler + SYSTEM 常驻 worker；
+- Windows worker stdout/stderr 日志与 native exit code；
+- 阿里私有云 RDS MySQL 5.6 Destination；
+- CentOS 7.9 systemd upgrade 后重启并 import 新代码；
+- 611 万行 Source 数据在 Destination 完整导入并达到 VERIFIED。
+- 真实 Defender/EDR 条件下的 WinError 32/33 bounded retry；
+- CentOS 7.9 portable Python 的 glibc 2.17 实机运行；
+- 完全无 DNS / 无 PyPI 条件下的真实离线 wheelhouse 安装。
+
+自动测试或开发机测试不得表述为上述现场验证已完成。
 
 发现问题优先在联网开发机复现并修正 `scripts/offline/` 后重新出包。

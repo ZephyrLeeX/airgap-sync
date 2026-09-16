@@ -108,6 +108,7 @@ class DestinationMySQLConnection:
         self._destination = destination
         self._metadata = quote_identifier(destination.metadata_database)
         self._conn: pymysql.Connection | None = None
+        self._supports_generation_expression: bool | None = None
 
     def connect(self) -> None:
         if self._conn is not None:
@@ -137,6 +138,7 @@ class DestinationMySQLConnection:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        self._supports_generation_expression = None
 
     def __enter__(self) -> DestinationMySQLConnection:
         self.connect()
@@ -480,14 +482,34 @@ class DestinationMySQLConnection:
     def create_staging_table(self, rewritten_ddl: str) -> None:
         self._execute(rewritten_ddl)
 
+    def _has_generation_expression_column(self) -> bool:
+        if self._supports_generation_expression is None:
+            row = self._fetchone(
+                "SELECT 1 FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='COLUMNS' "
+                "AND COLUMN_NAME='GENERATION_EXPRESSION' LIMIT 1"
+            )
+            self._supports_generation_expression = row is not None
+        return self._supports_generation_expression
+
     def staging_columns(self, staging_table: str) -> list[DestinationColumn]:
+        if self._has_generation_expression_column():
+            rows = self._fetchall(
+                "SELECT COLUMN_NAME,ORDINAL_POSITION,EXTRA,"
+                "COALESCE(GENERATION_EXPRESSION,'') "
+                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s "
+                "ORDER BY ORDINAL_POSITION",
+                (self._config.database, staging_table),
+            )
+            return [DestinationColumn(str(a), int(b), str(c), str(d)) for a, b, c, d in rows]
+
         rows = self._fetchall(
-            "SELECT COLUMN_NAME,ORDINAL_POSITION,EXTRA,COALESCE(GENERATION_EXPRESSION,'') "
+            "SELECT COLUMN_NAME,ORDINAL_POSITION,EXTRA "
             "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s "
             "ORDER BY ORDINAL_POSITION",
             (self._config.database, staging_table),
         )
-        return [DestinationColumn(str(a), int(b), str(c), str(d)) for a, b, c, d in rows]
+        return [DestinationColumn(str(a), int(b), str(c), "") for a, b, c in rows]
 
     def chunk_status(self, run_id: str, sequence: int) -> str:
         row = self._fetchone(

@@ -51,6 +51,19 @@ Windows install and upgrade validate the exact PATH Python version,
 architecture, standard-library modules, and temporary venv creation before
 creating the per-release venv. The Windows `current` switch stages a
 GUID-named junction first and restores the old pointer if the switch fails.
+Retired junctions are removed with the non-recursive .NET directory primitive
+only after verifying that the path is a directory reparse point, so cleanup is
+non-interactive and never traverses the release directory it targets.
+
+For a production Windows Source, copy `service-examples/run-source-worker.ps1`
+to the install root and run it from Task Scheduler as SYSTEM. The wrapper accepts
+`-Config` and `-LogFile`, combines native stdout/stderr into the log, and returns
+the worker's real native exit code. Recommended Task Scheduler settings are:
+At startup, Run with highest privileges, Ignore new instances, restart after 2
+minutes, and no execution time limit. The task starts one resident worker; the
+7-day/retry cadence belongs in YAML under `schedule`, not in task triggers.
+Upgrade with `-ScheduledTaskName "Airgap Sync Source Worker"` so the deploy
+script stops and restarts the task around backup/install/switch.
 
 ## Tests
 
@@ -62,3 +75,19 @@ bundle (install guard, upgrade ordering, SQLite backup, integrity gate), and
 syntax-checked when `pwsh` is available and covered by static constraint
 tests otherwise (real validation happens on the first Windows Server 2019
 deployment).
+
+## Field upgrade compatibility notes
+
+- Release `6117c6d` had invalid `python -c` quote escaping under Windows
+  PowerShell 5.1 in `Test-ExternalPython`; payloads now use PowerShell double
+  quotes with Python single quotes.
+- Its retired-junction cleanup could prompt because `Remove-Item` treated the
+  link as a directory with children. Cleanup now unlinks only a verified
+  directory reparse point, without recursion.
+- Destination metadata inspection no longer assumes MySQL exposes
+  `GENERATION_EXPRESSION`: the field is capability-probed and MySQL 5.6 uses a
+  three-column metadata query. Source DDL is unchanged and still fails normally
+  if the target server cannot execute it.
+- Windows PowerShell 5.1 can wrap normal native stderr as `NativeCommandError`.
+  The Source worker wrapper logs that stream without treating it as process
+  failure; its result is determined by `$LASTEXITCODE`.

@@ -177,6 +177,77 @@ def test_destination_connect_sets_utc_session(tmp_path, monkeypatch, password_en
     assert fake.executed == [("SET SESSION time_zone = '+00:00'", ())]
 
 
+class StagingColumnsConnection(DestinationMySQLConnection):
+    def __init__(self, mysql, destination, *, probe, rows):
+        super().__init__(mysql, destination)
+        self.probe = probe
+        self.rows = rows
+        self.probe_calls = 0
+        self.queries = []
+
+    def _fetchone(self, sql, params=()):
+        self.probe_calls += 1
+        self.queries.append((sql, params))
+        return self.probe
+
+    def _fetchall(self, sql, params=()):
+        self.queries.append((sql, params))
+        return self.rows
+
+
+def test_mysql_56_staging_columns_omit_generation_expression_and_cache_probe(tmp_path):
+    connection = StagingColumnsConnection(
+        *configs(tmp_path),
+        probe=None,
+        rows=[("id", 1, ""), ("name", 2, "")],
+    )
+
+    first = connection.staging_columns("staging")
+    second = connection.staging_columns("staging")
+
+    assert first == second
+    assert [column.generation_expression for column in first] == ["", ""]
+    assert connection.probe_calls == 1
+    staging_queries = [sql for sql, _ in connection.queries if "ORDER BY" in sql]
+    assert len(staging_queries) == 2
+    assert all("GENERATION_EXPRESSION" not in sql for sql in staging_queries)
+
+
+def test_generation_expression_capability_preserves_generated_column(tmp_path):
+    connection = StagingColumnsConnection(
+        *configs(tmp_path),
+        probe=(1,),
+        rows=[("id", 1, "", ""), ("computed", 2, "", "(`id` + 1)")],
+    )
+
+    columns = connection.staging_columns("staging")
+
+    assert columns[1].generation_expression == "(`id` + 1)"
+    assert columns[1].generated
+    assert "COALESCE(GENERATION_EXPRESSION,'')" in connection.queries[-1][0]
+
+
+def test_generation_expression_capability_probe_failure_is_not_fallback(tmp_path):
+    connection = DestinationMySQLConnection(*configs(tmp_path))
+
+    def fail_probe(sql, params=()):
+        raise DestinationMySQLError("Destination MySQL query failed: connection lost")
+
+    connection._fetchone = fail_probe
+    connection._fetchall = lambda sql, params=(): pytest.fail("fallback query must not run")
+
+    with pytest.raises(DestinationMySQLError, match="connection lost"):
+        connection.staging_columns("staging")
+    assert connection._supports_generation_expression is None
+
+
+def test_generation_expression_capability_does_not_use_server_version(tmp_path):
+    connection = StagingColumnsConnection(*configs(tmp_path), probe=None, rows=[("id", 1, "")])
+    connection.ping = lambda: pytest.fail("VERSION() must not be used for capability detection")
+
+    assert connection.staging_columns("staging")[0].generation_expression == ""
+
+
 def test_v2_to_v3_adds_explicit_cleanup_completion_columns(tmp_path):
     connection = RecordingConnection(*configs(tmp_path))
     connection._fetchall = lambda sql, params=(): []
