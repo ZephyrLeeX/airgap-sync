@@ -44,6 +44,7 @@ $ErrorActionPreference = 'Stop'
 $script:BundleRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:StoppedService = $null
 $script:StoppedTask = $null
+$script:PathPython = $null
 
 function Write-Stage([string] $Message) {
     Write-Host "== $Message" -ForegroundColor Cyan
@@ -84,6 +85,9 @@ function Test-Platform([object] $Manifest) {
     if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
         Fail "this machine reports $env:PROCESSOR_ARCHITECTURE; an amd64 bundle requires AMD64"
     }
+    if ($Manifest.runtime_policy -ne 'external-python-path') {
+        Fail "Windows bundle runtime_policy must be external-python-path"
+    }
 }
 
 function Test-BundleLayout([object] $Manifest) {
@@ -91,7 +95,6 @@ function Test-BundleLayout([object] $Manifest) {
         (Join-Path $script:BundleRoot 'SHA256SUMS'),
         (Join-Path $script:BundleRoot 'release_manifest.py'),
         (Join-Path $script:BundleRoot 'airgap-sync-deploy.ps1'),
-        (Join-Path $script:BundleRoot ('runtime\' + $Manifest.runtime_artifact)),
         (Join-Path $script:BundleRoot ('app\' + $Manifest.app_wheel)),
         (Join-Path $script:BundleRoot 'config\source.example.yaml'),
         (Join-Path $script:BundleRoot 'config\destination.example.yaml')
@@ -148,41 +151,50 @@ function Invoke-VerifyBundle([object] $Manifest) {
     Write-Host 'Bundle verification OK'
 }
 
-function Get-RuntimeDir([object] $Manifest) {
-    return (Join-Path $InstallRoot ('runtimes\python-' + $Manifest.python_version))
-}
+function Test-ExternalPython([object] $Manifest) {
+    Write-Stage ("Check Python {0} x64 from PATH" -f $Manifest.python_version)
+    $command = Get-Command python -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $command -or [System.IO.Path]::GetFileName($command.Source).ToLowerInvariant() -ne 'python.exe') {
+        Fail ("Python {0} x64 is required on PATH.`nInstall Python first and ensure 'python' is available in this shell." -f $Manifest.python_version)
+    }
+    $python = $command.Source
+    $versionOutput = (& $python --version 2>&1) -join ' '
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Python on PATH could not report its version: $python"
+    }
+    $foundVersion = $versionOutput -replace '^Python\s+', ''
+    if ($foundVersion -ne $Manifest.python_version) {
+        Fail ("Python version mismatch.`nRequired: {0}`nFound:    {1}`nPath:     {2}" -f $Manifest.python_version, $foundVersion, $python)
+    }
 
-function Install-Runtime([object] $Manifest) {
-    Write-Stage ("Install Python runtime {0} (shared across releases)" -f $Manifest.python_version)
-    $runtimeDir = Get-RuntimeDir $Manifest
-    $runtimePython = Join-Path $runtimeDir 'python.exe'
-    $marker = Join-Path $runtimeDir '.runtime-installed'
-    if (Test-Path -LiteralPath $marker) {
-        Write-Host "  runtime already installed at $runtimeDir, reusing"
-        return
+    $architecture = (& $python -c 'import struct; print(struct.calcsize("P") * 8)' 2>&1) -join ' '
+    if ($LASTEXITCODE -ne 0 -or $architecture.Trim() -ne '64') {
+        Fail 'Windows Python must be 64-bit.'
     }
-    if (Test-Path -LiteralPath $runtimeDir) {
-        Write-Host '  incomplete runtime found, removing'
-        Remove-Item -LiteralPath $runtimeDir -Recurse -Force
+    $smoke = 'import ctypes, ssl, sqlite3, struct, sys, venv, zlib; ' +
+        'print("Python version: " + sys.version.replace("\n", " ")); ' +
+        'print("Python executable: " + sys.executable); ' +
+        'print("Python architecture: " + str(struct.calcsize("P") * 8) + "-bit"); ' +
+        'print("OpenSSL version: " + ssl.OPENSSL_VERSION); ' +
+        'print("SQLite version: " + sqlite3.sqlite_version)'
+    Invoke-Checked $python @('-c', $smoke) 'Python runtime smoke test'
+
+    $smokeVenv = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ('airgap-sync-python-smoke-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-Checked $python @('-m', 'venv', $smokeVenv) 'temporary venv creation'
+        $smokePython = Join-Path $smokeVenv 'Scripts\python.exe'
+        Invoke-Checked $smokePython @('-c', 'import ssl,sqlite3,ctypes,zlib') `
+            'temporary venv runtime smoke test'
+    } finally {
+        if (Test-Path -LiteralPath $smokeVenv) {
+            Remove-Item -LiteralPath $smokeVenv -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
-    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
-    $installer = Join-Path $script:BundleRoot ('runtime\' + $Manifest.runtime_artifact)
-    $arguments = @(
-        '/quiet', 'InstallAllUsers=1',
-        "TargetDir=$runtimeDir",
-        'Include_doc=0', 'Include_launcher=0', 'Include_test=0',
-        'Shortcuts=0', 'AssociateFiles=0'
-    )
-    Write-Host "  running $($Manifest.runtime_artifact) (silent, per-machine)"
-    $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-        Fail ("python installer exited with code {0}" -f $process.ExitCode)
-    }
-    if (-not (Test-Path -LiteralPath $runtimePython)) {
-        Fail "runtime python not found after install: $runtimePython"
-    }
-    Invoke-Checked $runtimePython @((Join-Path $script:BundleRoot 'release_manifest.py'), 'smoke-runtime') 'runtime smoke test'
-    Set-Content -LiteralPath $marker -Value (Get-Date).ToUniversalTime().ToString('o')
+    Write-Host "  Python requirement satisfied: $($Manifest.python_version) x64 via PATH"
+    Write-Host "  Python executable: $python"
+    $script:PathPython = $python
 }
 
 function Get-ReleasesDir {
@@ -271,7 +283,7 @@ function Switch-Current([string] $ReleaseId) {
     }
 }
 
-function Ensure-ReleaseInstalled([object] $Manifest) {
+function Ensure-ReleaseInstalled([object] $Manifest, [string] $PathPython) {
     $releaseDir = Join-Path (Get-ReleasesDir) $Manifest.release_id
     $venvDir = Join-Path $releaseDir 'venv'
     $venvPython = Join-Path $venvDir 'Scripts\python.exe'
@@ -288,8 +300,7 @@ function Ensure-ReleaseInstalled([object] $Manifest) {
     New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
 
     Write-Stage "Create venv for $($Manifest.release_id)"
-    $runtimePython = Join-Path (Get-RuntimeDir $Manifest) 'python.exe'
-    Invoke-Checked $runtimePython @('-m', 'venv', $venvDir) 'venv creation'
+    Invoke-Checked $PathPython @('-m', 'venv', $venvDir) 'venv creation'
 
     Write-Stage 'Offline pip install (app wheel + locked dependencies)'
     $oldNoIndex = $env:PIP_NO_INDEX
@@ -322,10 +333,10 @@ function Ensure-ReleaseInstalled([object] $Manifest) {
         git_commit                   = $Manifest.git_commit
         created_at                   = $Manifest.created_at
         python_version               = $Manifest.python_version
+        runtime_policy              = $Manifest.runtime_policy
         platform                     = $Manifest.platform
         source_state_schema          = $Manifest.source_state_schema
         destination_metadata_schema  = $Manifest.destination_metadata_schema
-        runtime_artifact             = $Manifest.runtime_artifact
         app_wheel                    = $Manifest.app_wheel
         wheel_count                  = $Manifest.wheel_count
         include_tests                = [bool] $Manifest.include_tests
@@ -380,7 +391,7 @@ function Backup-Configs {
     Write-Host "  config backup: $destination"
 }
 
-function Backup-Sqlite([object] $Manifest) {
+function Backup-Sqlite([string] $PathPython) {
     if ($DataRoot -eq '') {
         Write-Host '  no -DataRoot given, skipping SQLite backup'
         return
@@ -390,17 +401,13 @@ function Backup-Sqlite([object] $Manifest) {
         Write-Host "  no SQLite state at $database, skipping backup"
         return
     }
-    $runtimePython = Join-Path (Get-RuntimeDir $Manifest) 'python.exe'
-    if (-not (Test-Path -LiteralPath $runtimePython)) {
-        Fail 'runtime python required for SQLite backup is missing'
-    }
     $stamp = Get-Date -Format 'yyyyMMddHHmmss'
     $destination = Join-Path $DataRoot "backups\$stamp"
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
     $scriptBlock = 'import sqlite3, sys; ' +
         'source = sqlite3.connect(sys.argv[1]); target = sqlite3.connect(sys.argv[2]); ' +
         'source.backup(target); source.close(); target.close()'
-    Invoke-Checked $runtimePython @('-c', $scriptBlock, $database, (Join-Path $destination 'meta.db')) 'SQLite backup'
+    Invoke-Checked $PathPython @('-c', $scriptBlock, $database, (Join-Path $destination 'meta.db')) 'SQLite backup'
     Write-Host "  SQLite backup: $destination\meta.db"
 }
 
@@ -431,11 +438,11 @@ function Write-NextSteps {
 }
 
 function Do-Install([object] $Manifest) {
-    Write-Stage '[1/7] Verify release bundle'
+    Write-Stage '[1/8] Verify release bundle'
     Invoke-VerifyBundle $Manifest
-    Write-Stage '[2/7] Check platform'
+    Write-Stage '[2/8] Check platform'
     Test-Platform $Manifest
-    Write-Stage '[3/7] Check for existing deployment'
+    Write-Stage '[3/8] Check for existing deployment'
     $current = Get-CurrentReleaseId
     if ($null -ne $current) {
         if ($current -eq $Manifest.release_id -and
@@ -452,23 +459,27 @@ function Do-Install([object] $Manifest) {
         Fail ("INSTALL_BLOCKED_EXISTING_DEPLOYMENT: current -> {0}, this bundle installs {1}" -f $current, $Manifest.release_id)
     }
     Write-Host '  no existing deployment; proceeding with first install'
-    Write-Stage '[4/7] Install Python runtime'
-    Install-Runtime $Manifest
-    Write-Stage ('[5/7] Create release directory {0}' -f (Join-Path (Get-ReleasesDir) $Manifest.release_id))
-    Ensure-ReleaseInstalled $Manifest
-    Write-Stage '[6/7] Switch current'
+    Write-Stage '[4/8] Validate external Python and temporary venv'
+    Test-ExternalPython $Manifest
+    Write-Stage ('[5/8] Create release directory {0}' -f (Join-Path (Get-ReleasesDir) $Manifest.release_id))
+    Ensure-ReleaseInstalled $Manifest $script:PathPython
+    Write-Stage '[6/8] Application smoke completed'
+    Write-Host '  release venv and application are ready'
+    Write-Stage '[7/8] Switch current'
     Switch-Current $Manifest.release_id
-    Write-Stage '[7/7] Done'
+    Write-Stage '[8/8] Done'
     Write-Host "Install complete: current -> $($Manifest.release_id)"
     Write-NextSteps
 }
 
 function Do-Upgrade([object] $Manifest) {
-    Write-Stage '[1/8] Verify release bundle'
+    Write-Stage '[1/9] Verify release bundle'
     Invoke-VerifyBundle $Manifest
-    Write-Stage '[2/8] Check platform'
+    Write-Stage '[2/9] Check platform'
     Test-Platform $Manifest
-    Write-Stage '[3/8] Stop worker'
+    Write-Stage '[3/9] Validate external Python and temporary venv'
+    Test-ExternalPython $Manifest
+    Write-Stage '[4/9] Stop worker'
     Stop-Worker
     try {
         $current = Get-CurrentReleaseId
@@ -478,21 +489,13 @@ function Do-Upgrade([object] $Manifest) {
             Start-Worker
             return
         }
-        Write-Stage '[4/8] Backup config'
+        Write-Stage '[5/9] Backup config'
         Backup-Configs
-        # Install the TARGET runtime before the SQLite backup: the backup runs
-        # under the target bundle's python, which does not exist yet on a
-        # Python patch upgrade (e.g. 3.13.15 -> 3.13.16). Installing this
-        # side-by-side runtime is safe before the backup: it runs no
-        # application code and migrates no metadata. Everything that touches
-        # application state (new venv, schema guard, current switch) still
-        # happens only after the backup.
-        Write-Stage '[5/8] Install target Python runtime (side-by-side, shared)'
-        Install-Runtime $Manifest
-        Write-Stage '[6/8] Backup Source SQLite state (when present)'
-        Backup-Sqlite $Manifest
-        Write-Stage '[7/8] Install new release + schema compatibility check'
-        Ensure-ReleaseInstalled $Manifest
+        Write-Stage '[6/9] Backup Source SQLite state (when present)'
+        Backup-Sqlite $script:PathPython
+        Write-Stage '[7/9] Install new release from external PATH Python'
+        Ensure-ReleaseInstalled $Manifest $script:PathPython
+        Write-Stage '[8/9] Schema compatibility check'
         if ($null -ne $current) {
             $currentMarker = Join-Path (Get-ReleasesDir) ($current + '\installed.json')
             if (Test-Path -LiteralPath $currentMarker) {
@@ -500,7 +503,7 @@ function Do-Upgrade([object] $Manifest) {
                 Test-SchemaCompatibility $currentData $Manifest 'upgrade blocked'
             }
         }
-        Write-Stage '[8/8] Switch current'
+        Write-Stage '[9/9] Switch current'
         Switch-Current $Manifest.release_id
     } catch {
         Write-Host "ERROR: upgrade failed; any partial current switch was rolled back so the current release is unchanged: $_" -ForegroundColor Red
@@ -573,7 +576,19 @@ function Do-Status {
             $data = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
             Write-Host ("App version       {0}" -f $data.app_version)
             Write-Host ("Git commit        {0}" -f $data.git_commit)
-            Write-Host ("Python version    {0}" -f $data.python_version)
+            Write-Host ("Required Python      {0}" -f $data.python_version)
+            $venvPython = Join-Path (Get-ReleasesDir) ($current + '\venv\Scripts\python.exe')
+            if (Test-Path -LiteralPath $venvPython) {
+                $venvVersion = (& $venvPython -c 'import platform; print(platform.python_version())' 2>&1) -join ' '
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host ("Current venv Python  {0}" -f $venvVersion.Trim())
+                    Write-Host ("Venv interpreter     {0}" -f $venvPython)
+                } else {
+                    Write-Host 'Current venv Python  (unable to query)'
+                }
+            } else {
+                Write-Host 'Current venv Python  (missing)'
+            }
             Write-Host ("Source schema     {0}" -f $data.source_state_schema)
             Write-Host ("Destination schema {0}" -f $data.destination_metadata_schema)
         }
@@ -643,6 +658,10 @@ try {
         default { Fail "unhandled action: $Action" }
     }
 } catch {
-    Write-Host "ERROR: $_" -ForegroundColor Red
+    if ($Action -eq 'Install') {
+        Write-Host "INSTALL FAILED: $_" -ForegroundColor Red
+    } else {
+        Write-Host "ERROR: $_" -ForegroundColor Red
+    }
     exit 1
 }

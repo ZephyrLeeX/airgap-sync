@@ -33,6 +33,7 @@ def make_manifest(**overrides) -> rm.ReleaseManifest:
         minimum_glibc="2.17",
         source_state_schema=4,
         destination_metadata_schema=3,
+        runtime_policy=rm.RUNTIME_POLICY_BUNDLED,
         runtime_artifact="cpython-3.13.15+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz",
         app_wheel="airgap_sync-0.1.0-py3-none-any.whl",
         wheel_count=15,
@@ -48,15 +49,22 @@ def write_fake_bundle(root: Path, *, platform: str = "linux") -> rm.ReleaseManif
         platform_os=platform,
         platform_arch="amd64" if platform == "windows" else "x86_64",
         minimum_glibc=None if platform == "windows" else "2.17",
+        runtime_policy=(
+            rm.RUNTIME_POLICY_EXTERNAL_PYTHON_PATH
+            if platform == "windows"
+            else rm.RUNTIME_POLICY_BUNDLED
+        ),
         runtime_artifact=(
-            "python-3.13.15-amd64.exe"
+            None
             if platform == "windows"
             else "cpython-3.13.15+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
         ),
     )
-    for name in ("runtime", "app", "wheelhouse", "config"):
+    for name in ("app", "wheelhouse", "config"):
         (root / name).mkdir(parents=True)
-    (root / "runtime" / manifest.runtime_artifact).write_bytes(b"runtime-bytes")
+    if manifest.runtime_artifact is not None:
+        (root / "runtime").mkdir()
+        (root / "runtime" / manifest.runtime_artifact).write_bytes(b"runtime-bytes")
     (root / "app" / manifest.app_wheel).write_bytes(b"app-wheel-bytes")
     (root / "wheelhouse" / "click-8.5.0-py3-none-any.whl").write_bytes(b"click-wheel")
     (root / "config" / "source.example.yaml").write_text("role: source\n")
@@ -88,6 +96,22 @@ class TestManifest:
     def test_platform_block(self, tmp_path: Path) -> None:
         data = make_manifest().to_dict()
         assert data["platform"] == {"os": "linux", "arch": "x86_64", "minimum_glibc": "2.17"}
+
+    def test_windows_external_python_policy_has_no_runtime_artifact(self) -> None:
+        manifest = make_manifest(
+            platform_os="windows",
+            platform_arch="amd64",
+            minimum_glibc=None,
+            runtime_policy=rm.RUNTIME_POLICY_EXTERNAL_PYTHON_PATH,
+            runtime_artifact=None,
+        )
+        data = manifest.to_dict()
+        assert data["runtime_policy"] == "external-python-path"
+        assert "runtime_artifact" not in data
+
+    def test_linux_bundled_policy_requires_runtime_artifact(self) -> None:
+        with pytest.raises(rm.ReleaseManifestError, match="runtime_artifact"):
+            make_manifest(runtime_artifact=None)
 
     def test_validation_rejects_wrong_platform(self) -> None:
         with pytest.raises(rm.ReleaseManifestError, match="unsupported platform"):

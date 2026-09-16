@@ -24,7 +24,7 @@ from typing import Any
 
 import zstandard
 
-from airgap_sync.common.fsutil import PART_SUFFIX, fsync_directory
+from airgap_sync.common.fsutil import PART_SUFFIX, fsync_directory, retry_windows_file_lock
 from airgap_sync.common.manifest import ChunkMeta
 from airgap_sync.common.models import ChunkConfig
 
@@ -184,7 +184,14 @@ class _OpenChunk:
             self._compressor = compressor_context.stream_writer(self._hashing, closefd=False)
         except Exception:
             self._raw_fh.close()
-            self._part_path.unlink(missing_ok=True)
+            try:
+                retry_windows_file_lock(
+                    "unlink",
+                    self._part_path,
+                    lambda: self._part_path.unlink(missing_ok=True),
+                )
+            except OSError as exc:
+                logger.warning("cannot remove failed chunk %s: %s", self._part_path, exc)
             raise
         self._aborted = False
 
@@ -207,7 +214,14 @@ class _OpenChunk:
             raise ChunkWriterError(f"cannot finalize chunk {self._final_path.name}: {exc}") from exc
         finally:
             self._raw_fh.close()
-        os.replace(self._part_path, self._final_path)
+        try:
+            retry_windows_file_lock(
+                "replace",
+                self._part_path,
+                lambda: os.replace(self._part_path, self._final_path),
+            )
+        except OSError as exc:
+            raise ChunkWriterError(f"cannot finalize chunk {self._final_path.name}: {exc}") from exc
         fsync_directory(self.run_dir)
         meta = ChunkMeta(
             sequence=self.sequence,
@@ -244,6 +258,10 @@ class _OpenChunk:
                     "cannot close raw file for aborted chunk %s: %s", self._part_path, exc
                 )
         try:
-            self._part_path.unlink(missing_ok=True)
+            retry_windows_file_lock(
+                "unlink",
+                self._part_path,
+                lambda: self._part_path.unlink(missing_ok=True),
+            )
         except OSError as exc:
             logger.warning("cannot remove aborted chunk %s: %s", self._part_path, exc)

@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-MANIFEST_FORMAT_VERSION = 1
+MANIFEST_FORMAT_VERSION = 2
 MANIFEST_NAME = "release.json"
 RELEASE_ENV_NAME = "release.env"
 SHA256SUMS_NAME = "SHA256SUMS"
@@ -42,6 +42,8 @@ DEPLOY_SCRIPT_NAMES = {"windows": "airgap-sync-deploy.ps1", "linux": "airgap-syn
 HELPER_SCRIPT_NAME = "release_manifest.py"
 CONFIG_EXAMPLES = ("source.example.yaml", "destination.example.yaml")
 SUPPORTED_PLATFORMS = {("windows", "amd64"), ("linux", "x86_64")}
+RUNTIME_POLICY_BUNDLED = "bundled"
+RUNTIME_POLICY_EXTERNAL_PYTHON_PATH = "external-python-path"
 SCHEMA_KEYS = ("source_state_schema", "destination_metadata_schema")
 
 RELEASE_ID_PATTERN = re.compile(r"^\d+\.\d+\.\d+-[0-9a-f]{7,40}$")
@@ -77,7 +79,8 @@ class ReleaseManifest:
     minimum_glibc: str | None
     source_state_schema: int
     destination_metadata_schema: int
-    runtime_artifact: str
+    runtime_policy: str
+    runtime_artifact: str | None
     app_wheel: str
     wheel_count: int
     include_tests: bool
@@ -91,21 +94,24 @@ class ReleaseManifest:
         platform: dict[str, str] = {"os": self.platform_os, "arch": self.platform_arch}
         if self.minimum_glibc is not None:
             platform["minimum_glibc"] = self.minimum_glibc
-        return {
+        result = {
             "format_version": MANIFEST_FORMAT_VERSION,
             "release_id": self.release_id,
             "app_version": self.app_version,
             "git_commit": self.git_commit,
             "created_at": self.created_at,
             "python_version": self.python_version,
+            "runtime_policy": self.runtime_policy,
             "platform": platform,
             "source_state_schema": self.source_state_schema,
             "destination_metadata_schema": self.destination_metadata_schema,
-            "runtime_artifact": self.runtime_artifact,
             "app_wheel": self.app_wheel,
             "wheel_count": self.wheel_count,
             "include_tests": self.include_tests,
         }
+        if self.runtime_artifact is not None:
+            result["runtime_artifact"] = self.runtime_artifact
+        return result
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ReleaseManifest:
@@ -129,7 +135,12 @@ class ReleaseManifest:
                 else None,
                 source_state_schema=int(data["source_state_schema"]),
                 destination_metadata_schema=int(data["destination_metadata_schema"]),
-                runtime_artifact=str(data["runtime_artifact"]),
+                runtime_policy=str(data["runtime_policy"]),
+                runtime_artifact=(
+                    str(data["runtime_artifact"])
+                    if data.get("runtime_artifact") is not None
+                    else None
+                ),
                 app_wheel=str(data["app_wheel"]),
                 wheel_count=int(data["wheel_count"]),
                 include_tests=bool(data["include_tests"]),
@@ -177,8 +188,20 @@ class ReleaseManifest:
             value = getattr(self, key)
             if value < 1:
                 problems.append(f"{key} must be a positive integer")
-        if "/" in self.runtime_artifact or not self.runtime_artifact:
-            problems.append("runtime_artifact must be a bare filename")
+        expected_policy = (
+            RUNTIME_POLICY_EXTERNAL_PYTHON_PATH
+            if self.platform_os == "windows"
+            else RUNTIME_POLICY_BUNDLED
+        )
+        if self.runtime_policy != expected_policy:
+            problems.append(
+                f"{self.platform_os} bundles must use runtime_policy {expected_policy!r}"
+            )
+        if self.runtime_policy == RUNTIME_POLICY_BUNDLED:
+            if self.runtime_artifact is None or "/" in self.runtime_artifact:
+                problems.append("bundled runtime_artifact must be a bare filename")
+        elif self.runtime_artifact is not None:
+            problems.append("external Python bundles must not declare runtime_artifact")
         if "/" in self.app_wheel or not self.app_wheel:
             problems.append("app_wheel must be a bare filename")
         if not self.app_wheel.endswith(".whl"):
@@ -226,15 +249,17 @@ def render_release_env(manifest: ReleaseManifest) -> str:
         f"AIRGAP_GIT_COMMIT={quote(manifest.git_commit)}",
         f"AIRGAP_CREATED_AT={quote(manifest.created_at)}",
         f"AIRGAP_PYTHON_VERSION={quote(manifest.python_version)}",
+        f"AIRGAP_RUNTIME_POLICY={quote(manifest.runtime_policy)}",
         f"AIRGAP_PLATFORM_OS={quote(manifest.platform_os)}",
         f"AIRGAP_PLATFORM_ARCH={quote(manifest.platform_arch)}",
         f"AIRGAP_SOURCE_STATE_SCHEMA={manifest.source_state_schema}",
         f"AIRGAP_DESTINATION_METADATA_SCHEMA={manifest.destination_metadata_schema}",
-        f"AIRGAP_RUNTIME_ARTIFACT={quote(manifest.runtime_artifact)}",
         f"AIRGAP_APP_WHEEL={quote(manifest.app_wheel)}",
         f"AIRGAP_WHEEL_COUNT={manifest.wheel_count}",
         f"AIRGAP_INCLUDE_TESTS={'1' if manifest.include_tests else '0'}",
     ]
+    if manifest.runtime_artifact is not None:
+        lines.append(f"AIRGAP_RUNTIME_ARTIFACT={quote(manifest.runtime_artifact)}")
     if manifest.minimum_glibc is not None:
         lines.append(f"AIRGAP_MINIMUM_GLIBC={quote(manifest.minimum_glibc)}")
     return "\n".join(lines) + "\n"
@@ -413,15 +438,17 @@ def verify_bundle(
     problems.extend(verify_sha256sums(root, entries))
 
     listed = {relative for _, relative in entries}
-    for required in (
+    required_files = [
         MANIFEST_NAME,
         RELEASE_ENV_NAME,
         HELPER_SCRIPT_NAME,
         DEPLOY_SCRIPT_NAMES[manifest.platform_os],
-        f"{RUNTIME_DIR_NAME}/{manifest.runtime_artifact}",
         f"{APP_DIR_NAME}/{manifest.app_wheel}",
         *(f"config/{name}" for name in CONFIG_EXAMPLES),
-    ):
+    ]
+    if manifest.runtime_artifact is not None:
+        required_files.append(f"{RUNTIME_DIR_NAME}/{manifest.runtime_artifact}")
+    for required in required_files:
         if required not in listed:
             problems.append(f"{SHA256SUMS_NAME} does not cover required file: {required}")
 

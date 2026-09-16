@@ -6,7 +6,7 @@
 
 | 端 | 系统 | 说明 |
 | --- | --- | --- |
-| Source | Windows Server 2019 x64 | 官方 CPython 3.13 x64 installer |
+| Source | Windows Server 2019 x64 | 管理员预装 CPython 3.13.15 x64，并加入系统 PATH |
 | Destination | CentOS 7.9 x86_64（glibc 2.17） | python-build-standalone portable Python |
 
 部署机器不需要 git、uv、gcc、make、PyPI 或任何网络访问。
@@ -43,8 +43,8 @@ dist/offline/
   `manylinux_2_18+` tag 的 wheel 会让构建失败（它们对 glibc 2.17 没有 ABI
   承诺，加载即崩）；
 - Linux runtime（python-build-standalone）与上游 `SHA256SUMS` 逐一校验；
-- Windows installer（python.org）无自动可校验的上游 checksum，构建时输出
-  WARNING，下载后自身 SHA256 写入 bundle 的 `SHA256SUMS`；
+- Windows bundle 不含 Python installer 或 runtime archive，只包含 Windows
+  CPython 3.13 wheelhouse；
 - `release.json` / `release.env` 中的 schema 版本直接读取
   `airgap_sync.source.state.SCHEMA_VERSION` 与
   `airgap_sync.destination.mysql.METADATA_SCHEMA_VERSION`（单一来源）。
@@ -62,7 +62,7 @@ airgap-sync-release/
 ├── release.json          # Release manifest（版本、git sha、schema 版本、平台）
 ├── release.env           # 同内容的 shell-sourceable 版本（构建时同步生成）
 ├── SHA256SUMS            # 全部 payload 的 SHA256（不含自身）
-├── runtime/              # Python 安装器 / portable runtime
+├── runtime/              # 仅 Linux bundle：portable Python runtime
 ├── app/                  # airgap_sync-<version>-py3-none-any.whl
 ├── wheelhouse/           # 锁定版本的依赖 binary wheels
 ├── test-wheelhouse/      # 仅 --include-tests：pytest 及其依赖
@@ -82,7 +82,16 @@ Bundle 不含任何真实密码 / Token；示例配置只引用 `password_env` /
 
 ## 3. Windows Server 2019（Source）
 
-以管理员 PowerShell 运行（默认路径写入 `C:\Program Files` 与
+Airgap Sync 不负责安装 Windows Python。管理员必须先安装 **Python 3.13.15
+x64**，并确保 `python.exe` 可通过系统 `PATH` 发现。部署前检查：
+
+```powershell
+python --version
+python -c "import struct; print(struct.calcsize('P')*8)"
+```
+
+输出必须分别为 `Python 3.13.15` 和 `64`。然后以管理员 PowerShell 运行
+（默认路径写入 `C:\Program Files` 与
 `C:\ProgramData`；所有路径都可用参数覆盖）。
 
 ```powershell
@@ -92,11 +101,16 @@ Bundle 不含任何真实密码 / Token；示例配置只引用 `password_env` /
 # 可选参数：-InstallRoot / -ConfigRoot / -DataRoot
 ```
 
-Install 顺序：Verify bundle → 平台检查 → 检查已有部署 → 安装 Python runtime
-（`runtimes\python-3.13.x`，静默官方 installer）→ 独立 release 目录 +
-venv → 离线 pip 安装（`--no-index --find-links wheelhouse`）→ import
+Install 顺序：Verify bundle → 平台检查 → 检查已有部署 → 从 PATH 严格检查
+Python 3.13.15 x64、标准库模块和真实临时 venv → 独立 release 目录 + venv →
+离线 pip 安装（`PIP_NO_INDEX=1 --no-index --find-links wheelhouse`）→ import
 smoke test → `airgap-sync --version` → 写 `installed.json` → 建立
 `current` directory junction。**安装后不会自动启动 worker。**
+
+Upgrade 也使用 PATH 中严格匹配 release 要求的 Python 创建新 release venv；
+旧 release venv 保持不动。Rollback 直接复用目标 release 已安装的 venv，
+不检查当前 PATH Python。`-InstallRoot "D:\AirgapApp"` 等现有自定义安装路径
+继续支持。
 
 **Install 仅用于首次安装。**机器上已有 `current`（指向任何 release）时：
 
@@ -142,7 +156,6 @@ $cli = "C:\Program Files\AirgapSync\current\venv\Scripts\airgap-sync.exe"
 
 ```text
 C:\Program Files\AirgapSync\
-├── runtimes\python-3.13.x\          # 同一 patch 版本只装一次, 各 release 共享
 ├── releases\<release-id>\venv\      # 每个 release 独立 venv + installed.json
 └── current                          # junction -> releases\<release-id>
 
@@ -254,7 +267,8 @@ Windows 等价：
 - **side-by-side**：新版本安装到 `releases/<新 release-id>`，旧 release
   目录原样保留；
 - 切换 `current` 前依次完成：config 备份（`<config-root>/backups/<ts>/`）、
-  **目标 Python runtime 安装**（side-by-side，见下）、Source SQLite
+  Python 前置条件准备（Windows 严格检查 PATH Python；Linux 安装 bundled
+  runtime）、Source SQLite
   `state/meta.db` 备份（SQLite backup API，写入
   `<data-root>/backups/<ts>/meta.db`；Destination 端不做 mysqldump，
   数据库级备份由 DBA / 环境备份体系负责）、新 venv + 离线安装 + smoke
@@ -263,12 +277,13 @@ Windows 等价：
   会在失败时尝试重新启动；
 - 同一 release 重复 upgrade 幂等：已完成 → no-op，未完成（无
   `installed.json`）→ 安全重建；
-- 同一 Python patch 版本复用已有 runtime；runtime 安装后校验
+- Linux 同一 Python patch 版本复用已有 runtime；校验
   `release.env` 与 `release.json` 关键字段一致（`check-env`）。
 
 ### Python runtime patch 升级（3.13.x → 3.13.y）
 
-新 bundle 的 Python patch 版本变化时（例如 `3.13.15 → 3.13.16`），升级顺序为：
+Linux bundle 的 Python patch 版本变化时（例如 `3.13.15 → 3.13.16`），
+仍按原有顺序安装 side-by-side portable runtime：
 
 ```text
 verify bundle → 平台检查 → stop worker → 确定 current → config 备份
@@ -282,6 +297,11 @@ verify bundle → 平台检查 → stop worker → 确定 current → config 备
 步骤（新 venv、schema guard、current 切换）仍严格发生在 backup 之后。
 旧 runtime 目录（`runtimes/python-3.13.15/`）保留不删，回滚到旧 release
 时旧 venv 继续可用。
+
+Windows release 当前严格 pin `3.13.15`。Upgrade 先验证 PATH 中正是要求的
+x64 Python，并通过临时 venv smoke，再停止 worker、备份并创建新 release
+venv；Airgap Sync 不安装或保留共享 Windows runtime。Rollback 只复用已完整
+安装的目标 release venv，因此不依赖 PATH Python。
 
 SQLite backup 失败时（如 `meta.db` 损坏）：升级终止，`current` 仍指向旧
 release，新 release 目录不会创建。
@@ -384,9 +404,12 @@ AIRGAP_TEST_MYSQL=... /tmp/testenv/bin/python -m pytest tests -m integration
 
 ## 10. 尚未在真实目标环境验证的事项
 
-- Windows Server 2019 实机安装（installer 静默参数、junction、PS 5.1
-  行为）需第一轮部署时实际验证；`Switch-Current` 需在实机做故障注入
+- Windows Server 2019 external PATH Python 首次安装、现有
+  `D:\AirgapApp` upgrade、junction 与 PS 5.1 行为需第一轮部署时实际验证；
+  `Switch-Current` 需在实机做故障注入
   （临时 junction 创建失败、`current` 改名失败）确认旧指针恢复；
+- 真实 Defender/EDR 触发的 WinError 32/33，以及真实大表数百 Chunk 运行
+  尚未验证；
 - CentOS 7.9 实机 portable Python（glibc 2.17）运行需实机验证；
 - 真实离线 wheelhouse 安装（无 DNS / 无 PyPI）需实机验证。
 

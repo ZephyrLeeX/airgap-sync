@@ -12,8 +12,8 @@ Produces under dist/offline/:
 
 Determinism: runtime dependencies come exclusively from the current uv.lock
 (``uv export --locked`` cross-checked against the lock's dependency closure),
-the application wheel is built from the current checkout, and the pinned
-Python runtimes come from scripts/offline/runtime-versions.json.
+the application wheel is built from the current checkout, and the bundled
+Linux Python runtime comes from scripts/offline/runtime-versions.json.
 """
 
 from __future__ import annotations
@@ -459,29 +459,6 @@ def fetch_linux_runtime(build_dir: Path, spec: dict) -> tuple[Path, str, bool]:
     return artifact, digest, True
 
 
-def fetch_windows_runtime(build_dir: Path, spec: dict) -> tuple[Path, str, bool]:
-    """Download the official CPython installer.
-
-    python.org publishes no machine-readable checksum file next to the
-    installer, so there is no automated upstream verification: a WARNING is
-    recorded and the downloaded artifact's own sha256 is written into the
-    bundle's SHA256SUMS so deploy-side verification is still exact.
-    """
-    downloads = build_dir / "downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
-    artifact = downloads / spec["installer"]
-    if artifact.exists():
-        print(f"  runtime cached: {artifact.name}")
-    else:
-        print(f"  downloading {spec['url']}")
-        fetch_url(spec["url"], artifact)
-    print(
-        "  WARNING: python.org installers have no auto-verifiable upstream checksum; "
-        "recording downloaded artifact sha256 into SHA256SUMS"
-    )
-    return artifact, rm.sha256_file(artifact), False
-
-
 def copy_tree_contents(source: Path, destination: Path) -> None:
     for path in sorted(source.rglob("*")):
         if path.is_dir() or "__pycache__" in path.parts or path.suffix == ".pyc":
@@ -496,7 +473,7 @@ def assemble_bundle(
     platform: str,
     manifest: rm.ReleaseManifest,
     app_wheel: Path,
-    runtime_artifact: Path,
+    runtime_artifact: Path | None,
     wheelhouse: Path,
     test_wheelhouse: Path | None,
 ) -> Path:
@@ -504,11 +481,12 @@ def assemble_bundle(
     bundle_root = build_dir / f"bundle-{platform}" / BUNDLE_ROOT_NAME
     if bundle_root.parent.exists():
         shutil.rmtree(bundle_root.parent)
-    (bundle_root / rm.RUNTIME_DIR_NAME).mkdir(parents=True)
     (bundle_root / rm.APP_DIR_NAME).mkdir(parents=True)
     (bundle_root / rm.WHEELHOUSE_DIR_NAME).mkdir(parents=True)
 
-    shutil.copy2(runtime_artifact, bundle_root / rm.RUNTIME_DIR_NAME / runtime_artifact.name)
+    if runtime_artifact is not None:
+        (bundle_root / rm.RUNTIME_DIR_NAME).mkdir(parents=True)
+        shutil.copy2(runtime_artifact, bundle_root / rm.RUNTIME_DIR_NAME / runtime_artifact.name)
     shutil.copy2(app_wheel, bundle_root / rm.APP_DIR_NAME / app_wheel.name)
     for wheel in sorted(wheelhouse.glob("*.whl")):
         shutil.copy2(wheel, bundle_root / rm.WHEELHOUSE_DIR_NAME / wheel.name)
@@ -677,21 +655,18 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
         print(f"tests:\n  wheels: {wheels}\n  unresolved: 0")
         summary_platforms["tests"] = {"wheels": wheels}
 
-    stage("[7/8] Fetch pinned Python runtimes")
+    stage("[7/8] Fetch pinned Linux Python runtime")
     linux_artifact, linux_sha, linux_verified = fetch_linux_runtime(
         build_dir, runtime_versions["linux_x86_64"]
     )
-    windows_artifact, windows_sha, windows_verified = fetch_windows_runtime(
-        build_dir, runtime_versions["windows"]
-    )
     print(f"  linux   {linux_artifact.name} (upstream checksum verified: {linux_verified})")
-    print(f"  windows {windows_artifact.name} (upstream checksum verified: {windows_verified})")
+    print(f"  windows Python {python_version} x64 required via PATH (not bundled)")
 
     stage("[8/8] Assemble and package release bundles")
     schemas = rm.schema_versions()
     output_dir.mkdir(parents=True, exist_ok=True)
     archives: dict[str, Path] = {}
-    runtime_by_platform = {"windows": windows_artifact, "linux": linux_artifact}
+    runtime_by_platform = {"windows": None, "linux": linux_artifact}
     for platform, spec in PLATFORM_SPECS.items():
         manifest = rm.ReleaseManifest(
             release_id=release_id,
@@ -704,7 +679,16 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
             minimum_glibc=spec["minimum_glibc"],
             source_state_schema=schemas["source_state_schema"],
             destination_metadata_schema=schemas["destination_metadata_schema"],
-            runtime_artifact=runtime_by_platform[platform].name,
+            runtime_policy=(
+                rm.RUNTIME_POLICY_EXTERNAL_PYTHON_PATH
+                if platform == "windows"
+                else rm.RUNTIME_POLICY_BUNDLED
+            ),
+            runtime_artifact=(
+                runtime_by_platform[platform].name
+                if runtime_by_platform[platform] is not None
+                else None
+            ),
             app_wheel=app_wheel.name,
             wheel_count=len(runtime_pins),
             include_tests=include_tests,
@@ -747,14 +731,30 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
             "path": archive_location,
             "size": archive_path.stat().st_size,
             "sha256": rm.sha256_file(archive_path),
-            "runtime_artifact": runtime_by_platform[platform].name,
-            "runtime_sha256": (windows_sha if platform == "windows" else linux_sha),
-            "runtime_upstream_checksum_verified": (
-                windows_verified if platform == "windows" else linux_verified
+            "runtime_policy": (
+                rm.RUNTIME_POLICY_EXTERNAL_PYTHON_PATH
+                if platform == "windows"
+                else rm.RUNTIME_POLICY_BUNDLED
             ),
             "runtime_wheel_count": summary_platforms[platform]["wheels"],
             "non_universal_platform_tags": summary_platforms[platform]["platform_tags"],
         }
+        if platform == "windows":
+            summary["platforms"][spec["archive_suffix"]].update(
+                {
+                    "python_requirement": f"{python_version} x64 via PATH",
+                    "bundled_runtime": False,
+                }
+            )
+        else:
+            summary["platforms"][spec["archive_suffix"]].update(
+                {
+                    "bundled_runtime": True,
+                    "runtime_artifact": linux_artifact.name,
+                    "runtime_sha256": linux_sha,
+                    "runtime_upstream_checksum_verified": linux_verified,
+                }
+            )
     if include_tests:
         summary["test_wheel_count"] = summary_platforms["tests"]["wheels"]
     summary_path = output_dir / "release-summary.json"

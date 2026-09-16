@@ -1,9 +1,7 @@
 {
   "python": "3.13.15",
   "windows": {
-    "installer": "python-3.13.15-amd64.exe",
-    "url": "https://www.python.org/ftp/python/3.13.15/python-3.13.15-amd64.exe",
-    "sha256": null
+    "runtime_policy": "external-python-path"
   },
   "linux_x86_64": {
     "pbs_release": "20260901",

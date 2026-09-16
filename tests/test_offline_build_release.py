@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import build_release as br
+import release_manifest as rm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -105,11 +106,9 @@ class TestRuntimeVersions:
     def test_python_version_is_pinned_xyz(self) -> None:
         assert re.fullmatch(r"\d+\.\d+\.\d+", self.load()["python"])
 
-    def test_windows_installer_from_python_org(self) -> None:
+    def test_windows_uses_external_python_path(self) -> None:
         windows = self.load()["windows"]
-        assert windows["url"].startswith("https://www.python.org/ftp/python/")
-        assert windows["url"].endswith(windows["installer"])
-        assert windows["sha256"] is None  # upstream 提供不了自动校验值
+        assert windows == {"runtime_policy": "external-python-path"}
 
     def test_linux_runtime_is_pbs_install_only_stripped(self) -> None:
         linux = self.load()["linux_x86_64"]
@@ -121,7 +120,6 @@ class TestRuntimeVersions:
 
     def test_versions_consistent_with_pinned_python(self) -> None:
         data = self.load()
-        assert data["python"] in data["windows"]["url"]
         assert data["python"] in data["linux_x86_64"]["artifact"]
 
 
@@ -131,6 +129,72 @@ class TestPlatformSpecs:
         assert br.PLATFORM_SPECS["windows"]["minimum_glibc"] is None
         assert "manylinux2014_x86_64" in br.PLATFORM_SPECS["linux"]["pip_platforms"]
         assert "win_amd64" in br.PLATFORM_SPECS["windows"]["pip_platforms"]
+
+
+class TestBundleRuntimePolicy:
+    @staticmethod
+    def manifest(platform: str, runtime_artifact: str | None) -> rm.ReleaseManifest:
+        return rm.ReleaseManifest(
+            release_id="0.1.0-abcdef0",
+            app_version="0.1.0",
+            git_commit="abcdef0" + "1" * 33,
+            created_at="2026-09-16T00:00:00+00:00",
+            python_version="3.13.15",
+            platform_os=platform,
+            platform_arch="amd64" if platform == "windows" else "x86_64",
+            minimum_glibc=None if platform == "windows" else "2.17",
+            source_state_schema=4,
+            destination_metadata_schema=3,
+            runtime_policy=(
+                rm.RUNTIME_POLICY_EXTERNAL_PYTHON_PATH
+                if platform == "windows"
+                else rm.RUNTIME_POLICY_BUNDLED
+            ),
+            runtime_artifact=runtime_artifact,
+            app_wheel="airgap_sync-0.1.0-py3-none-any.whl",
+            wheel_count=1,
+            include_tests=False,
+        )
+
+    @staticmethod
+    def inputs(tmp_path: Path) -> tuple[Path, Path]:
+        app = tmp_path / "airgap_sync-0.1.0-py3-none-any.whl"
+        app.write_bytes(b"app")
+        wheelhouse = tmp_path / "wheels"
+        wheelhouse.mkdir()
+        (wheelhouse / "click-8.5.0-py3-none-any.whl").write_bytes(b"wheel")
+        return app, wheelhouse
+
+    def test_windows_bundle_has_no_runtime_payload(self, tmp_path: Path) -> None:
+        app, wheelhouse = self.inputs(tmp_path)
+        bundle = br.assemble_bundle(
+            tmp_path / "build",
+            "windows",
+            self.manifest("windows", None),
+            app,
+            None,
+            wheelhouse,
+            None,
+        )
+        assert not (bundle / "runtime").exists()
+        assert not list(bundle.rglob("python-*.exe"))
+        assert not list(bundle.rglob("cpython-*.tar.gz"))
+
+    def test_linux_bundle_keeps_pbs_runtime(self, tmp_path: Path) -> None:
+        app, wheelhouse = self.inputs(tmp_path)
+        runtime_name = "cpython-3.13.15+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        runtime = tmp_path / runtime_name
+        runtime.write_bytes(b"runtime")
+        bundle = br.assemble_bundle(
+            tmp_path / "build",
+            "linux",
+            self.manifest("linux", runtime_name),
+            app,
+            runtime,
+            wheelhouse,
+            None,
+        )
+        assert (bundle / "runtime" / runtime_name).read_bytes() == b"runtime"
 
     def test_linux_download_platforms_reject_generic_linux_and_musl(self) -> None:
         """generic linux_x86_64 / musllinux 不提供 glibc <= 2.17 ABI 承诺。"""

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import zstandard
 
+from airgap_sync.common import fsutil
 from airgap_sync.common.models import ChunkConfig
 from airgap_sync.source.chunk_writer import ChunkWriter, ChunkWriterError, chunk_filename
 
@@ -85,6 +86,45 @@ class TestThresholds:
 
 
 class TestAtomicity:
+    def test_replace_retries_windows_lock_then_succeeds(self, tmp_path, monkeypatch):
+        writer = make_writer(tmp_path)
+        writer.write_row(b"[1]")
+        real_replace = __import__("os").replace
+        attempts = 0
+
+        def locked_once(source, destination):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                error = OSError("sharing violation")
+                error.winerror = 32
+                raise error
+            real_replace(source, destination)
+
+        monkeypatch.setattr("airgap_sync.source.chunk_writer.os.replace", locked_once)
+        monkeypatch.setattr(fsutil.time, "sleep", lambda _: None)
+        (meta,) = writer.finish()
+        final = tmp_path / "run" / meta.file
+        assert final.exists()
+        assert meta.rows == 1
+        assert meta.compressed_bytes == final.stat().st_size
+        assert meta.sha256 == hashlib.sha256(final.read_bytes()).hexdigest()
+
+    def test_replace_exhaustion_raises_chunk_writer_error(self, tmp_path, monkeypatch):
+        writer = make_writer(tmp_path)
+        writer.write_row(b"[1]")
+
+        def always_locked(*_args):
+            error = OSError("sharing violation")
+            error.winerror = 32
+            raise error
+
+        monkeypatch.setattr("airgap_sync.source.chunk_writer.os.replace", always_locked)
+        monkeypatch.setattr(fsutil.time, "sleep", lambda _: None)
+        with pytest.raises(ChunkWriterError, match="cannot finalize chunk") as caught:
+            writer.finish()
+        assert getattr(caught.value.__cause__, "winerror", None) == 32
+
     def test_only_final_names_after_close(self, tmp_path):
         writer = make_writer(tmp_path, max_rows=2)
         write_rows(writer, 4)
@@ -111,6 +151,53 @@ class TestAtomicity:
         writer.abort()
         writer.abort()
         assert list((tmp_path / "run").iterdir()) == []
+
+    def test_abort_unlink_retries_windows_lock_then_succeeds(self, tmp_path, monkeypatch):
+        writer = make_writer(tmp_path)
+        writer.write_row(b"[1]")
+        part = tmp_path / "run" / "chunk-000001.jsonl.zst.part"
+        real_unlink = Path.unlink
+        attempts = 0
+
+        def locked_once(path, *, missing_ok=False):
+            nonlocal attempts
+            if path == part:
+                attempts += 1
+                if attempts == 1:
+                    error = OSError("sharing violation")
+                    error.winerror = 32
+                    raise error
+            return real_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", locked_once)
+        monkeypatch.setattr(fsutil.time, "sleep", lambda _: None)
+        writer.abort()
+        assert attempts == 2
+        assert not part.exists()
+
+    def test_abort_unlink_exhaustion_warns_and_preserves_original_error(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        writer = make_writer(tmp_path)
+        writer.write_row(b"[1]")
+        part = tmp_path / "run" / "chunk-000001.jsonl.zst.part"
+        real_unlink = Path.unlink
+
+        def always_locked(path, *, missing_ok=False):
+            if path == part:
+                error = OSError("sharing violation")
+                error.winerror = 32
+                raise error
+            return real_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", always_locked)
+        monkeypatch.setattr(fsutil.time, "sleep", lambda _: None)
+        original = RuntimeError("scan failed")
+        with pytest.raises(RuntimeError) as caught, writer:
+            raise original
+        assert caught.value is original
+        assert "cannot remove aborted chunk" in caplog.text
+        assert part.exists()
 
     def test_context_exception_aborts_current_but_keeps_closed_chunks(self, tmp_path):
         writer = make_writer(tmp_path, max_rows=100)

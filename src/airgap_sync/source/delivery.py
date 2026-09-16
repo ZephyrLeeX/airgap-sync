@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from airgap_sync.common.fsutil import atomic_write_bytes
+from airgap_sync.common.fsutil import atomic_write_bytes, retry_windows_file_lock
 from airgap_sync.common.manifest import (
     MANIFEST_FILENAME,
     PROTOCOL_VERSION,
@@ -148,7 +148,11 @@ class DeliveryRunner:
                             confirmation.request_id,
                         )
                         try:
-                            item.path.unlink(missing_ok=True)
+                            retry_windows_file_lock(
+                                "unlink",
+                                item.path,
+                                lambda path=item.path: path.unlink(missing_ok=True),
+                            )
                             worker_state.mark_cleanup_error(run_id, item.logical_name, None)
                             with pending_lock:
                                 pending_bytes -= item.size
@@ -391,7 +395,7 @@ class DeliveryRunner:
             run_id, logical_name, confirmation.attempts, confirmation.request_id
         )
         try:
-            path.unlink(missing_ok=True)
+            retry_windows_file_lock("unlink", path, lambda: path.unlink(missing_ok=True))
         except OSError as exc:
             self._state.mark_cleanup_error(run_id, logical_name, str(exc))
 
@@ -401,11 +405,13 @@ class DeliveryRunner:
                 continue
             path = run_dir / artifact.logical_name
             try:
-                path.unlink(missing_ok=True)
+                retry_windows_file_lock(
+                    "unlink", path, lambda cleanup_path=path: cleanup_path.unlink(missing_ok=True)
+                )
                 self._state.mark_cleanup_error(run_id, artifact.logical_name, None)
             except OSError as exc:
                 self._state.mark_cleanup_error(run_id, artifact.logical_name, str(exc))
         try:
-            run_dir.rmdir()
+            retry_windows_file_lock("rmdir", run_dir, run_dir.rmdir)
         except OSError:
             logger.warning("delivered run directory cleanup pending: %s", run_dir)

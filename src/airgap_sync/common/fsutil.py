@@ -8,10 +8,60 @@ Snapshot 的所有最终文件 (chunk / schema.sql / manifest.json) 都必须:
 
 from __future__ import annotations
 
+import logging
 import os
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 PART_SUFFIX = ".part"
+WINDOWS_FILE_LOCK_ERRORS = frozenset({32, 33})
+WINDOWS_FILE_LOCK_RETRY_DELAYS = (0.05, 0.10, 0.25, 0.50, 1.00, 2.00)
+
+logger = logging.getLogger(__name__)
+
+
+def retry_windows_file_lock[T](
+    operation: str,
+    path: Path,
+    action: Callable[[], T],
+    *,
+    delays: Sequence[float] = WINDOWS_FILE_LOCK_RETRY_DELAYS,
+    sleep: Callable[[float], None] | None = None,
+) -> T:
+    """Retry only Windows sharing/lock violations, then re-raise the last error."""
+    max_attempts = len(delays) + 1
+    sleeper = time.sleep if sleep is None else sleep
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = action()
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror not in WINDOWS_FILE_LOCK_ERRORS or attempt == max_attempts:
+                raise
+            delay = delays[attempt - 1]
+            logger.warning(
+                "transient Windows file lock; retrying operation=%s path=%s "
+                "winerror=%s attempt=%d/%d delay=%.2f",
+                operation,
+                path,
+                winerror,
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            sleeper(delay)
+        else:
+            if attempt > 1:
+                logger.debug(
+                    "recovered from transient Windows file lock operation=%s path=%s attempt=%d/%d",
+                    operation,
+                    path,
+                    attempt,
+                    max_attempts,
+                )
+            return result
+    raise AssertionError("unreachable")
 
 
 def fsync_directory(path: Path) -> None:
@@ -43,5 +93,5 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         fh.write(data)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(part, path)
+    retry_windows_file_lock("replace", part, lambda: os.replace(part, path))
     fsync_directory(path.parent)

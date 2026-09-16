@@ -87,12 +87,43 @@ class TestPowerShellStaticConstraints:
         assert "INSTALL_BLOCKED_EXISTING_DEPLOYMENT" in body
         assert "Use upgrade instead of install." in body
         assert "already installed and current; nothing to do" in body
-        # guard 必须发生在安装 runtime / release 之前
-        assert body.index("Get-CurrentReleaseId") < body.index("Install-Runtime $Manifest")
+        # guard 必须发生在 external Python 检查 / release 创建之前
+        assert body.index("Get-CurrentReleaseId") < body.index("Test-ExternalPython $Manifest")
 
-    def test_upgrade_installs_target_runtime_before_sqlite_backup(self) -> None:
+    def test_upgrade_checks_path_python_before_sqlite_backup(self) -> None:
         body = ps1_function_body("Do-Upgrade")
-        assert body.index("Install-Runtime $Manifest") < body.index("Backup-Sqlite $Manifest")
+        assert body.index("Test-ExternalPython $Manifest") < body.index("Backup-Sqlite")
+
+    def test_external_python_preflight_is_strict_and_creates_real_venv(self) -> None:
+        body = ps1_function_body("Test-ExternalPython")
+        assert "Get-Command python" in body
+        assert "--version" in body
+        assert "-ne $Manifest.python_version" in body
+        assert 'struct.calcsize("P") * 8' in body
+        assert "Windows Python must be 64-bit" in body
+        for module in ("ssl", "sqlite3", "ctypes", "zlib", "venv"):
+            assert module in body
+        assert "airgap-sync-python-smoke-" in body
+        assert "'-m', 'venv'" in body
+        assert "Scripts\\python.exe" in body
+
+    def test_windows_script_contains_no_python_installer_logic(self) -> None:
+        text = DEPLOY_PS1.read_text(encoding="utf-8")
+        for forbidden in (
+            "PythonExe",
+            "InstallAllUsers",
+            "TargetDir=",
+            "AssociateFiles",
+            "Include_launcher",
+            "Start-Process -FilePath $installer",
+            "C:\\Python313",
+            "D:\\Python313",
+        ):
+            assert forbidden not in text
+
+    def test_rollback_does_not_check_path_python(self) -> None:
+        body = ps1_function_body("Do-Rollback")
+        assert "Test-ExternalPython" not in body
 
     def test_switch_current_stages_junction_before_retiring_old(self) -> None:
         body = ps1_function_body("Switch-Current")
@@ -233,6 +264,7 @@ def build_test_bundle(
         minimum_glibc="2.17",
         source_state_schema=4,
         destination_metadata_schema=3,
+        runtime_policy=rm.RUNTIME_POLICY_BUNDLED,
         runtime_artifact=runtime_artifact,
         app_wheel=app_wheel,
         wheel_count=1,

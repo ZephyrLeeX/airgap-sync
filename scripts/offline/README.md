@@ -9,7 +9,7 @@ Full operator documentation: `docs/offline-deployment.md`.
 | File | Purpose |
 | --- | --- |
 | `build_release.py` | Runs on a networked dev machine; builds both bundles into `dist/offline/` |
-| `runtime-versions.json` | The single place where Python runtime versions/URLs are pinned |
+| `runtime-versions.json` | Python version source of truth, Windows external policy, and Linux runtime pin |
 | `release_manifest.py` | Shared manifest/SHA256SUMS/schema helpers; copied into every bundle |
 | `airgap-sync-deploy.sh` | Linux deploy script (bundled; CentOS 7 base tools only) |
 | `airgap-sync-deploy.ps1` | Windows deploy script (bundled; PowerShell 5.1 compatible) |
@@ -27,10 +27,10 @@ locked, all runtime dependencies resolve to binary wheels for both
 `win_amd64` and `manylinux2014_x86_64` (any sdist-only dependency fails the
 build), every non-universal Linux wheel carries at least one glibc <= 2.17
 compatible platform tag (generic `linux_x86_64` / `musllinux` /
-`manylinux_2_18+`-only wheels fail the build), runtime checksums verified
-against python-build-standalone upstream SHA256SUMS (python.org installers
-carry no machine-readable checksum: a warning is printed and the artifact
-hash is recorded in the bundle's SHA256SUMS instead).
+`manylinux_2_18+`-only wheels fail the build), and the bundled Linux runtime
+checksum is verified against python-build-standalone upstream SHA256SUMS.
+Windows bundles contain no Python installer or runtime archive; Windows
+administrators provide the exactly pinned x64 Python through PATH.
 
 ## Deploy (offline machine)
 
@@ -47,10 +47,10 @@ guard and switch failure recovery.
 
 Bundle-consuming actions verify `SHA256SUMS` before sourcing `release.env`;
 SHA256SUMS entries must stay inside the bundle (no absolute paths, no `..`).
-Upgrades install the target Python runtime side-by-side BEFORE the SQLite
-backup so Python patch upgrades (3.13.x -> 3.13.y) can always complete the
-backup. The Windows `current` switch stages a GUID-named junction first and
-restores the old pointer if the switch fails.
+Windows install and upgrade validate the exact PATH Python version,
+architecture, standard-library modules, and temporary venv creation before
+creating the per-release venv. The Windows `current` switch stages a
+GUID-named junction first and restores the old pointer if the switch fails.
 
 ## Tests
 
