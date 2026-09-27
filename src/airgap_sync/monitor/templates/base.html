@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airgap Sync · {{ page|title }}</title><link rel="stylesheet" href="/static/monitor.css"></head>
+<body><header><div class="brand">Airgap Sync <span>Destination Monitor</span></div><nav>
+<a href="/" {% if page == 'overview' %}class="active"{% endif %}>Overview</a>
+<a href="/tables" {% if page == 'tables' %}class="active"{% endif %}>Tables</a>
+<a href="/runs" {% if page == 'runs' %}class="active"{% endif %}>Runs</a>
+<a href="/system" {% if page == 'system' %}class="active"{% endif %}>System</a>
+<a href="/problems" {% if page == 'problems' %}class="active"{% endif %}>Problems</a>
+</nav></header><main><div class="heading"><div><h1>{% block title %}{% endblock %}</h1><p>Destination-only facts · {{ data.timezone }} · Updated {{ data.generated_at }}</p></div><span class="badge {{ data.status|lower }}">{{ data.status }}</span></div>
+{% if data.query_error %}<div class="notice">{{ data.query_error }}. Database facts may be unavailable.</div>{% endif %}
+{% block content %}{% endblock %}</main><footer>M1 is destination-only. Source telemetry is unavailable until M2/M3. Alerts arrive in M4.</footer><script src="/static/monitor.js" defer></script></body></html>

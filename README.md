@@ -55,7 +55,7 @@ outbox/<table>/<run_id>/
 - 扫描前后各取一次 DDL，结构变化则 Run FAILED（`SCHEMA_CHANGED_DURING_SNAPSHOT`），不产生结构错配的快照；
 - 验证摘要是与行顺序无关的 multiset digest（`row_count` + `digest_a` + `digest_b`），供目标端导入后复算比对。
 
-以下能力**尚未实现**：Web UI（它不是 V1 数据同步正确性的必要组成）。
+Monitoring M1 提供独立的 Destination 只读 Web 控制台，见 [Monitoring M1](docs/monitoring-m1.md)。
 FTP Client 是现有外部链路组件，不属于本项目。
 
 ## 环境要求

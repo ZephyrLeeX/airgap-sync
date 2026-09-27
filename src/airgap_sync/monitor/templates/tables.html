@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% block title %}Tables{% endblock %}{% block content %}
+<p class="intro">Rows and 净增 come from verified metadata; no business tables are scanned.</p>
+<div class="table-wrap"><table><thead><tr><th>Source database</th><th>Table</th><th>Latest VERIFIED</th><th>Row count</th><th>本次净增</th><th>月度净增</th><th>Data age</th><th>Latest Destination status</th><th>Latest error</th></tr></thead><tbody>
+{% for item in data.tables %}<tr><td>{{ item.source_database }}</td><td>{{ item.table_name }}</td><td title="{{ item.verified_at }}">{{ item.verified_display }}</td><td>{{ '{:,}'.format(item.row_count) }}</td><td>{{ item.this_run_net if item.this_run_net is not none else '—' }}</td><td>{{ item.monthly_net if item.monthly_net is not none else '—' }}</td><td>{{ item.data_age }}</td><td><span class="badge {{ item.latest_status|lower }}">{{ item.latest_status }}</span></td><td class="error" title="{{ item.latest_error or '' }}">{{ item.latest_error or '—' }}</td></tr>{% else %}<tr><td colspan="9">No verified table metadata available</td></tr>{% endfor %}
+</tbody></table></div>{% endblock %}

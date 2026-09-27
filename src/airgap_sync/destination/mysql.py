@@ -100,6 +100,40 @@ class TableVersion:
     applied_at: datetime
 
 
+@dataclass(frozen=True)
+class MonitoringRunRecord:
+    run_id: str
+    source_database: str
+    table_name: str
+    status: str
+    expected_rows: int
+    actual_rows: int | None
+    chunk_count: int
+    source_created_at: datetime
+    manifest_received_at: datetime
+    validated_at: datetime | None
+    import_started_at: datetime | None
+    import_completed_at: datetime | None
+    digest_verified_at: datetime | None
+    applied_at: datetime | None
+    updated_at: datetime
+    last_error: str | None
+    cleanup_error: str | None
+    backup_cleanup_error: str | None
+    incoming_cleanup_completed_at: datetime | None
+    backup_cleanup_completed_at: datetime | None
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return (
+            self.status == "VERIFIED"
+            and (
+                self.incoming_cleanup_completed_at is None
+                or self.backup_cleanup_completed_at is None
+            )
+        ) or (self.status == "SUPERSEDED" and self.incoming_cleanup_completed_at is None)
+
+
 class DestinationMySQLConnection:
     """不公开任意 SQL，只暴露同步协议所需的固定操作。"""
 
@@ -827,3 +861,45 @@ class DestinationMySQLConnection:
             "source_created_at"
         )
         return [self._version(row) for row in rows]
+
+    def monitoring_runs(self, limit: int = 200) -> list[MonitoringRunRecord]:
+        """Recent destination facts in one bounded, SELECT-only query (MySQL 5.6)."""
+        return self._monitoring_query("", "updated_at", limit)
+
+    def monitoring_active_runs(self) -> list[MonitoringRunRecord]:
+        """Active runs stay visible even when older than the recent-runs window."""
+        return self._monitoring_query(
+            "WHERE status IN ('VALIDATED','IMPORTING','STAGED','VERIFYING','SWAPPING')",
+            "updated_at",
+            20,
+        )
+
+    def _monitoring_query(
+        self, where: str, order_column: str, limit: int
+    ) -> list[MonitoringRunRecord]:
+        # All SQL fragments are internal constants; callers cannot supply SQL.
+        rows = self._fetchall(
+            "SELECT run_id,source_database,table_name,status,row_count,actual_row_count,"
+            "chunk_count,source_created_at,manifest_received_at,validated_at,"
+            "import_started_at,import_completed_at,digest_verified_at,applied_at,"
+            "updated_at,last_error,cleanup_error,backup_cleanup_error,"
+            "incoming_cleanup_completed_at,backup_cleanup_completed_at "
+            f"FROM {self._metadata}.runs {where} ORDER BY {order_column} DESC LIMIT %s",
+            (limit,),
+        )
+        return [MonitoringRunRecord(*row) for row in rows]
+
+    def monitoring_counts(self) -> dict[str, int]:
+        """Full counts without fetching all historical runs."""
+        rows = self._fetchall(
+            "SELECT status,COUNT(*) FROM " + self._metadata + ".runs GROUP BY status"
+        )
+        counts = {str(status): int(count) for status, count in rows}
+        row = self._fetchone(
+            "SELECT COUNT(*) FROM " + self._metadata + ".runs WHERE "
+            "(status='VERIFIED' AND (incoming_cleanup_completed_at IS NULL OR "
+            "backup_cleanup_completed_at IS NULL)) OR "
+            "(status='SUPERSEDED' AND incoming_cleanup_completed_at IS NULL)"
+        )
+        counts["cleanup_pending"] = int(row[0]) if row else 0
+        return counts

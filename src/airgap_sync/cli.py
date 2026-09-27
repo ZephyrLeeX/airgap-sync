@@ -99,6 +99,26 @@ def destination_group() -> None:
     """Destination 端命令。"""
 
 
+@destination_group.command("monitor-web")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", type=click.IntRange(1, 65535), default=8080, show_default=True)
+def destination_monitor_web(config_path: Path, host: str, port: int) -> None:
+    """Run the independent read-only Destination dashboard."""
+    import uvicorn
+
+    from airgap_sync.monitor.app import create_app
+
+    config = load_config(config_path)
+    _require_destination_role(config)
+    uvicorn.run(create_app(config), host=host, port=port)
+
+
 @destination_group.command("check")
 @click.option(
     "--config",

@@ -1,0 +1,17 @@
+{% extends "base.html" %}{% block title %}Overview{% endblock %}{% block content %}
+<div class="cards">
+<article><label>Destination worker</label><strong>{{ data.system.worker.status }}</strong><small>{{ data.system.worker.detail }}</small></article>
+<article><label>RDS connectivity</label><strong>{{ data.rds }}</strong><small>MySQL {{ data.mysql_version or '—' }}</small></article>
+<article><label>Metadata schema</label><strong>{{ data.metadata_status }}</strong><small>Version {{ data.metadata_version if data.metadata_version is not none else '—' }}</small></article>
+<article><label>Latest VERIFIED</label><strong>{{ data.latest_verified.run_id if data.latest_verified else '—' }}</strong><small>{{ data.latest_verified.display_timestamps.applied_at if data.latest_verified else 'Unavailable' }}</small></article>
+<article><label>Active Destination run</label><strong>{{ data.active_run.run_id if data.active_run else '—' }}</strong><small>{{ data.active_run.status if data.active_run else 'None observed' }}</small></article>
+<article><label>FAILED / MISMATCH</label><strong>{{ (data.counts.get('FAILED', 0) ~ ' / ' ~ data.counts.get('MISMATCH', 0)) if data.counts is not none else '—' }}</strong></article>
+<article><label>Incoming candidates</label><strong>{{ data.system.incoming_candidates if data.system.incoming_candidates is not none else '—' }}</strong></article>
+<article><label>Cleanup pending</label><strong>{{ data.counts.get('cleanup_pending', 0) if data.counts is not none else '—' }}</strong></article>
+<article><label>Max data age</label><strong>{{ data.max_data_age or '—' }}</strong></article>
+<article><label>Destination free space</label><strong>{{ data.system.filesystems[0].free|filesizeformat if data.system.filesystems else '—' }}</strong></article>
+<article><label>Agent version</label><strong>{{ data.system.version }}</strong></article>
+<article><label>Hostname / OS</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
+<article><label>Uptime</label><strong>{{ data.system.uptime or '—' }}</strong></article>
+<article><label>Memory available</label><strong>{{ data.system.memory_available|filesizeformat if data.system.memory_available is not none else '—' }}</strong></article>
+</div>{% endblock %}

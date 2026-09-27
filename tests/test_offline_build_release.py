@@ -31,6 +31,11 @@ class TestLockClosures:
             "zstandard",
             "tzdata",
             "certifi",
+            "fastapi",
+            "starlette",
+            "jinja2",
+            "uvicorn",
+            "markupsafe",
         ):
             assert name in runtime, name
         assert re.fullmatch(r"\d+\.\d+\.\d+", runtime["click"])

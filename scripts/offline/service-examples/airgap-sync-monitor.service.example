@@ -1,0 +1,15 @@
+# Independent Destination monitor service. Copy to /etc/systemd/system/airgap-sync-monitor.service.
+[Unit]
+Description=Airgap Sync destination monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EnvironmentFile=/etc/airgap-sync/destination.env
+ExecStart=/opt/airgap-sync/current/venv/bin/airgap-sync destination monitor-web --config /etc/airgap-sync/destination.yaml --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
