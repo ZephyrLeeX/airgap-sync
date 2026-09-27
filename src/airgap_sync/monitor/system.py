@@ -102,30 +102,39 @@ def system_snapshot(incoming_dir: Path) -> dict:
         )
     except OSError:
         pass
-    seen = set()
+    by_device: dict[int, dict] = {}
     for label, path in (
         ("root", Path("/")),
         ("incoming", incoming_dir),
         ("install", Path(__file__).resolve()),
     ):
         try:
-            resolved = path if path.exists() else path.parent
-            device = os.stat(resolved).st_dev
-            if device in seen:
+            device = os.stat(path).st_dev
+            if device in by_device:
+                by_device[device]["locations"].append({"label": label, "path": str(path)})
                 continue
-            seen.add(device)
-            usage = shutil.disk_usage(resolved)
+            usage = shutil.disk_usage(path)
+            entry = {
+                "label": label,
+                "path": str(path),
+                "locations": [{"label": label, "path": str(path)}],
+                "total": usage.total,
+                "free": usage.free,
+                "used_percent": round(100 * usage.used / usage.total, 1),
+            }
+            by_device[device] = entry
+            result["filesystems"].append(entry)
+        except (OSError, ZeroDivisionError):
             result["filesystems"].append(
                 {
                     "label": label,
-                    "path": str(resolved),
-                    "total": usage.total,
-                    "free": usage.free,
-                    "used_percent": round(100 * usage.used / usage.total, 1),
+                    "path": str(path),
+                    "locations": [{"label": label, "path": str(path)}],
+                    "total": None,
+                    "free": None,
+                    "used_percent": None,
                 }
             )
-        except (OSError, ZeroDivisionError):
-            continue
     try:
         if not incoming_dir.is_dir():
             raise OSError("incoming directory unavailable")

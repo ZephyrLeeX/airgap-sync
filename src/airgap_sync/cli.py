@@ -94,6 +94,30 @@ def source_group() -> None:
     """Source 端命令。"""
 
 
+@source_group.command("monitor-report")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def source_monitor_report(config_path: Path) -> None:
+    """Collect and best-effort upload one Source telemetry sample."""
+    from airgap_sync.source.monitor_report import report
+
+    config = load_config(config_path)
+    _require_source_role(config)
+    if config.monitoring is None or config.relay is None:
+        raise ConfigError("monitoring and relay configuration are required for monitor-report")
+    ok, reason = report(config, config_path)
+    if ok:
+        click.echo("Source telemetry accepted by Relay")
+    elif reason == "UPLOAD_SKIPPED":
+        logger.warning("Source telemetry upload skipped")
+    else:
+        logger.warning("Source telemetry not accepted: %s", reason)
+
+
 @cli.group("destination")
 def destination_group() -> None:
     """Destination 端命令。"""

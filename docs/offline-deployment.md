@@ -154,6 +154,10 @@ $cli = "C:\Program Files\AirgapSync\current\venv\Scripts\airgap-sync.exe"
 
 ### Windows 目录布局（默认）
 
+独立 Source telemetry 任务的配置和 Task Scheduler 安装步骤见
+[Monitoring M2](monitoring-m2.md)（离线包中为 `MONITORING-M2.md`）。离线包的 `service/run-source-monitor.ps1`
+与现有 worker wrapper 分开运行，不会修改 worker 任务。
+
 ```text
 C:\Program Files\AirgapSync\
 ├── releases\<release-id>\venv\      # 每个 release 独立 venv + installed.json
@@ -404,6 +408,24 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -Config "C:\ProgramData\AirgapSync\config\source.yaml" `
   -LogFile "D:\AirgapApp\logs\source-worker.log"
 ```
+
+使用独立 Monitoring M2 Reporter 时，显式配置日志专用目录，与上面的
+`-LogFile` 父目录一致；`data_dir` 可以位于其他盘符。Reporter 不猜测安装位置：
+
+```yaml
+monitoring:
+  node_id: source-01
+  log_dirs:
+    - 'D:\AirgapApp\logs'
+```
+
+Monitor wrapper 默认也写入 `<InstallRoot>\logs`。自定义日志路径时，安装 Monitor
+任务可传 `install-source-monitor-task.ps1 -InstallRoot 'D:\AirgapApp'
+-Config 'C:\ProgramData\AirgapSync\config\source.yaml'
+-LogFile 'F:\AirgapLogs\source-monitor.log'`；把 `F:\AirgapLogs` 也加入
+`monitoring.log_dirs`（若两者共用目录只列一次）。未配置时日志容量为未知；显式
+目录不存在时为 0。不要配置整个安装目录或系统共享日志目录。
+完整配置、权限和现场验证要求见 [Monitoring M2](monitoring-m2.md)。
 
 计划任务只在开机时启动一个常驻 Source Worker，不要另设“每 7 天”触发。
 同步周期与失败重试由配置控制：

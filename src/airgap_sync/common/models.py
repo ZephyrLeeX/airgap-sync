@@ -9,6 +9,8 @@ V1 统一 Full Snapshot 同步: 表配置只有 name / enabled,
 
 from __future__ import annotations
 
+import os
+import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Self
@@ -173,6 +175,42 @@ class DestinationConfig(BaseModel):
         return self
 
 
+class SourceMonitoringConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    worker_task_name: str = "Airgap Sync Source Worker"
+    collect_cpu: bool = True
+    collect_memory: bool = True
+    managed_storage_interval: str = "1h"
+    log_dirs: list[Path] = Field(default_factory=list, max_length=8)
+    upload_connect_timeout_seconds: float = Field(default=3, gt=0, le=30)
+    upload_read_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    upload_max_attempts: int = Field(default=2, ge=1, le=3)
+
+    @model_validator(mode="after")
+    def validate_monitoring(self) -> Self:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", self.node_id):
+            raise ValueError("monitoring.node_id must be a safe filename component")
+        if not self.worker_task_name.strip():
+            raise ValueError("monitoring.worker_task_name must not be blank")
+        for path in self.log_dirs:
+            if not path.is_absolute() or path == Path(path.anchor):
+                raise ValueError(
+                    "monitoring.log_dirs must contain absolute project log directories"
+                )
+        normalized = [Path(os.path.abspath(path)) for path in self.log_dirs]
+        for index, path in enumerate(normalized):
+            if any(
+                path == other or path in other.parents or other in path.parents
+                for other in normalized[:index]
+            ):
+                raise ValueError("monitoring.log_dirs must not overlap")
+        if parse_duration(self.managed_storage_interval) < 1800:
+            raise ValueError("monitoring.managed_storage_interval must be at least 30m")
+        return self
+
+
 class TableConfig(BaseModel):
     """单张同步表的配置。
 
@@ -209,6 +247,7 @@ class AppConfig(BaseModel):
     destination_worker: DestinationWorkerConfig = DestinationWorkerConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
     destination: DestinationConfig | None = None
+    monitoring: SourceMonitoringConfig | None = None
     tables: list[TableConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")

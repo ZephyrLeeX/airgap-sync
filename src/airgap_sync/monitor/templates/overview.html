@@ -9,7 +9,7 @@
 <article><label>Incoming candidates</label><strong>{{ data.system.incoming_candidates if data.system.incoming_candidates is not none else '—' }}</strong></article>
 <article><label>Cleanup pending</label><strong>{{ data.counts.get('cleanup_pending', 0) if data.counts is not none else '—' }}</strong></article>
 <article><label>Max data age</label><strong>{{ data.max_data_age or '—' }}</strong></article>
-<article><label>Destination free space</label><strong>{{ data.system.filesystems[0].free|filesizeformat if data.system.filesystems else '—' }}</strong></article>
+{% for fs in data.system.filesystems %}<article><label>Free space · {% for location in fs.locations %}{{ location.label }}{% if not loop.last %}, {% endif %}{% endfor %}</label><strong>{{ fs.free|filesizeformat if fs.free is not none else '—' }}</strong><small>{% for location in fs.locations %}{{ location.label }}: {{ location.path }}{% if not loop.last %} · {% endif %}{% endfor %} · Used {{ fs.used_percent ~ '%' if fs.used_percent is not none else 'unknown' }}</small></article>{% else %}<article><label>Free space</label><strong>—</strong><small>Filesystem information unavailable</small></article>{% endfor %}
 <article><label>Agent version</label><strong>{{ data.system.version }}</strong></article>
 <article><label>Hostname / OS</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
 <article><label>Uptime</label><strong>{{ data.system.uptime or '—' }}</strong></article>

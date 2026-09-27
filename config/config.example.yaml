@@ -60,6 +60,21 @@ maintenance:
   # Source 不使用此项；保留默认值便于两端配置结构一致。
   destination_orphan_retention: 30d
 
+# 可选：仅独立 source monitor-report 命令使用；现有 worker 不读取此节。
+# monitoring:
+#   node_id: source-01
+#   worker_task_name: Airgap Sync Source Worker
+#   collect_cpu: true
+#   collect_memory: true
+#   managed_storage_interval: 1h
+#   # 仅列出本项目日志专用绝对目录，须与 Worker/Monitor wrapper 的 -LogFile 父目录一致。
+#   # 未配置时 logs_bytes 为 null；显式目录不存在时为 0。支持独立安装目录与自定义日志目录。
+#   log_dirs:
+#     - 'D:\AirgapApp\logs'
+#   upload_connect_timeout_seconds: 3
+#   upload_read_timeout_seconds: 10
+#   upload_max_attempts: 2
+
 tables:
   # 所有表统一 FULL_SNAPSHOT: 只需要 name 和 enabled。
   # 不需要配置主键、逻辑键或同步模式。

@@ -16,6 +16,8 @@ from airgap_sync.destination.mysql import (
 from airgap_sync.destination.statistics import calculate_statistics
 from airgap_sync.monitor.system import system_snapshot
 
+MONITOR_DB_TIMEOUT_SECONDS = 3
+
 
 def utc(value: datetime | None) -> datetime | None:
     if value is None:
@@ -111,7 +113,10 @@ def snapshot(config: AppConfig) -> dict:
         data["problems"].append("Destination worker status unknown")
     if system["incoming_error"]:
         data["problems"].append("Incoming discovery unavailable")
-    connection = DestinationMySQLConnection(config.mysql, config.destination)
+    connection = DestinationMySQLConnection(
+        config.mysql, config.destination, monitor_timeout=MONITOR_DB_TIMEOUT_SECONDS
+    )
+    latest_runs: list[dict] = []
     try:
         with connection:
             data["mysql_version"] = connection.ping()
@@ -123,8 +128,9 @@ def snapshot(config: AppConfig) -> dict:
                 data["problems"].append("Metadata schema mismatch")
             else:
                 data["metadata_status"] = "OK"
-                # Each section is independent, so a query failure leaves local facts visible.
+                # Keep completed sections, then stop on the first failed query.
                 for section, query in (
+                    ("latest_runs", connection.monitoring_latest_runs),
                     ("runs", lambda: connection.monitoring_runs()),
                     ("active", lambda: connection.monitoring_active_runs()),
                     ("counts", lambda: connection.monitoring_counts()),
@@ -132,7 +138,9 @@ def snapshot(config: AppConfig) -> dict:
                 ):
                     try:
                         rows = query()
-                        if section == "runs":
+                        if section == "latest_runs":
+                            latest_runs = [_run(row, now, zone, secrets) for row in rows]
+                        elif section == "runs":
                             data["runs"] = [_run(row, now, zone, secrets) for row in rows]
                         elif section == "active":
                             data["active_run"] = _run(rows[0], now, zone, secrets) if rows else None
@@ -172,6 +180,9 @@ def snapshot(config: AppConfig) -> dict:
                             ]
                     except Exception:
                         data["query_error"] = "Metadata query unavailable"
+                        # A timed-out socket is unusable. Do not pay the read
+                        # timeout again for each remaining section.
+                        break
     except Exception:
         # MySQL and config errors may include credentials, host details, or environment names.
         data["query_error"] = (
@@ -188,15 +199,43 @@ def snapshot(config: AppConfig) -> dict:
         data["problems"].append("Metadata unavailable")
     if data["query_error"]:
         data["problems"].append(data["query_error"])
+    known_failures = {}
     if data["counts"] is not None:
         for state in ("FAILED", "MISMATCH"):
             if data["counts"].get(state, 0):
                 data["problems"].append(f"{state} runs: {data['counts'][state]}")
         if data["counts"].get("cleanup_pending", 0):
             data["problems"].append(f"Cleanup pending: {data['counts']['cleanup_pending']}")
-    latest_by_table = {}
-    for run in data["runs"]:
-        latest_by_table.setdefault((run["source_database"], run["table_name"]), run)
+    else:
+        # These are observed runs, not a substitute for the unavailable global counts.
+        for run in (*latest_runs, *data["runs"]):
+            if run["status"] in ("FAILED", "MISMATCH"):
+                known_failures.setdefault(run["run_id"], run)
+        for run in known_failures.values():
+            data["problems"].append(
+                f"Known {run['status']} run: {run['run_id']} "
+                f"({run['source_database']}.{run['table_name']})"
+            )
+    latest_by_table = {(run["source_database"], run["table_name"]): run for run in latest_runs}
+    table_by_identity = {
+        (table["source_database"], table["table_name"]): table for table in data["tables"]
+    }
+    for identity in latest_by_table:
+        if identity not in table_by_identity:
+            table = {
+                "source_database": identity[0],
+                "table_name": identity[1],
+                "row_count": None,
+                "this_run_net": None,
+                "monthly_net": None,
+                "verified_at": None,
+                "verified_display": "—",
+                "data_age": "—",
+                "data_age_seconds": None,
+                "run_id": None,
+            }
+            data["tables"].append(table)
+            table_by_identity[identity] = table
     for table in data["tables"]:
         latest = latest_by_table.get((table["source_database"], table["table_name"]))
         table["latest_status"] = latest["status"] if latest else "—"
@@ -204,18 +243,26 @@ def snapshot(config: AppConfig) -> dict:
     data["tables"].sort(
         key=lambda row: (
             row["latest_status"] not in ("FAILED", "MISMATCH"),
-            -row["data_age_seconds"],
+            -(row["data_age_seconds"] or 0),
+            row["source_database"],
+            row["table_name"],
         )
     )
-    oldest = max(data["tables"], key=lambda row: row["data_age_seconds"], default=None)
+    known_age = [table for table in data["tables"] if table["data_age_seconds"] is not None]
+    oldest = max(known_age, key=lambda row: row["data_age_seconds"], default=None)
     data["max_data_age"] = oldest["data_age"] if oldest else None
     if (
-        data["rds"] == "DISCONNECTED"
-        or any(data["counts"] and data["counts"].get(x, 0) for x in ("FAILED", "MISMATCH"))
+        any(data["counts"] and data["counts"].get(x, 0) for x in ("FAILED", "MISMATCH"))
+        or known_failures
         or system["worker"]["status"] == "NOT RUNNING"
     ):
         data["status"] = "CRITICAL"
-    elif data["query_error"] or data["metadata_status"] != "OK" or system["incoming_error"]:
+    elif (
+        data["rds"] == "DISCONNECTED"
+        or data["query_error"]
+        or data["metadata_status"] != "OK"
+        or system["incoming_error"]
+    ):
         data["status"] = "DEGRADED"
     elif system["worker"]["status"] == "UNKNOWN":
         data["status"] = "UNKNOWN"

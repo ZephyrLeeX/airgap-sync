@@ -137,25 +137,41 @@ class MonitoringRunRecord:
 class DestinationMySQLConnection:
     """不公开任意 SQL，只暴露同步协议所需的固定操作。"""
 
-    def __init__(self, mysql: MySQLConfig, destination: DestinationConfig) -> None:
+    def __init__(
+        self,
+        mysql: MySQLConfig,
+        destination: DestinationConfig,
+        *,
+        monitor_timeout: int | None = None,
+    ) -> None:
         self._config = mysql
         self._destination = destination
         self._metadata = quote_identifier(destination.metadata_database)
         self._conn: pymysql.Connection | None = None
         self._supports_generation_expression: bool | None = None
+        self._monitor_timeout = monitor_timeout
 
     def connect(self) -> None:
         if self._conn is not None:
             return
         password = resolve_password(self._config)
         try:
+            timeout_options = (
+                {
+                    "connect_timeout": self._monitor_timeout,
+                    "read_timeout": self._monitor_timeout,
+                    "write_timeout": self._monitor_timeout,
+                }
+                if self._monitor_timeout is not None
+                else {"connect_timeout": self._config.connect_timeout}
+            )
             self._conn = pymysql.connect(
                 host=self._config.host,
                 port=self._config.port,
                 user=self._config.user,
                 password=password,
                 database=self._config.database,
-                connect_timeout=self._config.connect_timeout,
+                **timeout_options,
                 charset="utf8mb4",
                 autocommit=True,
             )
@@ -865,6 +881,30 @@ class DestinationMySQLConnection:
     def monitoring_runs(self, limit: int = 200) -> list[MonitoringRunRecord]:
         """Recent destination facts in one bounded, SELECT-only query (MySQL 5.6)."""
         return self._monitoring_query("", "updated_at", limit)
+
+    def monitoring_latest_runs(self) -> list[MonitoringRunRecord]:
+        """One run per table by snapshot time, receipt time, then run ID.
+
+        Cleanup changes updated_at, so it cannot order business runs. The
+        correlated anti-join works on MySQL 5.6 and has no global window.
+        """
+        rows = self._fetchall(
+            "SELECT r.run_id,r.source_database,r.table_name,r.status,r.row_count,"
+            "r.actual_row_count,r.chunk_count,r.source_created_at,"
+            "r.manifest_received_at,r.validated_at,r.import_started_at,"
+            "r.import_completed_at,r.digest_verified_at,r.applied_at,r.updated_at,"
+            "r.last_error,r.cleanup_error,r.backup_cleanup_error,"
+            "r.incoming_cleanup_completed_at,r.backup_cleanup_completed_at "
+            f"FROM {self._metadata}.runs r WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {self._metadata}.runs newer WHERE "
+            "newer.source_database=r.source_database AND newer.table_name=r.table_name "
+            "AND (newer.source_created_at>r.source_created_at OR "
+            "(newer.source_created_at=r.source_created_at AND "
+            "newer.manifest_received_at>r.manifest_received_at) OR "
+            "(newer.source_created_at=r.source_created_at AND "
+            "newer.manifest_received_at=r.manifest_received_at AND newer.run_id>r.run_id)))"
+        )
+        return [MonitoringRunRecord(*row) for row in rows]
 
     def monitoring_active_runs(self) -> list[MonitoringRunRecord]:
         """Active runs stay visible even when older than the recent-runs window."""
