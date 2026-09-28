@@ -143,6 +143,31 @@ def destination_monitor_web(config_path: Path, host: str, port: int) -> None:
     uvicorn.run(create_app(config), host=host, port=port)
 
 
+@destination_group.command("monitor-ingest")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def destination_monitor_ingest(config_path: Path) -> None:
+    """Run one bounded telemetry ingestion round (stable files may need another invocation)."""
+    from airgap_sync.monitor.ingest import Ingestor
+
+    config = load_config(config_path)
+    _require_destination_role(config)
+    if config.monitor_ingest is None:
+        raise ConfigError("monitor_ingest configuration is required")
+    try:
+        with Ingestor(config.monitor_ingest) as ingestor:
+            counts = ingestor.tick()
+    except Exception:
+        raise click.ClickException("Monitor ingest unavailable or already owned") from None
+    click.echo("Monitor ingest: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+    if counts["error"]:
+        raise click.ClickException("Monitor ingest round incomplete; files retained")
+
+
 @destination_group.command("check")
 @click.option(
     "--config",

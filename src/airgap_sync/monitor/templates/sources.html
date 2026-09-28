@@ -1,0 +1,23 @@
+<h2>Source observations · {{ data.sources.status }}</h2>
+<p>Ingest: {{ data.ingest_status }}. Times below use {{ data.timezone }}. Observations do not assert Destination verification or heartbeat recovery.</p>
+{% for sample in data.sources.samples %}{% set p = sample.payload %}
+<section><h3>{{ p.node_id }} · {{ p.host.hostname if p.host.hostname is not none else 'Unknown' }}</h3>
+<p>{{ p.host.os if p.host.os is not none else 'Unknown OS' }} · Agent {{ p.agent_version }} · Host boot: {{ p.host.boot_time|display_time }}</p>
+<p>Source captured: {{ p.captured_at|display_time }} · Destination received: {{ sample.received_at|display_time }} · Age: {{ sample.age_seconds|round(0) }} seconds</p>
+<p>Worker: {{ p.worker.status }} · PID: {{ p.worker.pid if p.worker.pid is not none else 'Unknown' }} · Task Scheduler: {{ p.worker.task_status }}</p>
+<div class="cards">
+{% for key, value in p.system.items() %}<article><label>{{ key }}</label><strong>{{ value if value is not none else 'Unknown' }}</strong></article>{% endfor %}
+</div>
+<h4>Filesystems</h4><div class="table-wrap"><table><thead><tr><th>Locations</th><th>Mount</th><th>Total bytes</th><th>Free bytes</th><th>Free %</th></tr></thead><tbody>
+{% for fs in p.filesystems %}<tr><td>{{ fs.locations|join(', ') }}</td><td>{{ fs.mount if fs.mount is not none else 'Unknown' }}</td><td>{{ fs.total_bytes if fs.total_bytes is not none else 'Unknown' }}</td><td>{{ fs.free_bytes if fs.free_bytes is not none else 'Unknown' }}</td><td>{{ fs.free_percent if fs.free_percent is not none else 'Unknown' }}</td></tr>{% else %}<tr><td colspan="5">Unavailable</td></tr>{% endfor %}
+</tbody></table></div>
+<h4>Managed storage · measured {{ p.managed_storage.captured_at|display_time }}</h4>
+<dl>{% for key, value in p.managed_storage.items() if key != 'captured_at' %}<dt>{{ key }}</dt><dd>{{ value if value is not none else 'Unknown / unconfigured' }}</dd>{% endfor %}</dl>
+{% for title, observed in [('Latest Cycle', p.cycle), ('Current Run', p.current_run), ('Last Run', p.last_run)] %}<h4>{{ title }}</h4>
+{% if observed is not none %}<dl>{% for key, value in observed.items() %}<dt>{{ key }}</dt><dd>{{ (value|display_time) if key in ('started_at', 'completed_at', 'created_at') else (value if value is not none else 'Unknown') }}</dd>{% endfor %}</dl>{% else %}<p>Unavailable / unrecorded</p>{% endif %}{% endfor %}
+<p>Next action: {{ p.next_action_at|display_time }}</p>
+<p>Connectivity: MySQL {{ p.connectivity.source_mysql }} · Relay {{ p.connectivity.relay }}</p>
+<p>Collection errors: {{ p.collection_errors|join(', ') if p.collection_errors else 'None reported' }}</p>
+<p>System history: {% for period in ['24h', '7d', '30d'] %}<a href="/source-history?node={{ p.node_id|urlencode }}&amp;window={{ period }}">{{ period }}</a> {% endfor %}</p>
+</section>{% else %}<p>No Source sample available.</p>{% endfor %}
+{% if data.sources.next_cursor %}<p>Additional nodes available through the paginated /api/sources endpoint.</p>{% endif %}

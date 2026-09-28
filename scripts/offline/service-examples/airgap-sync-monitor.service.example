@@ -6,6 +6,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# CentOS 7 systemd: create the state directory explicitly (StateDirectory is newer).
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/airgap-sync-monitor
+UMask=0077
+# Single Web process. Ingest takes only Monitor-specific inbox/database locks.
+# Enable monitor_ingest in YAML; grant this account access to telemetry incoming.
+# For a custom db_path, adjust ExecStartPre accordingly.
 # EnvironmentFile=/etc/airgap-sync/destination.env
 ExecStart=/opt/airgap-sync/current/venv/bin/airgap-sync destination monitor-web --config /etc/airgap-sync/destination.yaml --host 127.0.0.1 --port 8080
 Restart=on-failure

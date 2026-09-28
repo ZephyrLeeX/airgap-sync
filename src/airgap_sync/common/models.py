@@ -211,6 +211,37 @@ class SourceMonitoringConfig(BaseModel):
         return self
 
 
+class MonitorIngestConfig(BaseModel):
+    """Opt-in Destination telemetry; independent of Source monitoring config."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    incoming: Path
+    db_path: Path = Path("/var/lib/airgap-sync-monitor/monitor.db")
+    poll_seconds: float = Field(default=10, ge=1, le=3600)
+    batch_size: int = Field(default=100, ge=1, le=1000)
+    scan_limit: int = Field(default=2000, ge=1, le=10000)
+    settle_seconds: float = Field(default=30, ge=1, le=3600)
+    invalid_grace_seconds: float = Field(default=300, ge=30, le=86400)
+    history_days: int = Field(default=35, ge=30, le=365)
+    dedup_days: int = Field(default=90, ge=31, le=730)
+    quarantine_days: int = Field(default=7, ge=1, le=30)
+    quarantine_max_files: int = Field(default=1000, ge=1, le=10000)
+    future_seconds: int = Field(default=300, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def validate_ingest(self) -> Self:
+        if not self.incoming.is_absolute() or not self.db_path.is_absolute():
+            raise ValueError("monitor_ingest paths must be absolute")
+        if self.db_path.name != "monitor.db":
+            raise ValueError("monitor_ingest.db_path must name a dedicated monitor.db")
+        if self.dedup_days <= self.history_days:
+            raise ValueError("dedup_days must exceed history_days")
+        if self.invalid_grace_seconds < self.settle_seconds:
+            raise ValueError("invalid grace must be at least settle_seconds")
+        return self
+
+
 class TableConfig(BaseModel):
     """单张同步表的配置。
 
@@ -248,6 +279,7 @@ class AppConfig(BaseModel):
     maintenance: MaintenanceConfig = MaintenanceConfig()
     destination: DestinationConfig | None = None
     monitoring: SourceMonitoringConfig | None = None
+    monitor_ingest: MonitorIngestConfig | None = None
     tables: list[TableConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")

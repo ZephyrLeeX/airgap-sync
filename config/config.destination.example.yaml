@@ -32,3 +32,19 @@ maintenance:
 
 # 可省略；Destination 不用这个列表决定接收哪些表。
 tables: []
+
+# M3 可选：仅由独立 monitor-web / monitor-ingest 使用；省略保持 M1。
+# Linux Destination 示例。可与 destination.incoming_dir 共用真实 Linux 目录。
+# monitor_ingest:
+#   incoming: /var/lib/airgap-sync/incoming
+#   db_path: /var/lib/airgap-sync-monitor/monitor.db
+#   poll_seconds: 10
+#   batch_size: 100 # 每轮每个目录上限；incoming + processing 合计最多 200
+#   scan_limit: 2000 # 每轮每个目录的目录项枚举上限
+#   settle_seconds: 30
+#   invalid_grace_seconds: 300
+#   history_days: 35
+#   dedup_days: 90 # 必须大于 history_days
+#   quarantine_days: 7
+#   quarantine_max_files: 1000
+#   future_seconds: 300

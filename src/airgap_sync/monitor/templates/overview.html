@@ -14,4 +14,4 @@
 <article><label>Hostname / OS</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
 <article><label>Uptime</label><strong>{{ data.system.uptime or '—' }}</strong></article>
 <article><label>Memory available</label><strong>{{ data.system.memory_available|filesizeformat if data.system.memory_available is not none else '—' }}</strong></article>
-</div>{% endblock %}
+</div>{% include "sources.html" %}{% endblock %}

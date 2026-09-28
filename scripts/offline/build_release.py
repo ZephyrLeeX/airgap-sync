@@ -514,6 +514,7 @@ def assemble_bundle(
     if DOCS_FILE.is_file():
         shutil.copy2(DOCS_FILE, bundle_root / "OFFLINE-DEPLOYMENT.md")
     shutil.copy2(REPO_ROOT / "docs" / "monitoring-m2.md", bundle_root / "MONITORING-M2.md")
+    shutil.copy2(REPO_ROOT / "docs" / "monitoring-m3.md", bundle_root / "MONITORING-M3.md")
 
     manifest.dump(bundle_root / rm.MANIFEST_NAME)
     rm.write_release_env(manifest, bundle_root / rm.RELEASE_ENV_NAME)

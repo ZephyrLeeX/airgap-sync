@@ -522,3 +522,34 @@ AIRGAP_TEST_MYSQL=... /tmp/testenv/bin/python -m pytest tests -m integration
 自动测试或开发机测试不得表述为上述现场验证已完成。
 
 发现问题优先在联网开发机复现并修正 `scripts/offline/` 后重新出包。
+
+## Destination Monitoring M3
+
+离线包新增 `MONITORING-M3.md`，更新的 Destination 配置示例和
+`service/airgap-sync-monitor.service.example` 同包并纳入校验和；Web 模板/静态资源在应用 wheel 内。
+完整配置与故障恢复见 [Monitoring M3](monitoring-m3.md)（离线环境打开 `MONITORING-M3.md`）。
+
+M3 在独立 Monitor 服务内运行后台 telemetry ingest，默认数据库是
+`/var/lib/airgap-sync-monitor/monitor.db`。给现有 Destination YAML 增加可选 `monitor_ingest`
+段才启用；不必修改 Source M2 配置或业务 Worker。使用真实 Linux incoming 绝对路径，允许
+与业务目录共用；只处理严格命名的 telemetry 文件。推荐 FTP 临时文件完成后原子 rename。
+Relay/FTP 远端 retention 仍由外部运维负责。
+
+安装服务前创建状态目录（服务示例也有兼容 CentOS 7 的 `ExecStartPre`），按现场账户配置
+incoming/状态目录权限和 MySQL EnvironmentFile，复制服务示例后运行：
+
+```bash
+systemctl daemon-reload
+systemctl enable --now airgap-sync-monitor
+```
+
+升级脚本既有的 Worker 停启流程不变。升级或回滚应用时另行停止并在完成后启动 Monitor，
+避免旧进程持续使用旧代码；不要删除 monitor.db。只有 Monitor schema 兼容的版本才能复用
+该库，未知版本会降级而不会自动重建。备份使用 SQLite 在线备份或停止 Monitor 后连同 WAL
+正确处理，不能只复制运行中主库文件。
+
+现场诊断可停止 **Monitor 服务** 后运行两次
+`airgap-sync destination monitor-ingest --config /etc/airgap-sync/destination.yaml`，两次间隔至少
+配置的 `settle_seconds`，然后恢复服务。检查 `/system` 与 `/api/sources` 中的 Source 采集时间、
+接收时间、独立存储测量时间，并做实际 Windows → Relay → FTP 的重复投递与重启验证。
+自动化临时目录测试不替代这些现场验收。
