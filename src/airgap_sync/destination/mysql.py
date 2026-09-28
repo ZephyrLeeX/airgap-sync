@@ -878,11 +878,47 @@ class DestinationMySQLConnection:
         )
         return [self._version(row) for row in rows]
 
+    def monitoring_latest_versions(
+        self, limit: int = 1000, after: tuple[str, str] | None = None
+    ) -> list[TableVersion]:
+        """Bounded latest VERIFIED rows, one per source database and table."""
+        rows = self._fetchall(
+            "SELECT v.run_id,v.source_database,v.table_name,v.source_created_at,v.row_count,"
+            "v.previous_run_id,v.previous_row_count,v.net_change,v.verified_at,v.applied_at "
+            f"FROM {self._metadata}.table_versions v WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {self._metadata}.table_versions newer WHERE "
+            "newer.source_database=v.source_database AND newer.table_name=v.table_name "
+            "AND (newer.source_created_at>v.source_created_at OR "
+            "(newer.source_created_at=v.source_created_at AND "
+            "newer.applied_at>v.applied_at) OR "
+            "(newer.source_created_at=v.source_created_at AND "
+            "newer.applied_at=v.applied_at AND newer.run_id>v.run_id))) "
+            + ("AND (v.source_database,v.table_name)>(%s,%s) " if after else "")
+            + "ORDER BY v.source_database,v.table_name LIMIT %s",
+            (*after, limit) if after else (limit,),
+        )
+        return [self._version(row) for row in rows]
+
     def monitoring_runs(self, limit: int = 200) -> list[MonitoringRunRecord]:
         """Recent destination facts in one bounded, SELECT-only query (MySQL 5.6)."""
         return self._monitoring_query("", "updated_at", limit)
 
-    def monitoring_latest_runs(self) -> list[MonitoringRunRecord]:
+    def monitoring_known_run_ids(self, run_ids: list[str]) -> dict[str, datetime]:
+        """Resolve a bounded set of incoming alerts in one metadata query."""
+        if not run_ids:
+            return {}
+        if len(run_ids) > 100:
+            raise ValueError("too many run IDs")
+        placeholders = ",".join(["%s"] * len(run_ids))
+        rows = self._fetchall(
+            f"SELECT run_id,updated_at FROM {self._metadata}.runs WHERE run_id IN ({placeholders})",
+            tuple(run_ids),
+        )
+        return {str(run_id): updated_at for run_id, updated_at in rows}
+
+    def monitoring_latest_runs(
+        self, limit: int | None = None, after: tuple[str, str] | None = None
+    ) -> list[MonitoringRunRecord]:
         """One run per table by snapshot time, receipt time, then run ID.
 
         Cleanup changes updated_at, so it cannot order business runs. The
@@ -903,6 +939,9 @@ class DestinationMySQLConnection:
             "newer.manifest_received_at>r.manifest_received_at) OR "
             "(newer.source_created_at=r.source_created_at AND "
             "newer.manifest_received_at=r.manifest_received_at AND newer.run_id>r.run_id)))"
+            + (" AND (r.source_database,r.table_name)>(%s,%s)" if after else "")
+            + (" ORDER BY r.source_database,r.table_name LIMIT %s" if limit is not None else ""),
+            ((*after,) if after else ()) + ((limit,) if limit is not None else ()),
         )
         return [MonitoringRunRecord(*row) for row in rows]
 

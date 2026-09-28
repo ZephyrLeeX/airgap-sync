@@ -7,6 +7,7 @@
 <a href="/runs" {% if page == 'runs' %}class="active"{% endif %}>Runs</a>
 <a href="/system" {% if page == 'system' %}class="active"{% endif %}>System</a>
 <a href="/problems" {% if page == 'problems' %}class="active"{% endif %}>Problems</a>
+<a href="/alerts" {% if page == 'alerts' %}class="active"{% endif %}>Alerts</a>
 </nav></header><main><div class="heading"><div><h1>{% block title %}{% endblock %}</h1><p>Observations · {{ data.timezone }} · Updated {{ data.generated_at|display_time }}</p></div><span class="badge {{ data.status|lower }}">{{ data.status }}</span></div>
 {% if data.query_error %}<div class="notice">{{ data.query_error }}. Database facts may be unavailable.</div>{% endif %}
-{% block content %}{% endblock %}</main><footer>M3 Source telemetry and Destination observations. Alerts arrive in M4.</footer><script src="/static/monitor.js" defer></script></body></html>
+{% block content %}{% endblock %}</main><footer>Monitoring observations and alert history are read only.</footer><script src="/static/monitor.js" defer></script></body></html>

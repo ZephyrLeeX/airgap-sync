@@ -246,11 +246,13 @@ class Ingestor:
 class BackgroundIngest:
     """One background thread, cancellable between bounded rounds; lock retry on failure."""
 
-    def __init__(self, config):
+    def __init__(self, config, app_config=None):
         self.config = config
+        self.app_config = app_config
         self.stop_event = threading.Event()
         self.thread = None
         self.status = "STARTING"
+        self.alert_status = "STARTING" if app_config and app_config.monitor_alerts else "DISABLED"
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -260,22 +262,66 @@ class BackgroundIngest:
         self.thread.start()
 
     def run(self):
+        next_alert = 0.0
+        next_ingest = 0.0
+        from airgap_sync.monitor.alerts import IncomingScanner
+
+        scanner = (
+            IncomingScanner(self.app_config.destination.incoming_dir)
+            if self.app_config and self.app_config.monitor_alerts
+            else None
+        )
         while not self.stop_event.is_set():
             try:
                 with Ingestor(self.config) as ingestor:
                     while not self.stop_event.is_set():
-                        try:
-                            counts = ingestor.tick()
-                            self.status = "DEGRADED" if counts["error"] else "RUNNING"
-                        except Exception:
-                            self.status = "UNAVAILABLE"
-                            logger.warning("Monitor ingest round unavailable")
-                        self.stop_event.wait(self.config.poll_seconds)
+                        if time.time() >= next_ingest:
+                            try:
+                                counts = ingestor.tick()
+                                self.status = "DEGRADED" if counts["error"] else "RUNNING"
+                            except Exception:
+                                self.status = "UNAVAILABLE"
+                                logger.warning("Monitor ingest round unavailable")
+                            next_ingest = time.time() + self.config.poll_seconds
+                        if self.app_config and time.time() >= next_alert:
+                            try:
+                                from airgap_sync.monitor.alerts import disable_all, evaluate
+
+                                with store.connect(self.config.db_path, write=True) as db:
+                                    if self.app_config.monitor_alerts:
+                                        failures = evaluate(
+                                            self.app_config, db, incoming_scanner=scanner
+                                        )
+                                        self.alert_status = "DEGRADED" if failures else "RUNNING"
+                                    else:
+                                        disable_all(db, time.time())
+                            except Exception:
+                                self.alert_status = "UNAVAILABLE"
+                                logger.warning("Monitor alert evaluation unavailable")
+                            interval = (
+                                self.app_config.monitor_alerts.interval_seconds
+                                if self.app_config.monitor_alerts
+                                else 60
+                            )
+                            next_alert = time.time() + interval
+                        self.stop_event.wait(
+                            max(
+                                0.1,
+                                min(next_ingest, next_alert if self.app_config else next_ingest)
+                                - time.time(),
+                            )
+                        )
             except Exception:
                 self.status = "UNAVAILABLE_OR_LOCKED"
+                if self.app_config and self.app_config.monitor_alerts:
+                    self.alert_status = "UNAVAILABLE_OR_LOCKED"
                 logger.warning("Monitor ingest unavailable or already owned")
                 self.stop_event.wait(self.config.poll_seconds)
         self.status = "STOPPED"
+        if self.app_config and self.app_config.monitor_alerts:
+            self.alert_status = "STOPPED"
+        if scanner is not None:
+            scanner.close()
 
     def stop(self):
         self.stop_event.set()

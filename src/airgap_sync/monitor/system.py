@@ -50,10 +50,18 @@ def worker_status() -> dict:
         active = fields.get("ActiveState")
         if active not in ("active", "inactive", "failed"):
             return {"status": "UNKNOWN", "detail": "service state unavailable"}
+        pid = fields.get("MainPID", "0")
+        substate = fields.get("SubState")
+        process_running = (
+            active == "active" and substate == "running" and pid.isdigit() and int(pid) > 0
+        )
+        stopped = active in ("inactive", "failed") or (
+            active == "active" and substate in ("dead", "exited")
+        )
         return {
-            "status": "RUNNING" if active == "active" else "NOT RUNNING",
+            "status": "RUNNING" if process_running else "NOT RUNNING" if stopped else "UNKNOWN",
             "detail": fields.get("SubState", "—"),
-            "pid": fields.get("MainPID", "—"),
+            "pid": pid,
         }
     except (OSError, subprocess.TimeoutExpired):
         return {"status": "UNKNOWN", "detail": "service query unavailable"}

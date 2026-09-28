@@ -33,18 +33,32 @@ CREATE INDEX transfer_expiry ON transfer_receipts(received);
 CREATE TABLE observations (identity TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
  since REAL NOT NULL, seen REAL NOT NULL);
 CREATE INDEX observation_expiry ON observations(seen);
-PRAGMA user_version=1;
+CREATE TABLE alerts (
+ id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, alert_type TEXT NOT NULL,
+ object_id TEXT NOT NULL, node_id TEXT, table_name TEXT, run_id TEXT, volume TEXT,
+ severity TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('OPEN','RECOVERED','DISABLED')),
+ message TEXT NOT NULL, details_json TEXT NOT NULL,
+ opened_at REAL NOT NULL, last_seen_at REAL NOT NULL, recovered_at REAL,
+ evaluated_at REAL NOT NULL, observed_at REAL, evaluation_state TEXT NOT NULL,
+ evidence_key TEXT);
+CREATE UNIQUE INDEX alerts_one_open ON alerts(fingerprint) WHERE status='OPEN';
+CREATE INDEX alerts_page ON alerts(status,severity,id DESC);
+CREATE INDEX alerts_recovered ON alerts(recovered_at,id);
+CREATE TABLE alert_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
+PRAGMA user_version=2;
 PRAGMA application_id=1095191859;
 """
+MIGRATION_V2 = SCHEMA[SCHEMA.index("CREATE TABLE alerts (") : SCHEMA.index("PRAGMA application_id")]
 
 
 class Conflict(ValueError):
     pass
 
 
-def check_schema(db):
+def check_schema(db, *, allow_v1=False):
+    version = db.execute("PRAGMA user_version").fetchone()[0]
     if (
-        db.execute("PRAGMA user_version").fetchone()[0] != 1
+        version not in ((1, 2) if allow_v1 else (2,))
         or db.execute("PRAGMA application_id").fetchone()[0] != 1095191859
     ):
         raise ValueError("monitor schema unavailable")
@@ -82,8 +96,21 @@ def initialize(path: Path):
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        with connect(path):
-            return
+        db = sqlite3.connect(path, timeout=1)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            check_schema(db, allow_v1=True)
+            if db.execute("PRAGMA user_version").fetchone()[0] == 1:
+                for statement in MIGRATION_V2.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return
     else:
         os.close(fd)
     db = sqlite3.connect(path, timeout=1)

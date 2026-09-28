@@ -48,3 +48,19 @@ tables: []
 #   quarantine_days: 7
 #   quarantine_max_files: 1000
 #   future_seconds: 300
+
+# M4 可选：仅与 monitor_ingest 一同启用；旧部署省略保持原行为。
+# monitor_alerts:
+#   expected_sources: [source-01] # 从未收到心跳的节点也在 10 分钟宽限后告警
+#   interval_seconds: 60
+#   first_heartbeat_grace_seconds: 600
+#   heartbeat_warning_seconds: 600
+#   heartbeat_critical_seconds: 1200
+#   freshness_warning_seconds: 691200 # 8d
+#   freshness_critical_seconds: 864000 # 10d
+#   incoming_stale_seconds: 7200
+#   incoming_settle_seconds: 60
+#   recovered_retention_days: 90
+#   disk_warning: {free_percent: 20, free_bytes: 53687091200} # 50 GiB
+#   disk_critical: {free_percent: 10, free_bytes: 21474836480} # 20 GiB
+#   disk_emergency: {free_percent: 5, free_bytes: 10737418240} # 10 GiB

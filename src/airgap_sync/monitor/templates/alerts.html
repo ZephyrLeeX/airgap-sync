@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}Alerts{% endblock %}{% block content %}
+<p>Current issues and retained history. UNKNOWN means evidence is unavailable; the issue stays open.</p>
+<form method="get" action="/alerts">
+<label>Status <select name="status"><option value="">All</option>{% for choice in ['OPEN','RECOVERED','DISABLED'] %}<option value="{{ choice }}" {% if filters.status == choice %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select></label>
+<label>Severity <select name="severity"><option value="">All</option>{% for choice in ['WARNING','CRITICAL','EMERGENCY'] %}<option value="{{ choice }}" {% if filters.severity == choice %}selected{% endif %}>{{ choice }}</option>{% endfor %}</select></label>
+<label>Node <input name="node" value="{{ filters.node or '' }}" maxlength="64"></label>
+<label>Rule <input name="kind" value="{{ filters.kind or '' }}" maxlength="40"></label>
+<button type="submit">Filter</button></form>
+{% if result.status != 'OK' %}<div class="notice">Alerts {{ result.status|lower }}.</div>{% endif %}
+<div class="table-wrap"><table><thead><tr><th>Status</th><th>Severity</th><th>Rule / object</th><th>Reason and evidence</th><th>Opened</th><th>Last confirmed</th><th>Observed</th><th>Evaluated</th><th>Recovered</th></tr></thead><tbody>
+{% for alert in result.alerts %}<tr><td>{{ alert.status }}{% if alert.evaluation_state == 'UNKNOWN' %} · evidence unavailable{% endif %}</td><td>{{ alert.severity }}</td><td>{{ alert.alert_type }}<br>{{ alert.object_id }}</td><td>{{ alert.message }}<details><summary>Evidence</summary><pre>{{ alert.details|tojson(indent=2) }}</pre></details></td><td>{{ alert.opened_at|display_time }}</td><td>{{ alert.last_seen_at|display_time }}</td><td>{{ alert.observed_at|display_time }}</td><td>{{ alert.evaluated_at|display_time }}</td><td>{{ alert.recovered_at|display_time }}</td></tr>{% else %}<tr><td colspan="9">No alert events in this page.</td></tr>{% endfor %}
+</tbody></table></div>
+{% if result.next_cursor %}<a href="/alerts?before={{ result.next_cursor }}{% if filters.status %}&amp;status={{ filters.status|urlencode }}{% endif %}{% if filters.severity %}&amp;severity={{ filters.severity|urlencode }}{% endif %}{% if filters.node %}&amp;node={{ filters.node|urlencode }}{% endif %}{% if filters.kind %}&amp;kind={{ filters.kind|urlencode }}{% endif %}">Older alerts</a>{% endif %}
+{% endblock %}

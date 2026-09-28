@@ -1,5 +1,6 @@
 {% extends "base.html" %}{% block title %}Overview{% endblock %}{% block content %}
 <div class="cards">
+<article><label>Open alerts</label><strong>{{ data.alerts.count if data.alerts.count is not none else 'Unknown' }}</strong><small>Highest: {{ data.alerts.highest or '—' }} · Store {{ data.alerts.status }} · Evaluation {{ data.alert_status }}</small></article>
 <article><label>Destination worker</label><strong>{{ data.system.worker.status }}</strong><small>{{ data.system.worker.detail }}</small></article>
 <article><label>RDS connectivity</label><strong>{{ data.rds }}</strong><small>MySQL {{ data.mysql_version or '—' }}</small></article>
 <article><label>Metadata schema</label><strong>{{ data.metadata_status }}</strong><small>Version {{ data.metadata_version if data.metadata_version is not none else '—' }}</small></article>
@@ -14,4 +15,6 @@
 <article><label>Hostname / OS</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
 <article><label>Uptime</label><strong>{{ data.system.uptime or '—' }}</strong></article>
 <article><label>Memory available</label><strong>{{ data.system.memory_available|filesizeformat if data.system.memory_available is not none else '—' }}</strong></article>
-</div>{% include "sources.html" %}{% endblock %}
+</div>
+{% if data.alerts.important %}<section><h2>Important alerts</h2><ul>{% for item in data.alerts.important %}<li><a href="/alerts?status=OPEN">{{ item.severity }} · {{ item.alert_type }} · {{ item.object_id }}</a> — {{ item.message }}{% if item.evaluation_state == 'UNKNOWN' %} (evidence unavailable){% endif %}</li>{% endfor %}</ul></section>{% endif %}
+{% include "sources.html" %}{% endblock %}

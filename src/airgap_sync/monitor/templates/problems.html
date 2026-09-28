@@ -1,4 +1,4 @@
 {% extends "base.html" %}{% block title %}Problems{% endblock %}{% block content %}
-<p class="intro">Current facts only. No persisted alert state.</p>
+<p class="intro">Destination observations and historical failure counts. See <a href="/alerts">Alerts</a> for current persisted issues; old failures may remain here after a newer successful Run.</p>
 {% for problem in data.problems %}<div class="problem">{{ problem }}</div>{% else %}<div class="empty">No current problems detected</div>{% endfor %}
 {% if data.runs %}<h2>Recent failed or mismatched runs</h2><div class="table-wrap"><table><thead><tr><th>Run ID</th><th>Table</th><th>Status</th><th>Error</th></tr></thead><tbody>{% for run in data.runs if run.status in ('FAILED', 'MISMATCH') %}<tr><td>{{ run.run_id }}</td><td>{{ run.table_name }}</td><td>{{ run.status }}</td><td class="error" title="{{ run.last_error or '' }}">{{ run.last_error or '—' }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}{% endblock %}

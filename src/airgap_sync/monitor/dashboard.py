@@ -203,7 +203,7 @@ def snapshot(config: AppConfig) -> dict:
     if data["counts"] is not None:
         for state in ("FAILED", "MISMATCH"):
             if data["counts"].get(state, 0):
-                data["problems"].append(f"{state} runs: {data['counts'][state]}")
+                data["problems"].append(f"Historical {state} runs: {data['counts'][state]}")
         if data["counts"].get("cleanup_pending", 0):
             data["problems"].append(f"Cleanup pending: {data['counts']['cleanup_pending']}")
     else:
@@ -252,8 +252,7 @@ def snapshot(config: AppConfig) -> dict:
     oldest = max(known_age, key=lambda row: row["data_age_seconds"], default=None)
     data["max_data_age"] = oldest["data_age"] if oldest else None
     if (
-        any(data["counts"] and data["counts"].get(x, 0) for x in ("FAILED", "MISMATCH"))
-        or known_failures
+        any(run["status"] in ("FAILED", "MISMATCH") for run in latest_by_table.values())
         or system["worker"]["status"] == "NOT RUNNING"
     ):
         data["status"] = "CRITICAL"

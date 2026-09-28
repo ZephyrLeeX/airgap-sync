@@ -242,6 +242,56 @@ class MonitorIngestConfig(BaseModel):
         return self
 
 
+class AlertThreshold(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    free_percent: float = Field(ge=0, le=100)
+    free_bytes: int = Field(ge=0)
+
+
+class MonitorAlertsConfig(BaseModel):
+    """Opt-in alert evaluation; requires monitor_ingest ownership."""
+
+    model_config = ConfigDict(extra="forbid")
+    expected_sources: list[str] = Field(default_factory=list, max_length=1000)
+    interval_seconds: int = Field(default=60, ge=5, le=3600)
+    future_seconds: int = Field(default=300, ge=0, le=3600)
+    first_heartbeat_grace_seconds: int = Field(default=600, ge=0)
+    heartbeat_warning_seconds: int = Field(default=600, ge=1)
+    heartbeat_critical_seconds: int = Field(default=1200, ge=2)
+    freshness_warning_seconds: int = Field(default=8 * 86400, ge=1)
+    freshness_critical_seconds: int = Field(default=10 * 86400, ge=2)
+    incoming_stale_seconds: int = Field(default=7200, ge=1)
+    incoming_settle_seconds: int = Field(default=60, ge=1)
+    recovered_retention_days: int = Field(default=90, ge=1, le=3650)
+    disk_warning: AlertThreshold = AlertThreshold(free_percent=20, free_bytes=50 * 1024**3)
+    disk_critical: AlertThreshold = AlertThreshold(free_percent=10, free_bytes=20 * 1024**3)
+    disk_emergency: AlertThreshold = AlertThreshold(free_percent=5, free_bytes=10 * 1024**3)
+
+    @model_validator(mode="after")
+    def validate_alerts(self) -> Self:
+        import re
+
+        if len(self.expected_sources) != len(set(self.expected_sources)) or any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", node) is None
+            for node in self.expected_sources
+        ):
+            raise ValueError("expected_sources must contain unique valid node IDs")
+        if not self.heartbeat_warning_seconds < self.heartbeat_critical_seconds:
+            raise ValueError("heartbeat warning must precede critical")
+        if not self.freshness_warning_seconds < self.freshness_critical_seconds:
+            raise ValueError("freshness warning must precede critical")
+        if not (
+            self.disk_emergency.free_percent
+            < self.disk_critical.free_percent
+            < self.disk_warning.free_percent
+            and self.disk_emergency.free_bytes
+            < self.disk_critical.free_bytes
+            < self.disk_warning.free_bytes
+        ):
+            raise ValueError("disk thresholds must rise from emergency to warning")
+        return self
+
+
 class TableConfig(BaseModel):
     """单张同步表的配置。
 
@@ -280,10 +330,13 @@ class AppConfig(BaseModel):
     destination: DestinationConfig | None = None
     monitoring: SourceMonitoringConfig | None = None
     monitor_ingest: MonitorIngestConfig | None = None
+    monitor_alerts: MonitorAlertsConfig | None = None
     tables: list[TableConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_table_names(self) -> Self:
+        if self.monitor_alerts is not None and self.monitor_ingest is None:
+            raise ValueError("monitor_alerts requires monitor_ingest")
         if self.role is Role.SOURCE:
             if self.paths is None:
                 raise ValueError("paths is required when role=source")

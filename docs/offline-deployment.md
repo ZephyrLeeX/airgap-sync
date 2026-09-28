@@ -529,6 +529,16 @@ AIRGAP_TEST_MYSQL=... /tmp/testenv/bin/python -m pytest tests -m integration
 `service/airgap-sync-monitor.service.example` 同包并纳入校验和；Web 模板/静态资源在应用 wheel 内。
 完整配置与故障恢复见 [Monitoring M3](monitoring-m3.md)（离线环境打开 `MONITORING-M3.md`）。
 
+### Monitoring M4 Alert Engine 升级
+
+先停止旧 Monitor Web 与独立 `monitor-ingest`，以 SQLite backup API 备份正在使用的
+`monitor.db`（不可只复制运行中 WAL 数据库的主文件）。在 Destination YAML 中保留
+`monitor_ingest`，按 [Monitoring M4](monitoring-m4.md) 和示例配置增加可选的
+`monitor_alerts`，再启动一个新版 Monitor Web。持有原有 Monitor 专属锁的进程会将
+v1 数据库事务化迁移到 v2；未知或损坏的数据库会拒绝写入，不会被清空。
+浏览 `/alerts` 与 `/api/alerts` 检查 OPEN、RECOVERED 与评估可用性；离线包中为
+`MONITORING-M4.md`。未配置 `monitor_alerts` 的部署保持 M1–M3 行为。
+
 M3 在独立 Monitor 服务内运行后台 telemetry ingest，默认数据库是
 `/var/lib/airgap-sync-monitor/monitor.db`。给现有 Destination YAML 增加可选 `monitor_ingest`
 段才启用；不必修改 Source M2 配置或业务 Worker。使用真实 Linux incoming 绝对路径，允许

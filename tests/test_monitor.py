@@ -460,8 +460,8 @@ def test_available_counts_keep_global_failure_summary(tmp_path, monkeypatch):
     assert data["status"] == "CRITICAL"
     assert data["counts"]["FAILED"] == 1
     assert data["counts"]["MISMATCH"] == 1
-    assert "FAILED runs: 1" in data["problems"]
-    assert "MISMATCH runs: 1" in data["problems"]
+    assert "Historical FAILED runs: 1" in data["problems"]
+    assert "Historical MISMATCH runs: 1" in data["problems"]
     assert not any(problem.startswith("Known ") for problem in data["problems"])
 
 
