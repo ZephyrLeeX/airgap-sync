@@ -97,7 +97,9 @@ def test_managed_storage_cache_and_failure(config, monkeypatch):
     (outbox / "a").write_bytes(b"longer text")
     assert monitor.managed_storage(config, now + timedelta(minutes=1))["outbox_bytes"] == 5
     assert monitor.managed_storage(config, now + timedelta(hours=2))["outbox_bytes"] == 11
-    monkeypatch.setattr(monitor, "_directory_bytes", lambda path: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(
+        monitor, "_directory_bytes", lambda path, **kwargs: (_ for _ in ()).throw(OSError())
+    )
     assert monitor.managed_storage(config, now + timedelta(hours=4))["outbox_bytes"] is None
 
 
@@ -121,7 +123,7 @@ def test_managed_storage_cache_unwritable_skips_scan(config, monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(OSError()),
     )
     monkeypatch.setattr(
-        monitor, "_directory_bytes", lambda path: pytest.fail("scan must be skipped")
+        monitor, "_directory_bytes", lambda path, **kwargs: pytest.fail("scan must be skipped")
     )
     sample = monitor.managed_storage(config, datetime.now(UTC))
     assert sample["captured_at"] is None
@@ -259,6 +261,7 @@ def test_offline_task_example_is_independent():
     installer = (service / "install-source-monitor-task.ps1").read_text()
     wrapper = (service / "run-source-monitor.ps1").read_text()
     assert "PT5M" in installer and "IgnoreNew" in installer
+    assert "<ExecutionTimeLimit>PT2M</ExecutionTimeLimit>" in installer
     assert "[string] $LogFile = ''" in installer
     assert "if ($LogFile)" in installer and ' -LogFile "' in installer
     assert "monitoring.log_dirs" in wrapper
@@ -601,6 +604,109 @@ def test_logs_failure_invalidates_whole_category(config, tmp_path):
     link.symlink_to(logs, target_is_directory=True)
     config.monitoring.log_dirs = [logs, link]
     assert monitor.managed_storage(config, datetime.now(UTC))["logs_bytes"] is None
+
+
+@pytest.mark.parametrize("phase", ["enumerate", "stat", "exhaust"])
+def test_storage_shared_budget_cached_and_heartbeat_uploaded(
+    config, tmp_path, monkeypatch, caplog, phase
+):
+    clock = [0.0]
+    config.monitoring.log_dirs = [tmp_path / f"logs-{i}" for i in range(4)]
+    roots = [
+        config.paths.data_dir / "outbox",
+        config.paths.data_dir / "backups",
+        *config.monitoring.log_dirs,
+        config.paths.data_dir / "spool",
+    ]
+    for root in roots:
+        root.mkdir(parents=True)
+    opened = []
+    real_scan = monitor.os.scandir
+    started = []
+    real_directory_bytes = monitor._directory_bytes
+
+    def directory_bytes(path, **kwargs):
+        started.append(path)
+        return real_directory_bytes(path, **kwargs)
+
+    def scan(path):
+        # TemporaryDirectory cleanup also uses scandir (with an fd on POSIX).
+        if path not in roots:
+            return real_scan(path)
+        opened.append(path)
+        entry = FakeEntry(path / "file")
+        original_stat = entry.stat
+
+        def delayed_stat(**kwargs):
+            if phase == "stat":
+                clock[0] += 10
+            return original_stat(**kwargs)
+
+        def entries():
+            if phase == "enumerate":
+                clock[0] += 10
+            yield entry
+            if phase == "exhaust":
+                clock[0] += 10
+
+        entry.stat = delayed_stat
+        return fake_entries(entries())
+
+    monkeypatch.setattr(monitor.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(monitor.os, "scandir", scan)
+    monkeypatch.setattr(monitor, "_directory_bytes", directory_bytes)
+    monkeypatch.setenv("TEST_RELAY_TOKEN", "SECRET")
+    uploaded = []
+    monkeypatch.setattr(
+        monitor.RelayUploader,
+        "upload",
+        lambda self, path, *args: uploaded.append(json.loads(path.read_text())),
+    )
+    # Every tree takes only 10 seconds (<15), but the fifth crosses 45 total.
+    # Two logs completed; the category must still be null. The last log and
+    # spool must never start. Use build_payload/report's real cache/upload path.
+    with SourceState(state_db_path(config.paths.data_dir)) as state:
+        state.initialize()
+    assert monitor.report(config, tmp_path / "source.yaml") == (True, "RELAY_ACCEPTED")
+    first = uploaded[0]["managed_storage"]
+    assert first["outbox_bytes"] == first["backups_bytes"] == 7
+    assert first["logs_bytes"] is None
+    assert first["pending_spool_bytes"] is None
+    assert opened == roots[:5]
+    assert started == roots[:5]
+    assert clock[0] == 50
+    assert uploaded[0]["collection_errors"] == ["STORAGE_UNAVAILABLE"]
+    assert "SECRET" not in caplog.text
+    cache = config.paths.data_dir / "monitor" / "storage-cache.json"
+    assert json.loads(cache.read_text())["logs_bytes"] is None
+    captured = datetime.fromisoformat(first["captured_at"].replace("Z", "+00:00"))
+    assert monitor.managed_storage(config, captured + timedelta(minutes=5)) == first
+    assert monitor.report(config, tmp_path / "source.yaml")[0]
+    assert uploaded[1]["managed_storage"] == first
+    assert uploaded[1]["collection_errors"] == ["STORAGE_UNAVAILABLE"]
+    assert opened == roots[:5]
+    assert started == roots[:5]
+
+
+@pytest.mark.parametrize("failed_category", [None, "logs", "outbox", "backups", "spool"])
+def test_storage_unconfigured_logs_are_not_failure(config, tmp_path, monkeypatch, failed_category):
+    if failed_category:
+        root = config.paths.data_dir / failed_category
+        root.mkdir(parents=True)
+        if failed_category == "logs":
+            config.monitoring.log_dirs = [root]
+
+        def denied(path):
+            assert path == root
+            raise PermissionError("SECRET path")
+
+        monkeypatch.setattr(monitor.os, "scandir", denied)
+    now = datetime.now(UTC)
+    for captured in (now, now + timedelta(minutes=5)):
+        payload = monitor.build_payload(config, tmp_path / "source.yaml", captured)
+        assert payload["managed_storage"]["logs_bytes"] is None
+        assert ("STORAGE_UNAVAILABLE" in payload["collection_errors"]) == bool(failed_category)
+        assert "SECRET" not in json.dumps(payload)
 
 
 @pytest.mark.parametrize("paths", [["relative"], ["/"], ["/logs", "/logs"], ["/logs", "/logs/sub"]])

@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 MAX_PAYLOAD = 64 * 1024
 _STORAGE_MAX_ENTRIES = 100_000
 _STORAGE_MAX_SECONDS = 15
+# Leave 75 seconds of the Windows task's 120-second limit for other work.
+# Cooperative only: neither budget can interrupt a blocked filesystem call.
+_STORAGE_TOTAL_MAX_SECONDS = 45
 _COLLECTION_CODES = frozenset(
     {
         "SOURCE_METADATA_MISSING",
@@ -525,9 +528,10 @@ def _is_storage_link(info: os.stat_result) -> bool:
     )
 
 
-def _directory_bytes(path: Path) -> int:
+def _directory_bytes(path: Path, *, deadline: float | None = None) -> int:
     """Cooperative budgets between I/O calls; cannot interrupt a blocked syscall."""
-    deadline = time.monotonic() + _STORAGE_MAX_SECONDS
+    directory_deadline = time.monotonic() + _STORAGE_MAX_SECONDS
+    deadline = min(directory_deadline, deadline) if deadline is not None else directory_deadline
     scanned = 0
 
     def check_budget() -> None:
@@ -579,6 +583,7 @@ def _directory_bytes(path: Path) -> int:
 
 def managed_storage(config: AppConfig, now: datetime) -> dict:
     assert config.paths is not None and config.monitoring is not None
+    deadline = time.monotonic() + _STORAGE_TOTAL_MAX_SECONDS
     cache = config.paths.data_dir / "monitor" / "storage-cache.json"
     interval = parse_duration(config.monitoring.managed_storage_interval)
     roots = {
@@ -641,9 +646,19 @@ def managed_storage(config: AppConfig, now: datetime) -> dict:
         result["captured_at"] = None
         return result
     for key, paths in roots.items():
-        if paths:
-            with suppress(OSError):
-                result[key] = sum(_directory_bytes(path) for path in paths)
+        total = 0
+        for path in paths:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                total += _directory_bytes(path, deadline=deadline)
+            except OSError:
+                break
+        else:
+            if paths:
+                result[key] = total
+        if time.monotonic() >= deadline:
+            break
     temp = cache.with_name(cache.name + f".{token_hex(4)}.tmp")
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -710,7 +725,9 @@ def build_payload(config: AppConfig, config_path: Path, now: datetime | None = N
     if any(
         value is None
         for key, value in storage.items()
-        if key.endswith("_bytes") and key != "failed_runs_bytes"
+        if key.endswith("_bytes")
+        and key != "failed_runs_bytes"
+        and (key != "logs_bytes" or config.monitoring.log_dirs)
     ):
         errors.append("STORAGE_UNAVAILABLE")
     payload = {
