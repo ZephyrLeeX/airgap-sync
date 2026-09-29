@@ -161,7 +161,12 @@ def test_upload_success_and_size_limit(config, tmp_path, monkeypatch):
 
     def uploaded(self, path, name, sha):
         names.append(name)
-        assert json.loads(path.read_text()) == {"schema_version": 1}
+        assert json.loads(path.read_text()) == {
+            "schema_version": 2,
+            "source_database": config.mysql.database,
+            "run_facts_status": "UNAVAILABLE",
+            "run_facts": [],
+        }
         assert len(sha) == 64
 
     monkeypatch.setattr(monitor.RelayUploader, "upload", uploaded)

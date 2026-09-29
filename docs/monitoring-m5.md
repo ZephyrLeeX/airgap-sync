@@ -1,0 +1,56 @@
+# Monitoring M5 — Run Timeline and Performance
+
+M5 reads persisted Source SQLite Run facts through the independent Reporter, merges them into the independent Destination `monitor.db`, and joins them to read-only Destination metadata for `/runs`, `/runs/{run_id}`, `/api/runs`, and `/api/runs/{run_id}`. The business workers, state machines, metadata schemas, chunk contents, and business tables are unchanged. The Runs page now uses bounded timeline queries and omits raw business error text.
+
+## Recorded fields and meaning
+
+| Displayed event | Field | Meaning and clock |
+| --- | --- | --- |
+| Source Run created | Source `sync_runs.created_at` | Run row creation, Source clock |
+| Snapshot completed | Source `snapshot_completed_at` | Snapshot result persisted, Source clock; scan and compression cannot be separated |
+| Source delivered | Source `delivered_at` | Source marked all files delivered, Source clock; it does not mean Destination ingested them |
+| Source manifest created | Destination `source_created_at` | Manifest `created_at` copied to Destination metadata, Source clock; distinct from Run creation |
+| Manifest recorded | Destination `manifest_received_at` | Validation and metadata insertion time, Destination clock; not first file landing |
+| Validated | Destination `validated_at` | Same metadata transaction as manifest receipt on current worker |
+| Import started/completed | Destination `import_started_at` / `import_completed_at` | First import start and staged import completion, Destination clock |
+| Digest verification completed | Destination `digest_verified_at` | Stored verification result; a MISMATCH can also have this timestamp |
+| Promotion applied | Destination `applied_at` | VERIFIED promotion, Destination clock |
+
+Source `row_count`, `chunk_count`, `raw_bytes`, and `compressed_bytes` are final snapshot facts when populated. Null means not recorded; the Reporter does not infer a collection failure from each null. Artifact `created_at` is not Upload Started. Destination `updated_at` is only an update timestamp and is excluded from stage timing because cleanup can change it. Ingest `received` is a telemetry reception time, never a business event time. The latest Source observation time is exposed separately.
+
+## Protocol, bounded backfill, and deployment order
+
+The v1 heartbeat remains an exact supported input. v2 keeps its fields and adds exactly `source_database`, `run_facts_status` (`OK` or `UNAVAILABLE`), and `run_facts` (up to 20); filename `airgap-monitor-v2--...` must match `schema_version: 2`, node and capture timestamp. An empty batch with `OK` means collection completed but no transferable facts were included; `UNAVAILABLE` means Run collection or identity binding could not be trusted. Run facts validate identifier length, status, UTC timestamps, nullable nonnegative 64-bit counters, complete field set, and 64 KiB **actual UTF-8 body**. v1 is not loosened to accept extensions. Bad transfers retain the M3 grace/quarantine behavior. A new Source Reporter always sends v2.
+
+Per invocation, Source scans at most 256 raw Run metadata rows in `run_id` order, advancing its durable cursor through old rows as well as recent rows. It checks `created_at` after the bounded read and sends at most 20 Runs created in the preceding 35 days; it does not infer creation time from `run_id`. The cursor lives at `<data_dir>/monitor/run-cursor.json` and advances after an upload attempt, whether Relay accepts or rejects it; at the end it wraps to the beginning. This rotates across multiple Runs completed between five-minute samples and repeatedly revisits older in-window Runs whose completion fields appear later. Restart resumes the saved cursor. Missing/corrupt cursor restarts from the beginning. A lost telemetry file, delayed/duplicate/out-of-order transfer, or Relay acceptance without Destination ingest is healed only if a later rotation reaches the Run while it remains in the Source recovery window and transfer eventually succeeds. There is no delivery acknowledgment or unbounded local spool, so delivery is **not guaranteed**. Records older than 35 days, removed Source metadata, records that cannot fit the byte budget, and extended transfer outages may leave a permanent gap. At most 256 metadata rows are read and at most 20 in-window facts are validated, with a half-second / 200,000 SQLite VM step limit. If the budget interrupts after some rows, the last visited `run_id` is retained for the next attempt; no business rows, artifacts, or chunk content are read. The base heartbeat has byte-budget priority and an invalid or individually oversized Run fact does not block later facts or the heartbeat.
+
+**Upgrade Destination Monitor before deploying v2 Source Reporter.** Stop old Monitor processes, back up live SQLite with its backup API (or after stopping, preserve WAL), install/restart Destination Monitor, confirm `monitor.db` schema v3 and v1 ingestion, then install/run v2 Reporter. An old Destination only accepts v1 and will quarantine v2 after its invalid grace period. Confirm external Relay filename/size allowlists accept `airgap-monitor-v2--...json` and the 64 KiB payload before switching Source. Rollback to a v1-only Destination requires restoring a compatible pre-v3 monitor.db backup or deploying an M5-compatible reader; do not delete/recreate the DB.
+
+## Identity, merge and retention
+
+`source_runs` primary key is `(node_id, source_database, table_name, run_id)`. Destination has no node ID. The UI joins only when `(source_database, table_name, run_id)` matches exactly one Source identity; multiple Source nodes with the same triple are marked `ambiguous`. A page without a matching counterpart is `unresolved`, not proof that no counterpart exists. Source DELIVERED and Destination VERIFIED stay distinct.
+Source SQLite does not persist `source_database`; v2 sends the Reporter's configured `mysql.database`. Keep one Source data directory bound to one database. The local cursor records the database binding and withholds Run facts if that setting later changes, while the base heartbeat remains available. A pre-M5 data directory cannot prove its earlier configuration history; reusing it after a database change requires operator review.
+
+Repeated identical transfers are idempotent through existing content and transfer receipts. Later non-null fields fill earlier nulls. An older capture cannot regress the status. Different non-null business timestamps or counts produce persistent conflict field names while retaining the first observed value; status regression/conflicting equal-time status is also flagged. Raw `last_error`, SQL, secrets, and environment values are never put into Run facts. Heartbeat sample retention does not cascade to `source_runs`. Source Run facts expire in bounded batches 35 days after their last receipt (`monitor_ingest.history_days`), with independent query and expiry indexes. Existing M3/M4 v1/v2 `monitor.db` migrates to v3 in one transaction under the ingest lock; samples, receipts, observations, alerts, and alert history remain. Failed migrations roll back and can retry. Unknown/corrupt DBs are refused, never replaced. Web GETs open read-only and do not migrate.
+
+## Durations and performance
+
+| Interval / metric | Formula and scope |
+| --- | --- |
+| Snapshot | Source `snapshot_completed_at − created_at`; entire snapshot, including setup/scan/compression |
+| Source delivery | Source `delivered_at − snapshot_completed_at`; includes any wait/retry, not pure upload duration |
+| Transport wait | Destination `manifest_received_at − Source delivered_at`; cross-host and includes relay/FTP/settle wait |
+| Import | Destination `import_completed_at − import_started_at`; includes retry/wait |
+| Verification window | Destination `digest_verified_at − import_completed_at`; includes unrecorded wait, not exact verify runtime |
+| End to end | Destination `applied_at − Source Run created_at`; cross-host |
+| Compression share | `compressed_bytes / raw_bytes`, when raw bytes > 0 |
+| Snapshot average | Source rows or raw MiB divided by positive snapshot interval |
+| Import average | Manifest expected rows divided by positive import interval |
+
+All stage rates are averages over recorded intervals, **not current speed**. Cross-host clock skew can make transport or end-to-end negative; the API preserves the signed result and marks `clock_or_order_anomaly`. Any negative interval prevents a rate. Missing endpoints, zero duration, and zero raw bytes return null/Unknown, never a fabricated zero. A zero-row snapshot over positive time legitimately yields 0 rows/s. Active statuses expose a separately labeled **Estimated ongoing elapsed** to the last Source capture or current Destination query time; it is not a completed duration. Historical completed stages never substitute `now` for a missing endpoint. Contradictory row/chunk counts are flagged. No failure cause is inferred from a long stage. Independent scan/compression time, Upload Started, exact upload throughput, verify start/rows read, live rows scanned, and instantaneous speed need M6 instrumentation and remain unavailable.
+
+API timestamps are UTC, HTML converts to `destination.report_timezone`. List filters are bounded to 64 characters, page size to 100, and navigation uses a keyset cursor ordered by Run ID and identity fields; this is stable pagination, not newest-first ordering. Each side is queried independently so RDS failure still shows saved Source facts, and monitor.db failure still shows Destination facts. Destination pages continue after the complete `(run_id, source_database, table_name)` key, and skip all Destination rows for a `run_id` once the cursor reaches a Source node key for that Run. A node filter selects a bounded Source page, then performs exact Destination lookups for those Source identities; it never filters a global Destination page after limiting it. The merged page advances only through keys scanned on both sides, so associated Source identities and later records remain reachable. Shared Destination identities across multiple Source nodes remain ambiguous. No full history scan occurs on GET. External text is escaped by templates. The UI remains loopback bound and read-only. There is no cached Destination timeline: Destination records are from the current read-only RDS query or marked unavailable.
+
+## Field acceptance
+
+Automated tests cover the local contract and simulated failures. On site, validate Windows scheduled Reporter permissions and cursor durability, Relay v2 allowlist and SHA256/201 behavior, real FTP loss/rename/retry, Source and Destination clock skew, CentOS monitor migration/restart, RDS MySQL 5.6 query plans/latency, and the actual report timezone. These checks are still pending until performed on the deployed systems.

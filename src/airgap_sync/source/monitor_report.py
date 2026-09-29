@@ -25,6 +25,7 @@ from airgap_sync import __version__
 from airgap_sync.common.config import resolve_relay_token
 from airgap_sync.common.models import AppConfig
 from airgap_sync.common.runtime import parse_duration
+from airgap_sync.monitor.protocol import RUN_FACT
 from airgap_sync.source.state import SCHEMA_VERSION, state_db_path
 from airgap_sync.source.uploader import RelayUploader, UploadError
 
@@ -86,6 +87,99 @@ def _utc(value: str | None) -> str | None:
 def _query_one(db: sqlite3.Connection, sql: str, args: tuple = ()) -> dict | None:
     row = db.execute(sql, args).fetchone()
     return dict(row) if row else None
+
+
+def run_facts(config: AppConfig, now: datetime | None = None) -> tuple[list[dict], str | None]:
+    """Advance a durable keyset through bounded raw rows, including old Runs."""
+    assert config.paths is not None
+    db_path = state_db_path(config.paths.data_dir)
+    cursor_path = config.paths.data_dir / "monitor" / "run-cursor.json"
+    try:
+        raw = cursor_path.read_bytes()
+        saved = json.loads(raw) if len(raw) <= 256 else {}
+        if saved.get("database", config.mysql.database) != config.mysql.database:
+            logger.warning("Source Run identity binding changed; Run facts withheld")
+            return [], None
+        cursor = saved["after"]
+        if not isinstance(cursor, str) or len(cursor) > 512:
+            cursor = ""
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        cursor = ""
+    try:
+        with closing(
+            sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+        ) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=1000")
+            deadline = time.monotonic() + 0.5
+            budget = 200
+
+            def progress():
+                nonlocal budget
+                budget -= 1
+                return int(budget <= 0 or time.monotonic() >= deadline)
+
+            db.set_progress_handler(progress, 1000)
+            version = db.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            if not version or version[0] != SCHEMA_VERSION:
+                return [], None
+            cutoff = (now or datetime.now(UTC)) - timedelta(days=35)
+
+            def page(after: str):
+                return db.execute(
+                    "SELECT run_id,table_name,status,created_at,snapshot_completed_at,"
+                    "delivered_at,row_count,chunk_count,raw_bytes,compressed_bytes "
+                    "FROM sync_runs WHERE run_id>? ORDER BY run_id LIMIT 256",
+                    (after,),
+                )
+
+            rows = page(cursor)
+            facts = []
+            last = cursor
+            seen = 0
+            while True:
+                try:
+                    row = rows.fetchone()
+                except sqlite3.Error:
+                    # Preserve progress already made when the VM/time budget interrupts.
+                    return facts, last if seen else None
+                if row is None:
+                    if seen == 0 and cursor:
+                        cursor = ""
+                        last = ""
+                        rows = page(cursor)
+                        continue
+                    break
+                seen += 1
+                last = row["run_id"]
+                fact = dict(row)
+                for key in ("created_at", "snapshot_completed_at", "delivered_at"):
+                    fact[key] = _utc(fact[key])
+                if fact["created_at"] is not None:
+                    created = datetime.fromisoformat(fact["created_at"].replace("Z", "+00:00"))
+                    if created >= cutoff:
+                        facts.append(fact)
+                        if len(facts) == 20:
+                            break
+            return facts, last if seen else ""
+    except (OSError, sqlite3.Error, ValueError):
+        return [], None
+
+
+def save_run_cursor(config: AppConfig, cursor: str | None) -> None:
+    if cursor is None or config.paths is None:
+        return
+    path = config.paths.data_dir / "monitor" / "run-cursor.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part = path.with_suffix(".tmp")
+        part.write_text(
+            json.dumps({"after": cursor, "database": config.mysql.database}), encoding="utf-8"
+        )
+        os.replace(part, path)
+    except OSError:
+        pass
 
 
 def metadata(config: AppConfig, now: datetime) -> tuple[dict, list[str]]:
@@ -784,6 +878,28 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
     except (OSError, ValueError, TypeError):
         _warn_collection(["COLLECTION_ERROR"])
         return False, "UPLOAD_SKIPPED"
+    facts, cursor = run_facts(config, now)
+    payload["schema_version"] = 2
+    payload["source_database"] = config.mysql.database
+    payload["run_facts_status"] = "UNAVAILABLE" if cursor is None else "OK"
+    payload["run_facts"] = []
+    # Base heartbeat wins the byte budget. Every included fact is independently
+    # validated; a damaged Source row cannot block future pages.
+    for fact in facts:
+        try:
+            RUN_FACT(fact)
+            candidate = json.dumps(
+                {**payload, "run_facts": [*payload["run_facts"], fact]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(candidate) > MAX_PAYLOAD:
+                continue
+            payload["run_facts"].append(fact)
+        except (ValueError, TypeError):
+            continue
+    # Invalid or individually oversized rows cannot starve later facts.
     try:
         body = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
@@ -796,7 +912,7 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
     _warn_collection(payload.get("collection_errors", []))
     if len(body) > MAX_PAYLOAD:
         return False, "PAYLOAD_TOO_LARGE"
-    name = filename(config.monitoring.node_id, now)
+    name = filename(config.monitoring.node_id, now).replace("-v1--", "-v2--", 1)
     relay = config.relay.model_copy(
         update={
             "connect_timeout_seconds": config.monitoring.upload_connect_timeout_seconds,
@@ -823,8 +939,10 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
             part.write_bytes(body)
             os.replace(part, path)
             RelayUploader(relay, token).upload(path, name, hashlib.sha256(body).hexdigest())
+        save_run_cursor(config, cursor)
         return True, "RELAY_ACCEPTED"
     except (OSError, UploadError) as exc:
+        save_run_cursor(config, cursor)
         if isinstance(exc, UploadError):
             return False, exc.code if exc.code in _UPLOAD_CODES else "UPLOAD_ERROR"
         return False, "TEMP_FILE_ERROR"

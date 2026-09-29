@@ -516,6 +516,7 @@ def assemble_bundle(
     shutil.copy2(REPO_ROOT / "docs" / "monitoring-m2.md", bundle_root / "MONITORING-M2.md")
     shutil.copy2(REPO_ROOT / "docs" / "monitoring-m3.md", bundle_root / "MONITORING-M3.md")
     shutil.copy2(REPO_ROOT / "docs" / "monitoring-m4.md", bundle_root / "MONITORING-M4.md")
+    shutil.copy2(REPO_ROOT / "docs" / "monitoring-m5.md", bundle_root / "MONITORING-M5.md")
 
     manifest.dump(bundle_root / rm.MANIFEST_NAME)
     rm.write_release_env(manifest, bundle_root / rm.RELEASE_ENV_NAME)

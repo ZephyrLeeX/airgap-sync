@@ -63,6 +63,8 @@ maintenance:
 # 可选：仅独立 source monitor-report 命令使用；现有 worker 不读取此节。
 # monitoring:
 #   node_id: source-01
+#   # M5 Reporter sends v2 Run facts. Upgrade Destination Monitor first;
+#   # cursor persists under paths.data_dir/monitor/run-cursor.json.
 #   worker_task_name: Airgap Sync Source Worker
 #   collect_cpu: true
 #   collect_memory: true

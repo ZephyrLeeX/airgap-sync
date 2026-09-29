@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from airgap_sync.common.models import MonitorIngestConfig
-from airgap_sync.monitor.protocol import VALIDATE, timestamp
+from airgap_sync.monitor.protocol import VALIDATE, VALIDATE_V2, timestamp
 
 SCHEMA = """
 CREATE TABLE node_samples (
@@ -45,20 +45,44 @@ CREATE UNIQUE INDEX alerts_one_open ON alerts(fingerprint) WHERE status='OPEN';
 CREATE INDEX alerts_page ON alerts(status,severity,id DESC);
 CREATE INDEX alerts_recovered ON alerts(recovered_at,id);
 CREATE TABLE alert_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 PRAGMA application_id=1095191859;
 """
-MIGRATION_V2 = SCHEMA[SCHEMA.index("CREATE TABLE alerts (") : SCHEMA.index("PRAGMA application_id")]
+MIGRATION_V2 = SCHEMA[
+    SCHEMA.index("CREATE TABLE alerts (") : SCHEMA.index("PRAGMA application_id")
+].replace("PRAGMA user_version=3;", "PRAGMA user_version=2;")
+RUN_SCHEMA = """
+CREATE TABLE source_runs (
+ node_id TEXT NOT NULL, source_database TEXT NOT NULL, table_name TEXT NOT NULL,
+ run_id TEXT NOT NULL, created REAL NOT NULL, last_capture REAL NOT NULL,
+ last_received REAL NOT NULL, facts TEXT NOT NULL, conflicts TEXT NOT NULL,
+ PRIMARY KEY(node_id,source_database,table_name,run_id));
+CREATE INDEX source_runs_list ON source_runs(run_id,node_id,source_database,table_name);
+CREATE INDEX source_runs_match ON source_runs(source_database,table_name,run_id);
+CREATE INDEX source_runs_expiry ON source_runs(last_received);
+PRAGMA user_version=3;
+"""
 
 
 class Conflict(ValueError):
     pass
 
 
+STATUS_RANK = {
+    "GENERATING": 0,
+    "SNAPSHOT_READY": 1,
+    "UPLOADING": 2,
+    "FINALIZING": 3,
+    "FAILED": 4,
+    "DISK_PRESSURE": 4,
+    "DELIVERED": 5,
+}
+
+
 def check_schema(db, *, allow_v1=False):
     version = db.execute("PRAGMA user_version").fetchone()[0]
     if (
-        version not in ((1, 2) if allow_v1 else (2,))
+        version not in ((1, 2, 3) if allow_v1 else (3,))
         or db.execute("PRAGMA application_id").fetchone()[0] != 1095191859
     ):
         raise ValueError("monitor schema unavailable")
@@ -100,8 +124,13 @@ def initialize(path: Path):
         try:
             db.execute("BEGIN IMMEDIATE")
             check_schema(db, allow_v1=True)
-            if db.execute("PRAGMA user_version").fetchone()[0] == 1:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 1:
                 for statement in MIGRATION_V2.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+            if version in (1, 2):
+                for statement in RUN_SCHEMA.split(";"):
                     if statement.strip():
                         db.execute(statement)
             db.commit()
@@ -116,7 +145,9 @@ def initialize(path: Path):
     db = sqlite3.connect(path, timeout=1)
     try:
         db.execute("PRAGMA journal_mode=WAL")
-        db.executescript("BEGIN IMMEDIATE;" + SCHEMA + "COMMIT;")
+        db.executescript(
+            "BEGIN IMMEDIATE;" + SCHEMA.replace("PRAGMA user_version=3;", RUN_SCHEMA) + "COMMIT;"
+        )
     finally:
         db.close()
 
@@ -159,7 +190,56 @@ def ingest(db, cfg: MonitorIngestConfig, name, payload, canonical, digest, now):
              FROM node_samples WHERE hash=latest_hash))""",
             (digest, payload["node_id"], captured, digest),
         )
+        if payload["schema_version"] == 2:
+            for fact in payload["run_facts"]:
+                merge_run(db, payload["node_id"], payload["source_database"], fact, captured, now)
     return True
+
+
+def merge_run(db, node_id, source_database, fact, captured, received):
+    key = (node_id, source_database, fact["table_name"], fact["run_id"])
+    old = db.execute(
+        "SELECT last_capture,facts,conflicts FROM source_runs WHERE "
+        "(node_id,source_database,table_name,run_id)=(?,?,?,?)",
+        key,
+    ).fetchone()
+    if old is None:
+        db.execute(
+            "INSERT INTO source_runs VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                *key,
+                timestamp(fact["created_at"]).timestamp(),
+                captured,
+                received,
+                json.dumps(fact),
+                "[]",
+            ),
+        )
+        return
+    prior = json.loads(old["facts"])
+    conflicts = set(json.loads(old["conflicts"]))
+    for field, value in fact.items():
+        previous = prior.get(field)
+        if value is None:
+            continue
+        if previous is None:
+            prior[field] = value
+        elif previous != value:
+            if field != "status":
+                conflicts.add(field)
+            elif captured == old["last_capture"]:
+                conflicts.add("status")
+            elif captured > old["last_capture"]:
+                if STATUS_RANK[value] >= STATUS_RANK[previous]:
+                    prior[field] = value
+                else:
+                    conflicts.add("status_regression")
+    db.execute(
+        "UPDATE source_runs SET last_capture=max(last_capture,?), "
+        "last_received=max(last_received,?), facts=?, conflicts=? WHERE "
+        "(node_id,source_database,table_name,run_id)=(?,?,?,?)",
+        (captured, received, json.dumps(prior), json.dumps(sorted(conflicts)), *key),
+    )
 
 
 def retention(db, cfg, now):
@@ -191,12 +271,18 @@ def retention(db, cfg, now):
             (SELECT identity FROM observations WHERE seen < ? ORDER BY seen LIMIT ?)""",
             (now - 86400, cfg.batch_size),
         )
+        db.execute(
+            "DELETE FROM source_runs WHERE rowid IN "
+            "(SELECT rowid FROM source_runs WHERE last_received<? "
+            "ORDER BY last_received LIMIT ?)",
+            (now - cfg.history_days * 86400, cfg.batch_size),
+        )
     db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
 
 def _sample(row, now):
     payload = json.loads(row["payload"])
-    VALIDATE(payload)
+    (VALIDATE_V2 if payload["schema_version"] == 2 else VALIDATE)(payload)
     return {
         "sample_id": row["hash"],
         "received_at": datetime.fromtimestamp(row["received"], UTC).isoformat(),

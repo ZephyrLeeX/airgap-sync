@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block title %}Run detail{% endblock %}{% block content %}
+<p class="intro">Run timeline. API timestamps are UTC; displayed timestamps use {{ data.timezone }}.</p>
+<p>Source facts: {{ result.source_status }} · Destination metadata: {{ result.destination_status }}</p>
+{% for run in result['items'] %}
+<h2>{{ run.source_database }}.{{ run.table_name }} · {{ run.run_id }}</h2>
+<p>Node: {{ run.node_id or 'Unknown' }} · Source: {{ run.source_status or 'Not recorded' }} · Destination: {{ run.destination_status or 'Not recorded' }} · Association: {{ run.association }}</p>
+<p>Source observed: {{ run.source_last_observed_at|display_time if run.source_last_observed_at else 'Unknown' }} · Telemetry received: {{ run.source_last_received_at|display_time if run.source_last_received_at else 'Unknown' }} · Destination updated: {{ run.destination_updated_at|display_time if run.destination_updated_at else 'Unknown' }} (update time is not a stage completion).</p>
+{% for state in run.ongoing %}<p>Estimated ongoing elapsed ({{ state.side }} {{ state.status }}, as of {{ state.as_of|display_time }}): {{ state.elapsed_seconds if state.elapsed_seconds is not none else 'Unknown' }} seconds.</p>{% endfor %}
+<h3>Recorded timeline</h3><div class="table-wrap"><table><thead><tr><th>Event</th><th>Time</th><th>Source</th></tr></thead><tbody>
+{% for event in run.timeline %}<tr><td>{{ event.label }}</td><td>{{ event.at|display_time if event.at else 'Not recorded' }}</td><td>{{ event.origin }}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Stage durations</h3><div class="table-wrap"><table><thead><tr><th>Stage</th><th>Seconds</th><th>State</th><th>Clock</th></tr></thead><tbody>
+{% for interval in run.intervals %}<tr><td>{{ interval.label }}</td><td>{{ interval.seconds if interval.seconds is not none else 'Unknown' }}</td><td>{{ interval.state }}</td><td>{{ interval.clock }}</td></tr>{% endfor %}</tbody></table></div>
+<h3>Performance</h3><ul>{% for key, value in run.metrics.items() %}<li>{{ key }}: {{ value if value is not none else 'Unknown' }}</li>{% endfor %}</ul>
+<p>Missing: {{ run.missing|join(', ') if run.missing else 'None' }}. Conflicts/anomalies: {{ run.anomalies|join(', ') if run.anomalies else 'None' }}.</p>
+{% else %}<p>No matching Run in the bounded query, or metadata is unavailable.</p>{% endfor %}
+{% endblock %}

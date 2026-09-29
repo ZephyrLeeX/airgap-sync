@@ -953,6 +953,68 @@ class DestinationMySQLConnection:
             20,
         )
 
+    def monitoring_run_page(
+        self,
+        *,
+        after: tuple[str, str | None, str | None] = ("", "", ""),
+        limit: int = 50,
+        source_database: str | None = None,
+        table_name: str | None = None,
+        run_id: str | None = None,
+    ) -> list[MonitoringRunRecord]:
+        """Bounded primary-key page for the read-only timeline API."""
+        if after[1] is None:
+            where = ["run_id>%s"]
+            args: list = [after[0]]
+        else:
+            where = ["(run_id,source_database,table_name)>(%s,%s,%s)"]
+            args = list(after)
+        if source_database is not None:
+            where.append("source_database=%s")
+            args.append(source_database)
+        if table_name is not None:
+            where.append("table_name=%s")
+            args.append(table_name)
+        if run_id is not None:
+            where.append("run_id=%s")
+            args.append(run_id)
+        rows = self._fetchall(
+            "SELECT run_id,source_database,table_name,status,row_count,actual_row_count,"
+            "chunk_count,source_created_at,manifest_received_at,validated_at,"
+            "import_started_at,import_completed_at,digest_verified_at,applied_at,"
+            "updated_at,NULL,NULL,NULL,"
+            "incoming_cleanup_completed_at,backup_cleanup_completed_at "
+            f"FROM {self._metadata}.runs WHERE {' AND '.join(where)} "
+            "ORDER BY run_id,source_database,table_name LIMIT %s",
+            (*args, limit),
+        )
+        return [MonitoringRunRecord(*row) for row in rows]
+
+    def monitoring_runs_for_identities(
+        self, identities: list[tuple[str, str, str]]
+    ) -> list[MonitoringRunRecord]:
+        """One bounded primary-key lookup for a Source page; verify full identities."""
+        run_ids = sorted({run_id for run_id, _, _ in identities})
+        if not run_ids:
+            return []
+        placeholders = ",".join("%s" for _ in run_ids)
+        rows = self._fetchall(
+            "SELECT run_id,source_database,table_name,status,row_count,actual_row_count,"
+            "chunk_count,source_created_at,manifest_received_at,validated_at,"
+            "import_started_at,import_completed_at,digest_verified_at,applied_at,"
+            "updated_at,NULL,NULL,NULL,"
+            "incoming_cleanup_completed_at,backup_cleanup_completed_at "
+            f"FROM {self._metadata}.runs WHERE run_id IN ({placeholders}) LIMIT %s",
+            (*run_ids, len(run_ids)),
+        )
+        wanted = set(identities)
+        records = [MonitoringRunRecord(*row) for row in rows]
+        return [
+            record
+            for record in records
+            if (record.run_id, record.source_database, record.table_name) in wanted
+        ]
+
     def _monitoring_query(
         self, where: str, order_column: str, limit: int
     ) -> list[MonitoringRunRecord]:

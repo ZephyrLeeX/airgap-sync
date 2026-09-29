@@ -28,6 +28,12 @@ def text(value):
         raise ValueError("control character")
 
 
+def short_text(value):
+    text(value)
+    if len(value) > 64:
+        raise ValueError("length")
+
+
 def integer(value):
     if type(value) is not int or not 0 <= value <= 2**63 - 1:
         raise ValueError("integer")
@@ -71,6 +77,7 @@ def obj(**fields):
         for key, check in fields.items():
             check(value[key])
 
+    validate.fields = fields
     return validate
 
 
@@ -168,6 +175,36 @@ VALIDATE = obj(
     ),
 )
 
+# v2 adds persisted Run facts; v1 remains an exact, unchanged schema.
+RUN_FACT = obj(
+    run_id=short_text,
+    table_name=short_text,
+    status=enum(
+        "GENERATING",
+        "UPLOADING",
+        "FINALIZING",
+        "SNAPSHOT_READY",
+        "DELIVERED",
+        "FAILED",
+        "DISK_PRESSURE",
+    ),
+    created_at=timestamp,
+    snapshot_completed_at=T,
+    delivered_at=T,
+    row_count=N,
+    chunk_count=N,
+    raw_bytes=N,
+    compressed_bytes=N,
+)
+VALIDATE_V2 = obj(
+    **{
+        **VALIDATE.fields,
+        "source_database": short_text,
+        "run_facts_status": enum("OK", "UNAVAILABLE"),
+        "run_facts": array(RUN_FACT, 20),
+    }
+)
+
 
 def _pairs(pairs):
     result = {}
@@ -187,8 +224,14 @@ def decode(body: bytes, name: str) -> tuple[dict, str, str]:
     if not match or len(body) > MAX_BYTES:
         raise ValueError("envelope")
     payload = json.loads(body.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
-    VALIDATE(payload)
-    if payload["schema_version"] != 1 or match["version"] != "1":
+    version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if version == 1:
+        VALIDATE(payload)
+    elif version == 2:
+        VALIDATE_V2(payload)
+    else:
+        raise ValueError("version")
+    if match["version"] != str(version):
         raise ValueError("version")
     if payload["node_id"] != match["node"]:
         raise ValueError("node")

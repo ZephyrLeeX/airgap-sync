@@ -274,7 +274,7 @@ def test_persisted_error_redacts_configured_secret(tmp_path, monkeypatch):
     monkeypatch.setattr("airgap_sync.monitor.dashboard.DestinationMySQLConnection", SecretError)
     response = TestClient(create_app(config(tmp_path))).get("/runs")
     assert "private-password" not in response.text
-    assert "[REDACTED]" in response.text
+    assert "Last error" not in response.text
 
 
 def test_monitoring_mysql_queries_are_select_only(tmp_path):

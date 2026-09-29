@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -20,6 +20,7 @@ from airgap_sync.monitor.alerts import read_alerts, summary
 from airgap_sync.monitor.dashboard import snapshot
 from airgap_sync.monitor.ingest import BackgroundIngest
 from airgap_sync.monitor.store import read_sources
+from airgap_sync.monitor.timeline import read_runs
 
 
 def _empty_is_none(value):
@@ -86,6 +87,20 @@ def create_app(config: AppConfig) -> FastAPI:
 
     templates.env.filters["display_time"] = display_time
 
+    def run_query(**kwargs):
+        try:
+            return read_runs(config, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid Run cursor") from exc
+
+    def run_page_data():
+        return {
+            "timezone": str(zone),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "status": "OBSERVATIONS",
+            "query_error": None,
+        }
+
     def render(request: Request, page: str) -> HTMLResponse:
         return templates.TemplateResponse(
             request, f"{page}.html", {"data": data_snapshot(), "page": page}
@@ -100,8 +115,84 @@ def create_app(config: AppConfig) -> FastAPI:
         return render(request, "tables")
 
     @app.get("/runs", response_class=HTMLResponse)
-    def runs(request: Request) -> HTMLResponse:
-        return render(request, "runs")
+    def runs(
+        request: Request,
+        before: str = Query("", max_length=512),
+        node: str | None = Query(None, max_length=64),
+        database: str | None = Query(None, max_length=64),
+        table: str | None = Query(None, max_length=64),
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "runs.html",
+            {
+                "data": run_page_data(),
+                "page": "runs",
+                "result": run_query(
+                    before=before,
+                    node=_empty_is_none(node),
+                    database=_empty_is_none(database),
+                    table=_empty_is_none(table),
+                ),
+                "filters": {"node": node, "database": database, "table": table},
+            },
+        )
+
+    @app.get("/runs/{run_id}", response_class=HTMLResponse)
+    def run_detail(
+        request: Request,
+        run_id: str,
+        node: str | None = Query(None, max_length=64),
+        database: str | None = Query(None, max_length=64),
+        table: str | None = Query(None, max_length=64),
+    ):
+        result = run_query(
+            limit=100,
+            run_id=run_id,
+            node=_empty_is_none(node),
+            database=_empty_is_none(database),
+            table=_empty_is_none(table),
+        )
+        return templates.TemplateResponse(
+            request,
+            "run-detail.html",
+            {
+                "data": run_page_data(),
+                "page": "runs",
+                "result": result,
+            },
+        )
+
+    @app.get("/api/runs")
+    def runs_api(
+        limit: int = Query(50, ge=1, le=100),
+        before: str = Query("", max_length=512),
+        node: str | None = Query(None, max_length=64),
+        database: str | None = Query(None, max_length=64),
+        table: str | None = Query(None, max_length=64),
+    ):
+        return run_query(
+            limit=limit,
+            before=before,
+            node=_empty_is_none(node),
+            database=_empty_is_none(database),
+            table=_empty_is_none(table),
+        )
+
+    @app.get("/api/runs/{run_id}")
+    def run_detail_api(
+        run_id: str,
+        node: str | None = Query(None, max_length=64),
+        database: str | None = Query(None, max_length=64),
+        table: str | None = Query(None, max_length=64),
+    ):
+        return run_query(
+            limit=100,
+            run_id=run_id,
+            node=_empty_is_none(node),
+            database=_empty_is_none(database),
+            table=_empty_is_none(table),
+        )
 
     @app.get("/system", response_class=HTMLResponse)
     def system(request: Request) -> HTMLResponse:

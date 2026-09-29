@@ -539,6 +539,18 @@ v1 数据库事务化迁移到 v2；未知或损坏的数据库会拒绝写入�
 浏览 `/alerts` 与 `/api/alerts` 检查 OPEN、RECOVERED 与评估可用性；离线包中为
 `MONITORING-M4.md`。未配置 `monitor_alerts` 的部署保持 M1–M3 行为。
 
+### Monitoring M5 Run Timeline 升级
+
+先停止旧 Monitor Web 和独立 ingest，以 SQLite backup API 备份 `monitor.db`，然后部署并启动
+新版 Destination Monitor。它在专属锁下把已知 v1/v2 monitor.db 事务迁移到 v3，同时继续接收
+v1 telemetry。确认 `/api/runs` 可读后，再部署新版 Windows Source Reporter；Reporter
+发送严格的 v2 telemetry，并在 `<data_dir>/monitor/run-cursor.json` 保存有界轮转游标。
+必须先确认外部 Relay/FTP 允许 `airgap-monitor-v2--...json` 和 64 KiB 文件。
+旧 Destination 无法解析 v2，会在宽限后隔离新文件。历史 Run 回补只覆盖 Source SQLite
+仍保留且创建于近 35 天的记录，Relay 接收不等于 Destination 入库。升级和现场检查细节见
+[Monitoring M5](monitoring-m5.md)；离线包内为 `MONITORING-M5.md`。Web 模板、CSS、
+JavaScript 与新 timeline 模块均打包在应用 wheel 内，无额外在线资源。
+
 M3 在独立 Monitor 服务内运行后台 telemetry ingest，默认数据库是
 `/var/lib/airgap-sync-monitor/monitor.db`。给现有 Destination YAML 增加可选 `monitor_ingest`
 段才启用；不必修改 Source M2 配置或业务 Worker。使用真实 Linux incoming 绝对路径，允许

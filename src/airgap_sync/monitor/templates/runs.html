@@ -1,6 +1,22 @@
 {% extends "base.html" %}{% block title %}Runs{% endblock %}{% block content %}
-<p class="intro">Recent Destination runs, ordered by last update.</p><div class="table-wrap"><table><thead><tr><th>Run ID</th><th>Source database</th><th>Table</th><th>Status</th><th>Expected / actual rows</th><th>Chunks</th><th>Source created</th><th>Manifest received</th><th>Validated</th><th>Import started</th><th>Import completed</th><th>Digest verified</th><th>Applied</th><th>Destination elapsed</th><th>Last error</th><th>Cleanup</th></tr></thead><tbody>
-{% for run in data.runs %}<tr><td>{{ run.run_id }}</td><td>{{ run.source_database }}</td><td>{{ run.table_name }}</td><td><span class="badge {{ run.status|lower }}">{{ run.status }}</span></td><td>{{ run.expected_rows }} / {{ run.actual_rows if run.actual_rows is not none else '—' }}</td><td>{{ run.chunk_count }}</td>
-{% for key in ('source_created_at','manifest_received_at','validated_at','import_started_at','import_completed_at','digest_verified_at','applied_at') %}<td title="{{ run.timestamps[key] or '' }}">{{ run.display_timestamps[key] }}</td>{% endfor %}
-<td>{{ run.duration }}</td><td class="error" title="{{ run.last_error or '' }}">{{ run.last_error or '—' }}</td><td>{{ 'Pending' if run.cleanup_pending else (run.cleanup_error or '—') }}</td></tr>{% else %}<tr><td colspan="16">No run metadata available</td></tr>{% endfor %}
-</tbody></table></div>{% endblock %}
+<p class="intro">Recorded Source and Destination Runs. Times are shown in {{ data.timezone }}; API values remain UTC. A page never proves an older Run is absent.</p>
+<p>Source facts: {{ result.source_status }} · Destination metadata: {{ result.destination_status }}</p>
+<form method="get" action="/runs"><label>Node <input name="node" value="{{ filters.node or '' }}"></label> <label>Database <input name="database" value="{{ filters.database or '' }}"></label> <label>Table <input name="table" value="{{ filters.table or '' }}"></label> <button type="submit">Filter</button></form>
+<div class="table-wrap"><table><thead><tr><th>Run</th><th>Node</th><th>Database</th><th>Table</th><th>Source</th><th>Destination</th><th>Source rows</th><th>Dest expected / actual rows</th><th>Source / Dest chunks</th><th>Raw bytes</th><th>Compressed bytes</th><th>Snapshot seconds</th><th>Import seconds</th><th>End-to-end seconds</th><th>Compressed / raw</th><th>Association</th></tr></thead><tbody>
+{% for run in result['items'] %}<tr>
+<td><a href="/runs/{{ run.run_id|urlencode }}?node={{ (run.node_id or '')|urlencode }}&amp;database={{ run.source_database|urlencode }}&amp;table={{ run.table_name|urlencode }}">{{ run.run_id }}</a></td>
+<td>{{ run.node_id or 'Unknown' }}</td><td>{{ run.source_database }}</td><td>{{ run.table_name }}</td>
+<td>{{ run.source_status or 'Not recorded' }}</td><td>{{ run.destination_status or 'Not recorded' }}</td>
+<td>{{ run.metrics.source_rows if run.metrics.source_rows is not none else 'Unknown' }}</td>
+<td>{{ run.metrics.destination_expected_rows if run.metrics.destination_expected_rows is not none else 'Unknown' }} / {{ run.metrics.destination_actual_rows if run.metrics.destination_actual_rows is not none else 'Unknown' }}</td>
+<td>{{ run.metrics.source_chunks if run.metrics.source_chunks is not none else 'Unknown' }} / {{ run.metrics.destination_chunks if run.metrics.destination_chunks is not none else 'Unknown' }}</td>
+<td>{{ run.metrics.raw_bytes if run.metrics.raw_bytes is not none else 'Unknown' }}</td>
+<td>{{ run.metrics.compressed_bytes if run.metrics.compressed_bytes is not none else 'Unknown' }}</td>
+<td>{{ run.duration_seconds.snapshot if run.duration_seconds.snapshot is not none else 'Unknown' }}</td>
+<td>{{ run.duration_seconds['import'] if run.duration_seconds['import'] is not none else 'Unknown' }}</td>
+<td>{{ run.duration_seconds.end_to_end if run.duration_seconds.end_to_end is not none else 'Unknown' }}</td>
+<td>{{ run.metrics.compressed_over_raw if run.metrics.compressed_over_raw is not none else 'Unknown' }}</td>
+<td>{{ run.association }}</td></tr>{% else %}<tr><td colspan="16">No Run on this page; try another cursor or check data availability.</td></tr>{% endfor %}
+</tbody></table></div>
+{% if result.next_cursor %}<a href="/runs?before={{ result.next_cursor|urlencode }}&amp;node={{ (filters.node or '')|urlencode }}&amp;database={{ (filters.database or '')|urlencode }}&amp;table={{ (filters.table or '')|urlencode }}">Next page</a>{% endif %}
+{% endblock %}

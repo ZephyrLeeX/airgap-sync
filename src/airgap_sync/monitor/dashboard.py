@@ -49,7 +49,7 @@ def _run(run: MonitoringRunRecord, now: datetime, zone: ZoneInfo, secrets: tuple
         )
     }
     start = dates["manifest_received_at"]
-    end = dates["applied_at"] or utc(run.updated_at)
+    end = dates["applied_at"]
     return {
         "run_id": run.run_id,
         "source_database": run.source_database,
@@ -63,7 +63,7 @@ def _run(run: MonitoringRunRecord, now: datetime, zone: ZoneInfo, secrets: tuple
             key: value.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z") if value else "—"
             for key, value in dates.items()
         },
-        "duration": str(end - start).split(".")[0] if start and end >= start else "—",
+        "duration": str(end - start).split(".")[0] if start and end and end >= start else "—",
         "last_error": _redact(run.last_error, secrets),
         "cleanup_pending": run.cleanup_pending,
         "cleanup_error": _redact(run.cleanup_error or run.backup_cleanup_error, secrets),

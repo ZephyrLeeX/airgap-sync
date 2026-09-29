@@ -142,7 +142,7 @@ def test_migrate_v1_retains_data_and_rejects_unknown(tmp_path):
             "observations",
         ):
             assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
     with sqlite3.connect(path) as db:
         db.execute("PRAGMA user_version=999")
     try:
@@ -177,7 +177,7 @@ def test_migration_failure_rolls_back_and_retries(tmp_path):
         db.execute("DROP TABLE alerts")
     store.initialize(path)
     with store.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.execute("SELECT received FROM content_receipts").fetchone()[0] == 7
 
 

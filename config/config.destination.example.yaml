@@ -43,7 +43,7 @@ tables: []
 #   scan_limit: 2000 # 每轮每个目录的目录项枚举上限
 #   settle_seconds: 30
 #   invalid_grace_seconds: 300
-#   history_days: 35
+#   history_days: 35 # M5 Source Run facts按最后收到时间独立保留；需启用此节
 #   dedup_days: 90 # 必须大于 history_days
 #   quarantine_days: 7
 #   quarantine_max_files: 1000
