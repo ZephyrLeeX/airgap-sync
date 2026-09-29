@@ -89,13 +89,20 @@ def _query_one(db: sqlite3.Connection, sql: str, args: tuple = ()) -> dict | Non
     return dict(row) if row else None
 
 
-def run_facts(config: AppConfig, now: datetime | None = None) -> tuple[list[dict], str | None]:
+def run_facts(
+    config: AppConfig, now: datetime | None = None, *, progress: bool = False
+) -> tuple[list[dict], str | None]:
     """Advance a durable keyset through bounded raw rows, including old Runs."""
     assert config.paths is not None
     db_path = state_db_path(config.paths.data_dir)
-    cursor_path = config.paths.data_dir / "monitor" / "run-cursor.json"
+    cursor_path = (
+        config.paths.data_dir
+        / "monitor"
+        / ("progress-cursor.json" if progress else "run-cursor.json")
+    )
     try:
-        raw = cursor_path.read_bytes()
+        with cursor_path.open("rb") as stream:
+            raw = stream.read(257)
         saved = json.loads(raw) if len(raw) <= 256 else {}
         if saved.get("database", config.mysql.database) != config.mysql.database:
             logger.warning("Source Run identity binding changed; Run facts withheld")
@@ -167,10 +174,14 @@ def run_facts(config: AppConfig, now: datetime | None = None) -> tuple[list[dict
         return [], None
 
 
-def save_run_cursor(config: AppConfig, cursor: str | None) -> None:
+def save_run_cursor(config: AppConfig, cursor: str | None, *, progress: bool = False) -> None:
     if cursor is None or config.paths is None:
         return
-    path = config.paths.data_dir / "monitor" / "run-cursor.json"
+    path = (
+        config.paths.data_dir
+        / "monitor"
+        / ("progress-cursor.json" if progress else "run-cursor.json")
+    )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         part = path.with_suffix(".tmp")
@@ -879,12 +890,15 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
         _warn_collection(["COLLECTION_ERROR"])
         return False, "UPLOAD_SKIPPED"
     facts, cursor = run_facts(config, now)
-    payload["schema_version"] = 2
+    payload["schema_version"] = 4
     payload["source_database"] = config.mysql.database
     payload["run_facts_status"] = "UNAVAILABLE" if cursor is None else "OK"
     payload["run_facts"] = []
-    # Base heartbeat wins the byte budget. Every included fact is independently
-    # validated; a damaged Source row cannot block future pages.
+    payload["run_progress"] = []
+    from airgap_sync.monitor.progress import path_for, read
+    from airgap_sync.monitor.protocol import RUN_PROGRESS_V4
+
+    # Facts get the full heartbeat budget before optional progress observations.
     for fact in facts:
         try:
             RUN_FACT(fact)
@@ -894,9 +908,62 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
                 separators=(",", ":"),
                 allow_nan=False,
             ).encode("utf-8")
-            if len(candidate) > MAX_PAYLOAD:
-                continue
-            payload["run_facts"].append(fact)
+            if len(candidate) <= MAX_PAYLOAD:
+                payload["run_facts"].append(fact)
+        except (ValueError, TypeError):
+            continue
+    progress_facts, progress_cursor = run_facts(config, now, progress=True)
+    progress_root = config.paths.data_dir / "monitor" / "progress" / "source"
+    progress_after = None
+    for fact in progress_facts:
+        if len(payload["run_progress"]) >= 5:
+            break
+        progress_after = fact["run_id"]
+        saved = read(
+            path_for(
+                progress_root,
+                config.monitoring.node_id,
+                config.mysql.database,
+                fact["table_name"],
+                fact["run_id"],
+            )
+        )
+        if not saved or saved.get("identity") != [
+            config.monitoring.node_id,
+            config.mysql.database,
+            fact["table_name"],
+            fact["run_id"],
+        ]:
+            continue
+        stages = [
+            {"stage": stage, **item}
+            for stage, item in saved["stages"].items()
+            if stage.startswith("source_")
+            and isinstance(item, dict)
+            and type(item.get("generation")) is int
+            and type(item.get("sequence")) is int
+        ]
+        if not stages:
+            continue
+        observation = {"run_id": fact["run_id"], "table_name": fact["table_name"], "stages": stages}
+        try:
+            RUN_PROGRESS_V4(observation)
+            candidate = json.dumps(
+                {**payload, "run_progress": [*payload["run_progress"], observation]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            progress_bytes = len(
+                json.dumps(
+                    [*payload["run_progress"], observation],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            if len(candidate) <= MAX_PAYLOAD and progress_bytes <= 32768:
+                payload["run_progress"].append(observation)
         except (ValueError, TypeError):
             continue
     # Invalid or individually oversized rows cannot starve later facts.
@@ -912,7 +979,7 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
     _warn_collection(payload.get("collection_errors", []))
     if len(body) > MAX_PAYLOAD:
         return False, "PAYLOAD_TOO_LARGE"
-    name = filename(config.monitoring.node_id, now).replace("-v1--", "-v2--", 1)
+    name = filename(config.monitoring.node_id, now).replace("-v1--", "-v4--", 1)
     relay = config.relay.model_copy(
         update={
             "connect_timeout_seconds": config.monitoring.upload_connect_timeout_seconds,
@@ -940,6 +1007,7 @@ def report(config: AppConfig, config_path: Path) -> tuple[bool, str]:
             os.replace(part, path)
             RelayUploader(relay, token).upload(path, name, hashlib.sha256(body).hexdigest())
         save_run_cursor(config, cursor)
+        save_run_cursor(config, progress_after or progress_cursor, progress=True)
         return True, "RELAY_ACCEPTED"
     except (OSError, UploadError) as exc:
         save_run_cursor(config, cursor)

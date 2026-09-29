@@ -967,7 +967,9 @@ class DestinationMySQLConnection:
             where = ["run_id>%s"]
             args: list = [after[0]]
         else:
-            where = ["(run_id,source_database,table_name)>(%s,%s,%s)"]
+            # Inclusive: a Destination-key cursor re-reads its own boundary row
+            # because a uniquely associated row can still owe its joined record.
+            where = ["(run_id,source_database,table_name)>=(%s,%s,%s)"]
             args = list(after)
         if source_database is not None:
             where.append("source_database=%s")

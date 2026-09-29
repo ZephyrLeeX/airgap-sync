@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from airgap_sync.common.models import AppConfig
+from airgap_sync.monitor.progress import path_for, read
 from airgap_sync.source.delivery import DeliveryRunner
 from airgap_sync.source.state import SourceState, state_db_path
 from airgap_sync.source.uploader import UploadConfirmation, UploadError
@@ -101,6 +102,29 @@ def run(tmp_path, source, uploader):
         state.close()
 
 
+def test_progress_separates_confirmed_and_retry_payload_bytes(tmp_path):
+    class RetryingUploader(Uploader):
+        def upload(self, path, name, sha256, *, on_attempt=None):
+            confirmation = super().upload(path, name, sha256, on_attempt=on_attempt)
+            if on_attempt:
+                on_attempt(2)
+            return UploadConfirmation(name, confirmation.size, sha256, confirmation.request_id, 2)
+
+    result, artifacts, _ = run(tmp_path, Source(), RetryingUploader())
+    assert result.status == "DELIVERED"
+    path = path_for(
+        tmp_path / "data" / "monitor" / "progress" / "source", "source", "db", "t", result.run_id
+    )
+    stages = read(path)["stages"]
+    upload = stages["source_upload_call"]
+    confirmed = sum(artifact.size for artifact in artifacts)
+    assert upload["bytes"] == confirmed
+    assert upload["retry_bytes"] == confirmed
+    assert upload["attempts"] == 2 * len(artifacts)
+    assert upload["chunks"] == upload["total_chunks"] == 3
+    assert upload["state"] == "COMPLETE"
+
+
 def test_producer_continues_while_first_upload_is_blocked(tmp_path):
     started = threading.Event()
     release = threading.Event()
@@ -132,6 +156,22 @@ def test_manifest_is_last_and_success_cleans_local_run(tmp_path):
     assert all(a.upload_status == "UPLOADED" for a in artifacts)
     assert table.last_delivered_run_id == result.run_id
     assert not result.run_dir.exists()
+
+
+def test_manifest_upload_failure_preserves_completed_scan_and_encoding(tmp_path):
+    result, _, _ = run(tmp_path, Source(), Uploader(fail_on="manifest.json"))
+    stages = read(
+        path_for(
+            tmp_path / "data" / "monitor" / "progress" / "source",
+            "source",
+            "db",
+            "t",
+            result.run_id,
+        )
+    )["stages"]
+    assert stages["source_read_wait"]["state"] == "COMPLETE"
+    assert stages["source_encode_write"]["state"] == "COMPLETE"
+    assert stages["source_upload_call"]["state"] == "INTERRUPTED"
 
 
 def test_confirmed_chunk_cleanup_failure_is_not_reuploaded(tmp_path, monkeypatch):

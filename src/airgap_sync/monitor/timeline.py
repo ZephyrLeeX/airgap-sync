@@ -9,6 +9,9 @@ from datetime import UTC, datetime
 
 from airgap_sync.destination.mysql import METADATA_SCHEMA_VERSION, DestinationMySQLConnection
 from airgap_sync.monitor import store
+from airgap_sync.monitor.progress import STAGES, path_for
+from airgap_sync.monitor.progress import display as display_progress
+from airgap_sync.monitor.progress import read as read_progress
 
 EVENTS = (
     ("source_created", "Source Run created", "created_at", "source"),
@@ -276,7 +279,7 @@ def _exact_destinations(config, sources, known=()):
     try:
         with DestinationMySQLConnection(config.mysql, config.destination, monitor_timeout=3) as db:
             if db.metadata_schema_version() != METADATA_SCHEMA_VERSION:
-                return "UNAVAILABLE", {}
+                return "UNAVAILABLE", result
             keys = {
                 (source["run_id"], source["source_database"], source["table_name"])
                 for source in missing
@@ -286,7 +289,7 @@ def _exact_destinations(config, sources, known=()):
                 result[(dest.run_id, dest.source_database, dest.table_name)] = dest
             return "OK", result
     except Exception:
-        return "UNAVAILABLE", {}
+        return "UNAVAILABLE", result
 
 
 def _exact_sources(cfg, destinations):
@@ -319,6 +322,9 @@ def _cursor_tuple(value):
         return ("", "", "", "")
     try:
         data = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+        if not isinstance(data, dict) or data.get("version") != 2:
+            raise ValueError("legacy cursor version")
+        data = data.get("key")
         if (
             not isinstance(data, list)
             or len(data) != 4
@@ -335,9 +341,41 @@ def _item_key(item):
 
 
 def _destination_after(after):
-    # Destination has no node. Once a node key is passed, every Destination
-    # identity under that run_id is already behind the cursor.
+    # Destination has no node field. A Destination key cursor re-reads its own
+    # boundary row: a uniquely associated row at that key can still owe its
+    # joined record at a Source key after the cursor, and the re-read row is
+    # filtered by the cursor and cannot be shown twice. Once a node-bearing key
+    # is passed, every Destination row of that run sorts before the cursor and
+    # was either emitted at its Destination key or is uniquely associated and
+    # is emitted at its Source key by the exact identity lookups.
     return (after[0], None, None) if after[1] else (after[0], after[2], after[3])
+
+
+def _attach_progress(config, item):
+    root = config.monitor_ingest.db_path.parent / "progress" if config.monitor_ingest else None
+    stages = {}
+    if root:
+        for side, node in (("source", item["node_id"]), ("destination", "destination")):
+            if side == "source" and node is None:
+                continue
+            saved = read_progress(
+                path_for(
+                    root / side, node, item["source_database"], item["table_name"], item["run_id"]
+                )
+            )
+            identity = [node, item["source_database"], item["table_name"], item["run_id"]]
+            if saved and saved.get("identity") == identity:
+                stages.update(
+                    {
+                        name: display_progress(value, remote=side == "source")
+                        for name, value in saved["stages"].items()
+                        if name in STAGES
+                        and name.startswith(side + "_")
+                        and isinstance(value, dict)
+                    }
+                )
+    item["progress"] = stages
+    return item
 
 
 def read_runs(config, *, before="", limit=50, node=None, database=None, table=None, run_id=None):
@@ -376,30 +414,49 @@ def read_runs(config, *, before="", limit=50, node=None, database=None, table=No
         key = (dest.run_id, "", dest.source_database, dest.table_name)
         matches = destination_sources.get((dest.source_database, dest.table_name, dest.run_id), [])
         item = assemble(matches[0], dest) if len(matches) == 1 else assemble(None, dest)
-        if len(matches) > 1:
-            item["association"] = "ambiguous"
-        elif not matches:
-            item["association"] = "unresolved"
+        if len(matches) == 1:
+            # A joined record always occupies its full Source identity key,
+            # independent of whether the Destination page or the exact lookup
+            # found the row, so its position never depends on query success.
+            key = _item_key(item)
+        else:
+            item["association"] = "ambiguous" if matches else "unresolved"
         entries.append((key, item))
     for source in sources:
         identity = (source["run_id"], source["source_database"], source["table_name"])
         dest = source_destinations.get(identity)
         matches = source_matches.get((identity[1], identity[2], identity[0]), []) if dest else []
-        if node is None and dest and len(matches) == 1:
-            # The joined item lives at its Destination key, on this or a later page.
-            continue
-        if node is not None and dest and len(matches) == 1:
+        if dest and len(matches) == 1:
+            # Exact identity lookups are independent of the Destination page
+            # cursor, so a joined record keeps its Source key position even
+            # when the Destination keyset has already passed its row.
             item = assemble(source, dest)
         else:
             item = assemble(source, None)
             item["association"] = "ambiguous" if dest else "unresolved"
         entries.append((_item_key(item), item))
-    entries = sorted((key, item) for key, item in entries if key > after)
+    unique_entries = {}
+    for key, item in entries:
+        if key <= after:
+            continue
+        previous = unique_entries.get(key)
+        if previous is None or item.get("destination_status") is not None:
+            unique_entries[key] = item
+    entries = sorted(unique_entries.items())
     frontier = None
     if len(sources) == limit + 1:
         last = sources[-1]
-        frontier = (last["run_id"], last["node_id"], last["source_database"], last["table_name"])
+        frontier = (
+            last["run_id"],
+            last["node_id"] or "",
+            last["source_database"],
+            last["table_name"],
+        )
     if len(destinations) == limit + 1:
+        # Hold the page at the Destination key of the first unfetched row.
+        # Records at Source keys of the same run sort after it and wait until
+        # the Destination side advanced, so a node-bearing boundary can never
+        # skip an unfetched Destination row of the same run.
         last = destinations[-1]
         dest_frontier = (last.run_id, "", last.source_database, last.table_name)
         frontier = min(frontier, dest_frontier) if frontier else dest_frontier
@@ -415,13 +472,17 @@ def read_runs(config, *, before="", limit=50, node=None, database=None, table=No
     else:
         boundary = after
     next_cursor = (
-        base64.urlsafe_b64encode(json.dumps(boundary).encode()).decode().rstrip("=")
+        base64.urlsafe_b64encode(
+            json.dumps({"version": 2, "key": boundary}, separators=(",", ":")).encode()
+        )
+        .decode()
+        .rstrip("=")
         if more and boundary > after
         else None
     )
     return {
         "source_status": source_status,
         "destination_status": dest_status,
-        "items": [item for _, item in entries[:limit]],
+        "items": [_attach_progress(config, item) for _, item in entries[:limit]],
         "next_cursor": next_cursor,
     }

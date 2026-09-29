@@ -201,11 +201,13 @@ class TestBundleRuntimePolicy:
         )
         assert (bundle / "runtime" / runtime_name).read_bytes() == b"runtime"
         assert (bundle / "MONITORING-M3.md").is_file()
+        assert (bundle / "MONITORING-M6.md").is_file()
         assert "monitor_ingest:" in (bundle / "config/destination.example.yaml").read_text()
         assert (
             "ExecStartPre=" in (bundle / "service/airgap-sync-monitor.service.example").read_text()
         )
         assert "MONITORING-M3.md" in (bundle / "SHA256SUMS").read_text()
+        assert "MONITORING-M6.md" in (bundle / "SHA256SUMS").read_text()
 
     def test_linux_download_platforms_reject_generic_linux_and_musl(self) -> None:
         """generic linux_x86_64 / musllinux 不提供 glibc <= 2.17 ABI 承诺。"""

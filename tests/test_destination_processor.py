@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -7,7 +8,13 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from airgap_sync.common.models import AppConfig
+import pytest
+import zstandard
+
+from airgap_sync.common.manifest import ChunkMeta, manifest_payload
+from airgap_sync.common.models import AppConfig, MonitorIngestConfig
+from airgap_sync.common.row_codec import encode_row
+from airgap_sync.common.transport import transport_filename
 from airgap_sync.destination.mysql import (
     DestinationColumn,
     DestinationMySQLError,
@@ -16,6 +23,7 @@ from airgap_sync.destination.mysql import (
     staging_table_name,
 )
 from airgap_sync.destination.processor import DestinationProcessor
+from airgap_sync.monitor.progress import display, path_for, read
 from test_destination_incoming import RUN, make_run
 
 
@@ -246,6 +254,113 @@ def test_full_pipeline_verifies_promotes_and_cleans_incoming(tmp_path):
     assert not list(app_config.destination.incoming_dir.iterdir())
 
 
+def test_full_pipeline_records_independent_import_and_verify_progress(tmp_path):
+    app_config = config(tmp_path).model_copy(
+        update={
+            "monitor_ingest": MonitorIngestConfig(
+                incoming=tmp_path / "telemetry", db_path=tmp_path / "monitor.db"
+            )
+        }
+    )
+    rows = [(1, "one"), (2, "two")]
+    make_run(app_config.destination.incoming_dir, rows=rows)
+    assert DestinationProcessor(FakeDestinationDB(), app_config).process(RUN).status == "VERIFIED"
+    path = path_for(
+        tmp_path / "progress" / "destination", "destination", "source_db", "new_table", RUN
+    )
+    stages = read(path)["stages"]
+    assert stages["destination_import"]["rows"] == 2
+    assert stages["destination_import"]["state"] == "COMPLETE"
+    assert stages["destination_verify"]["rows"] == 2
+    assert stages["destination_verify"]["state"] == "COMPLETE"
+
+
+def test_import_rate_excludes_recovered_chunks(tmp_path):
+    app_config = config(tmp_path).model_copy(
+        update={
+            "monitor_ingest": MonitorIngestConfig(
+                incoming=tmp_path / "telemetry", db_path=tmp_path / "monitor.db"
+            )
+        }
+    )
+    rows = ((1, "one"), (2, "two"))
+    manifest = make_run(app_config.destination.incoming_dir, rows=rows)
+    chunks = []
+    for sequence, row in enumerate(rows, 1):
+        raw = encode_row(row) + b"\n"
+        body = zstandard.ZstdCompressor().compress(raw)
+        filename = f"chunk-{sequence:06d}.jsonl.zst"
+        (app_config.destination.incoming_dir / transport_filename(RUN, filename)).write_bytes(body)
+        chunks.append(
+            ChunkMeta(
+                sequence=sequence,
+                file=filename,
+                rows=1,
+                uncompressed_bytes=len(raw),
+                compressed_bytes=len(body),
+                sha256=hashlib.sha256(body).hexdigest(),
+            )
+        )
+    manifest = manifest.model_copy(update={"chunks": chunks})
+    (app_config.destination.incoming_dir / transport_filename(RUN, "manifest.json")).write_bytes(
+        manifest_payload(manifest)
+    )
+
+    class ResumingDB(FakeDestinationDB):
+        def __init__(self, restored):
+            super().__init__()
+            self.restored = restored
+
+        def register_validated_run(self, manifest, staging, source_created_at):
+            super().register_validated_run(manifest, staging, source_created_at)
+            if self.restored:
+                self.objects[staging] = "BASE TABLE"
+                self.rows = list(rows[: self.restored])
+                for sequence in range(1, self.restored + 1):
+                    self.chunk_statuses[sequence] = "IMPORTED"
+
+    for restored in (0, 1, 2):
+        case = tmp_path / f"case-{restored}"
+        case.mkdir()
+        # A separate incoming copy lets each process complete and clean up its files.
+        import shutil
+
+        shutil.copytree(app_config.destination.incoming_dir, case / "incoming")
+        cfg = app_config.model_copy(
+            update={
+                "destination": app_config.destination.model_copy(
+                    update={"incoming_dir": case / "incoming"}
+                ),
+                "monitor_ingest": MonitorIngestConfig(
+                    incoming=case / "telemetry", db_path=case / "monitor.db"
+                ),
+            }
+        )
+        db = ResumingDB(restored)
+        if restored:
+            db.register_validated_run(manifest, staging_table_name(RUN), datetime.now(UTC))
+        result = DestinationProcessor(db, cfg).process(RUN)
+        assert result.status == "VERIFIED", result.error
+        stage = read(
+            path_for(
+                case / "progress" / "destination", "destination", "source_db", "new_table", RUN
+            )
+        )["stages"]["destination_import"]
+        assert stage["rows"] == 2 and stage["chunks"] == 2
+        assert stage["processed_rows"] == 2 - restored
+        shown = display(stage)
+        if restored == 2:
+            assert stage["seconds"] == 0
+            assert shown["rows_per_second"] is None
+            assert shown["bytes_per_second"] is None
+        else:
+            assert stage["window_rows"] == 2 - restored
+            assert stage["window_bytes"] == sum(
+                chunk.compressed_bytes for chunk in chunks[restored:]
+            )
+            assert shown["rows_per_second"] is not None
+
+
 def test_verification_reads_database_and_mismatch_keeps_incoming(tmp_path):
     app_config = config(tmp_path)
     make_run(app_config.destination.incoming_dir, rows=((1, "correct file"),))
@@ -256,6 +371,39 @@ def test_verification_reads_database_and_mismatch_keeps_incoming(tmp_path):
     assert result.status == "MISMATCH"
     assert database.renames == []
     assert list(app_config.destination.incoming_dir.iterdir())
+
+
+def test_verification_failure_keeps_import_complete(tmp_path):
+    from airgap_sync.destination.mysql import DestinationMySQLError
+
+    app_config = config(tmp_path).model_copy(
+        update={
+            "monitor_ingest": MonitorIngestConfig(
+                incoming=tmp_path / "telemetry", db_path=tmp_path / "monitor.db"
+            )
+        }
+    )
+    make_run(app_config.destination.incoming_dir, rows=((1, "one"),))
+
+    class VerifyFailure(FakeDestinationDB):
+        @contextmanager
+        def stream_table_columns(self, table, columns, fetch_size):
+            if table != "new_table":
+                raise DestinationMySQLError("injected verification failure")
+            yield iter(self.target_rows)
+
+    assert DestinationProcessor(VerifyFailure(), app_config).process(RUN).status == "FAILED"
+    stages = read(
+        path_for(
+            tmp_path / "progress" / "destination",
+            "destination",
+            "source_db",
+            "new_table",
+            RUN,
+        )
+    )["stages"]
+    assert stages["destination_import"]["state"] == "COMPLETE"
+    assert stages["destination_verify"]["state"] == "INTERRUPTED"
 
 
 def test_empty_table_verifies_and_promotes(tmp_path):
@@ -603,3 +751,53 @@ def test_staging_name_is_deterministic_bounded_and_source_independent():
     assert first.startswith("__airgap_stg_")
     assert len(first) <= 64
     assert "new_table" not in first
+
+
+def test_staged_recovery_skips_import_and_keeps_previous_completion(tmp_path):
+    from airgap_sync.destination.mysql import DestinationMySQLError
+
+    app_config = config(tmp_path).model_copy(
+        update={
+            "monitor_ingest": MonitorIngestConfig(
+                incoming=tmp_path / "telemetry", db_path=tmp_path / "monitor.db"
+            )
+        }
+    )
+    manifest = make_run(app_config.destination.incoming_dir, rows=((1, "one"), (2, "two")))
+    path = path_for(
+        tmp_path / "progress" / "destination", "destination", "source_db", "new_table", RUN
+    )
+
+    class CrashBeforeVerify(FakeDestinationDB):
+        # First attempt dies after staging; no interrupt handler runs.
+        def set_verifying(self, run_id):
+            raise RuntimeError("simulated crash between staging and verification")
+
+    crashed = CrashBeforeVerify()
+    with pytest.raises(RuntimeError):
+        DestinationProcessor(crashed, app_config).process(RUN)
+    assert crashed.run.status == "STAGED"
+    old_import = read(path)["stages"]["destination_import"]
+    assert old_import["state"] == "COMPLETE" and old_import["rows"] == 2
+
+    class VerifyFailure(FakeDestinationDB):
+        @contextmanager
+        def stream_table_columns(self, table, columns, fetch_size):
+            if table != "new_table":
+                raise DestinationMySQLError("injected verification failure")
+            yield iter(self.target_rows)
+
+    # Second attempt recovers from STAGED: import is skipped, verify fails.
+    resumed = VerifyFailure()
+    resumed.register_validated_run(manifest, staging_table_name(RUN), datetime.now(UTC))
+    resumed.run = replace(resumed.run, status="STAGED")
+    resumed.objects[staging_table_name(RUN)] = "BASE TABLE"
+    resumed.rows = [(1, "one"), (2, "two")]
+    for chunk in manifest.chunks:
+        resumed.chunk_statuses[chunk.sequence] = "IMPORTED"
+
+    assert DestinationProcessor(resumed, app_config).process(RUN).status == "FAILED"
+    stages = read(path)["stages"]
+    assert stages["destination_import"] == old_import
+    assert stages["destination_verify"]["state"] == "INTERRUPTED"
+    assert stages["destination_verify"]["attempt"] != old_import["attempt"]

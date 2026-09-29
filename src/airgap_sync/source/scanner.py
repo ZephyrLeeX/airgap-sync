@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from airgap_sync.common.manifest import ChunkMeta
 from airgap_sync.common.models import ChunkConfig, SnapshotConfig
 from airgap_sync.common.row_codec import encode_row
 from airgap_sync.common.verification import MultisetDigest, VerificationSummary
+from airgap_sync.monitor.progress import Recorder
 from airgap_sync.source.chunk_writer import ChunkWriter
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ def scan_table(
     *,
     on_chunk_closed: Callable[[ChunkMeta], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
+    progress: Recorder | None = None,
 ) -> ScanResult:
     """流式扫描一张表, 生成 Chunk 文件并计算验证摘要。
 
@@ -72,6 +75,9 @@ def scan_table(
     摘要与行顺序无关。
     """
     digest = MultisetDigest()
+    if progress:
+        progress.update("source_read_wait")
+        progress.update("source_encode_write")
     with ChunkWriter(
         run_dir,
         chunk_config,
@@ -80,14 +86,43 @@ def scan_table(
     ) as writer:
         with source.stream_table(table_name, snapshot_config.fetch_size) as stream:
             columns = list(stream.columns)
-            for batch in stream:
+            iterator = iter(stream)
+            while True:
+                started = time.monotonic()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    if progress:
+                        progress.update(
+                            "source_read_wait",
+                            seconds=time.monotonic() - started,
+                            state="COMPLETE",
+                            force=True,
+                        )
+                    break
+                if progress:
+                    progress.update("source_read_wait", seconds=time.monotonic() - started)
                 if cancel_check is not None:
                     cancel_check()
+                started = time.monotonic()
+                count = 0
+                byte_count = 0
                 for row in batch:
                     encoded = encode_row(row)
                     writer.write_row(encoded)
                     digest.update(encoded)
+                    count += 1
+                    byte_count += len(encoded) + 1
+                if progress:
+                    progress.update(
+                        "source_encode_write",
+                        rows=count,
+                        bytes_=byte_count,
+                        seconds=time.monotonic() - started,
+                    )
         chunks = writer.finish()
+        if progress:
+            progress.update("source_encode_write", chunks=len(chunks), state="COMPLETE", force=True)
     logger.info(
         "scan finished: table=%s rows=%d chunks=%d", table_name, digest.row_count, len(chunks)
     )

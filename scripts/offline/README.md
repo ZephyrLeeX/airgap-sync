@@ -15,6 +15,9 @@ Full operator documentation: `docs/offline-deployment.md`.
 | `airgap-sync-deploy.ps1` | Windows deploy script (bundled; PowerShell 5.1 compatible) |
 | `service-examples/` | systemd unit examples and the Windows worker wrapper |
 
+Each bundle includes `OFFLINE-DEPLOYMENT.md` and `MONITORING-M2.md` through
+`MONITORING-M6.md`; M6 explains the v4 telemetry upgrade, stage units, and rollback.
+
 ## Build (networked machine)
 
 ```bash

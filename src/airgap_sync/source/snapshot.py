@@ -46,6 +46,7 @@ from airgap_sync.common.manifest import (
 )
 from airgap_sync.common.models import AppConfig
 from airgap_sync.common.verification import DIGEST_ALGORITHM
+from airgap_sync.monitor.progress import Recorder
 from airgap_sync.source.mysql import check_table, fetch_table_info
 from airgap_sync.source.scanner import ScanResult, SnapshotSource, scan_table
 from airgap_sync.source.state import SourceState, TableStatus
@@ -158,11 +159,20 @@ class SnapshotRunner:
         run_dir = outbox_run_dir(self._config.paths.data_dir, table_name, run_id)
         self._state.register_table(table_name)
         self._state.begin_run(table_name, run_id)
+        progress = Recorder(
+            self._config.paths.data_dir / "monitor" / "progress" / "source",
+            self._config.monitoring.node_id if self._config.monitoring else "source",
+            self._config.mysql.database,
+            table_name,
+            run_id,
+        )
         started = datetime.now(UTC)
         logger.info("snapshot started: table=%s run_id=%s", table_name, run_id)
         try:
-            scan = self._generate(table_name, run_id, run_dir)
+            scan = self._generate(table_name, run_id, run_dir, progress)
         except Exception as exc:
+            progress.update("source_read_wait", state="INTERRUPTED", force=True)
+            progress.update("source_encode_write", state="INTERRUPTED", force=True)
             self._state.fail_run(table_name, run_id, str(exc))
             elapsed = (datetime.now(UTC) - started).total_seconds()
             logger.error(
@@ -214,7 +224,9 @@ class SnapshotRunner:
             run_dir=run_dir,
         )
 
-    def _generate(self, table_name: str, run_id: str, run_dir: Path) -> ScanResult:
+    def _generate(
+        self, table_name: str, run_id: str, run_dir: Path, progress: Recorder | None = None
+    ) -> ScanResult:
         """Run 主体: DDL → 扫描 → DDL → schema.sql + manifest。"""
         run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -226,6 +238,7 @@ class SnapshotRunner:
             run_dir,
             self._config.snapshot,
             self._config.chunk,
+            progress=progress,
         )
 
         ddl_after = self._source.get_create_table(table_name)

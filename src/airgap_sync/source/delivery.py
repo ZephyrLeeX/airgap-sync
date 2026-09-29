@@ -27,6 +27,7 @@ from airgap_sync.common.manifest import (
 from airgap_sync.common.models import AppConfig
 from airgap_sync.common.transport import transport_filename
 from airgap_sync.common.verification import DIGEST_ALGORITHM
+from airgap_sync.monitor.progress import Recorder
 from airgap_sync.source.mysql import check_table, fetch_table_info
 from airgap_sync.source.scanner import SnapshotSource, scan_table
 from airgap_sync.source.snapshot import (
@@ -99,6 +100,13 @@ class DeliveryRunner:
         run_dir = outbox_run_dir(self._config.paths.data_dir, table_name, run_id)
         self._state.register_table(table_name)
         self._state.begin_run(table_name, run_id)
+        progress = Recorder(
+            self._config.paths.data_dir / "monitor" / "progress" / "source",
+            self._config.monitoring.node_id if self._config.monitoring else "source",
+            self._config.mysql.database,
+            table_name,
+            run_id,
+        )
         run_dir.mkdir(parents=True, exist_ok=False)
 
         upload_queue: queue.Queue[_UploadItem | None] = queue.Queue()
@@ -132,6 +140,7 @@ class DeliveryRunner:
                     if already_failed:
                         continue
                     try:
+                        upload_started = time.monotonic()
                         confirmation = self._uploader.upload(
                             item.path,
                             item.transport_name,
@@ -139,6 +148,14 @@ class DeliveryRunner:
                             on_attempt=lambda attempt, name=item.logical_name: (
                                 worker_state.mark_upload_attempt(run_id, name, attempt)
                             ),
+                        )
+                        progress.update(
+                            "source_upload_call",
+                            chunks=int(item.logical_name.startswith("chunk-")),
+                            bytes_=item.size,
+                            attempts=confirmation.attempts,
+                            retry_bytes=item.size * (confirmation.attempts - 1),
+                            seconds=time.monotonic() - upload_started,
                         )
                         # 远端确认先持久化；本地删除失败绝不能触发重新上传。
                         worker_state.mark_uploaded(
@@ -175,6 +192,12 @@ class DeliveryRunner:
                             confirmation.attempts,
                         )
                     except UploadError as exc:
+                        progress.update(
+                            "source_upload_call",
+                            attempts=exc.attempts,
+                            retry_bytes=item.size * max(exc.attempts - 1, 0),
+                            seconds=time.monotonic() - upload_started,
+                        )
                         worker_state.mark_artifact_failed(
                             run_id, item.logical_name, exc.attempts, str(exc)
                         )
@@ -237,7 +260,9 @@ class DeliveryRunner:
                 self._config.chunk,
                 on_chunk_closed=on_chunk_closed,
                 cancel_check=check_fatal,
+                progress=progress,
             )
+            progress.update("source_upload_call", total_chunks=len(scan.chunks))
             ddl_after = self._source.get_create_table(table_name)
             if _normalize_ddl(ddl_before) != _normalize_ddl(ddl_after):
                 raise SnapshotError(
@@ -272,6 +297,7 @@ class DeliveryRunner:
                 SCHEMA_FILENAME,
                 schema_path,
                 hashlib.sha256(schema_bytes).hexdigest(),
+                progress,
             )
 
             manifest = Manifest(
@@ -314,6 +340,7 @@ class DeliveryRunner:
                 MANIFEST_FILENAME,
                 manifest_path,
                 hashlib.sha256(manifest_bytes).hexdigest(),
+                progress,
             )
             self._state.deliver_run(
                 table_name,
@@ -323,6 +350,7 @@ class DeliveryRunner:
                 raw_bytes=raw_bytes,
                 compressed_bytes=compressed_bytes,
             )
+            progress.update("source_upload_call", state="COMPLETE", force=True)
             self._cleanup_delivered_run(run_id, run_dir)
             finished = time.monotonic()
             snapshot_seconds = max((scan_completed_at or finished) - started, 0.000001)
@@ -354,6 +382,9 @@ class DeliveryRunner:
                 run_dir,
             )
         except Exception as exc:
+            progress.update("source_read_wait", state="INTERRUPTED", force=True)
+            progress.update("source_encode_write", state="INTERRUPTED", force=True)
+            progress.update("source_upload_call", state="INTERRUPTED", force=True)
             is_disk = isinstance(exc, DeliveryError) and exc.code in {
                 DISK_PRESSURE,
                 UPLOAD_BACKLOG_LIMIT,
@@ -372,13 +403,20 @@ class DeliveryRunner:
             )
 
     def _upload_final_artifact(
-        self, run_id: str, kind: str, logical_name: str, path: Path, sha256: str
+        self,
+        run_id: str,
+        kind: str,
+        logical_name: str,
+        path: Path,
+        sha256: str,
+        progress: Recorder | None = None,
     ) -> None:
         transport_name = transport_filename(run_id, logical_name)
         size = path.stat().st_size
         self._state.register_artifact(
             run_id, kind, None, logical_name, transport_name, size, sha256
         )
+        upload_started = time.monotonic()
         try:
             confirmation = self._uploader.upload(
                 path,
@@ -389,8 +427,23 @@ class DeliveryRunner:
                 ),
             )
         except UploadError as exc:
+            if progress:
+                progress.update(
+                    "source_upload_call",
+                    attempts=exc.attempts,
+                    retry_bytes=size * max(exc.attempts - 1, 0),
+                    seconds=time.monotonic() - upload_started,
+                )
             self._state.mark_artifact_failed(run_id, logical_name, exc.attempts, str(exc))
             raise
+        if progress:
+            progress.update(
+                "source_upload_call",
+                bytes_=size,
+                attempts=confirmation.attempts,
+                retry_bytes=size * (confirmation.attempts - 1),
+                seconds=time.monotonic() - upload_started,
+            )
         self._state.mark_uploaded(
             run_id, logical_name, confirmation.attempts, confirmation.request_id
         )

@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from airgap_sync.common.models import MonitorIngestConfig
-from airgap_sync.monitor.protocol import VALIDATE, VALIDATE_V2, timestamp
+from airgap_sync.monitor.progress import merge_received
+from airgap_sync.monitor.protocol import VALIDATE, VALIDATE_V2, VALIDATE_V3, VALIDATE_V4, timestamp
 
 SCHEMA = """
 CREATE TABLE node_samples (
@@ -190,9 +191,17 @@ def ingest(db, cfg: MonitorIngestConfig, name, payload, canonical, digest, now):
              FROM node_samples WHERE hash=latest_hash))""",
             (digest, payload["node_id"], captured, digest),
         )
-        if payload["schema_version"] == 2:
+        if payload["schema_version"] in (2, 3, 4):
             for fact in payload["run_facts"]:
                 merge_run(db, payload["node_id"], payload["source_database"], fact, captured, now)
+    if payload["schema_version"] in (3, 4):
+        for fact in payload["run_progress"]:
+            merge_received(
+                cfg.db_path.parent / "progress" / "source",
+                payload["node_id"],
+                payload["source_database"],
+                fact,
+            )
     return True
 
 
@@ -282,7 +291,9 @@ def retention(db, cfg, now):
 
 def _sample(row, now):
     payload = json.loads(row["payload"])
-    (VALIDATE_V2 if payload["schema_version"] == 2 else VALIDATE)(payload)
+    {1: VALIDATE, 2: VALIDATE_V2, 3: VALIDATE_V3, 4: VALIDATE_V4}[payload["schema_version"]](
+        payload
+    )
     return {
         "sample_id": row["hash"],
         "received_at": datetime.fromtimestamp(row["received"], UTC).isoformat(),

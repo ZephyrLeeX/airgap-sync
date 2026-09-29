@@ -205,6 +205,49 @@ VALIDATE_V2 = obj(
     }
 )
 
+# v3 adds bounded stage observations. v1/v2 validators remain unchanged.
+PROGRESS_STAGE = obj(
+    stage=enum("source_read_wait", "source_encode_write", "source_upload_call"),
+    attempt=short_text,
+    state=enum("RUNNING", "COMPLETE", "INTERRUPTED"),
+    rows=integer,
+    chunks=integer,
+    bytes=integer,
+    seconds=lambda value: _seconds(value),
+    attempts=integer,
+    retry_bytes=integer,
+    total_rows=N,
+    total_chunks=N,
+    observed_at=timestamp,
+    window_seconds=nullable(lambda value: _seconds(value)),
+    window_rows=N,
+    window_bytes=N,
+)
+RUN_PROGRESS = obj(run_id=short_text, table_name=short_text, stages=array(PROGRESS_STAGE, 3))
+VALIDATE_V3 = obj(**{**VALIDATE_V2.fields, "run_progress": array(RUN_PROGRESS, 5)})
+PROGRESS_STAGE_V4 = obj(
+    **{
+        **PROGRESS_STAGE.fields,
+        "generation": lambda value: _positive(value),
+        "sequence": lambda value: _positive(value),
+        "processed_rows": integer,
+        "processed_bytes": integer,
+    }
+)
+RUN_PROGRESS_V4 = obj(run_id=short_text, table_name=short_text, stages=array(PROGRESS_STAGE_V4, 3))
+VALIDATE_V4 = obj(**{**VALIDATE_V2.fields, "run_progress": array(RUN_PROGRESS_V4, 5)})
+
+
+def _seconds(value):
+    if type(value) not in (int, float) or not 0 <= value <= 2**63 - 1:
+        raise ValueError("seconds")
+
+
+def _positive(value):
+    integer(value)
+    if value == 0:
+        raise ValueError("positive")
+
 
 def _pairs(pairs):
     result = {}
@@ -229,6 +272,10 @@ def decode(body: bytes, name: str) -> tuple[dict, str, str]:
         VALIDATE(payload)
     elif version == 2:
         VALIDATE_V2(payload)
+    elif version == 3:
+        VALIDATE_V3(payload)
+    elif version == 4:
+        VALIDATE_V4(payload)
     else:
         raise ValueError("version")
     if match["version"] != str(version):

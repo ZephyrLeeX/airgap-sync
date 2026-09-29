@@ -551,6 +551,18 @@ v1 telemetry。确认 `/api/runs` 可读后，再部署新版 Windows Source Rep
 [Monitoring M5](monitoring-m5.md)；离线包内为 `MONITORING-M5.md`。Web 模板、CSS、
 JavaScript 与新 timeline 模块均打包在应用 wheel 内，无额外在线资源。
 
+### Monitoring M6 阶段进度升级
+
+先升级 Destination Monitor 与 Destination Worker，再升级 Windows Source Worker 和独立
+Reporter。先确认 Relay/FTP 放行 `airgap-monitor-v4--...json` 和 64 KiB；旧 Monitor
+不接受 v4。`monitor.db` 仍为 v3，不迁移业务元数据；阶段快照单独保存在
+`<monitor.db 父目录>/progress/{source,destination}`，Source 本地快照位于
+`<data_dir>/monitor/progress/source`。为 Worker 与 Monitor 服务账户授权相应目录写权限，
+为 Reporter 授权 Source 快照读权限。回滚 Source Reporter 至 M5 v2 可停止新增阶段遥测；
+回滚 Destination Monitor 前先停 v4 Reporter，否则 v4 文件会隔离。不要删除旧 `monitor.db`
+或阶段文件。现场检查阶段、累计量、未知总量、过期状态及实际 Relay 延迟；具体口径和回滚限制见
+[Monitoring M6](monitoring-m6.md)，离线包内为 `MONITORING-M6.md`。
+
 M3 在独立 Monitor 服务内运行后台 telemetry ingest，默认数据库是
 `/var/lib/airgap-sync-monitor/monitor.db`。给现有 Destination YAML 增加可选 `monitor_ingest`
 段才启用；不必修改 Source M2 配置或业务 Worker。使用真实 Linux incoming 绝对路径，允许

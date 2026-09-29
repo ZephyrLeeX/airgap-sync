@@ -2,6 +2,7 @@
 
 import copy
 import json
+import random
 import sqlite3
 from datetime import UTC, datetime
 
@@ -372,7 +373,7 @@ def test_real_report_to_safe_ingest_contract(config_data, tmp_path, monkeypatch)
 
     monkeypatch.setattr(monitor_report.RelayUploader, "upload", upload)
     assert monitor_report.report(config, tmp_path / "source.yaml") == (True, "RELAY_ACCEPTED")
-    assert sent[0].startswith("airgap-monitor-v2--")
+    assert sent[0].startswith("airgap-monitor-v4--")
     clock = [time.time()]
     with Ingestor(cfg, lambda: clock[0]) as ing:
         assert ing.tick()["waiting"] == 1
@@ -523,7 +524,7 @@ def _timeline_case(config_data, tmp_path, monkeypatch, source_ids, destination_i
             eligible = [d for d in destinations if d.run_id > after[0]]
         else:
             eligible = [
-                d for d in destinations if (d.run_id, d.source_database, d.table_name) > after
+                d for d in destinations if (d.run_id, d.source_database, d.table_name) >= after
             ]
         eligible = [
             d
@@ -657,7 +658,7 @@ def test_destination_keyset_sql_uses_full_identity(monkeypatch):
     monkeypatch.setattr(db, "_fetchall", lambda sql, args: queries.append((sql, args)) or [])
     db.monitoring_run_page(after=("r3", "d", "t"), limit=3)
     sql, args = queries.pop()
-    assert "(run_id,source_database,table_name)>(%s,%s,%s)" in sql
+    assert "(run_id,source_database,table_name)>=(%s,%s,%s)" in sql
     assert "ORDER BY run_id,source_database,table_name LIMIT %s" in sql
     assert args == ("r3", "d", "t", 3)
     db.monitoring_run_page(after=("r3", None, None), limit=3)
@@ -677,6 +678,126 @@ def test_destination_keyset_sql_uses_full_identity(monkeypatch):
     sql, args = queries.pop()
     assert "WHERE run_id IN (%s,%s) LIMIT %s" in sql
     assert args == ("r1", "r2", 2)
+
+
+@pytest.mark.parametrize("failed_query", ["page", "exact"])
+def test_timeline_query_failure_keeps_known_facts_and_pages(
+    config_data, tmp_path, monkeypatch, failed_query
+):
+    cfg = MonitorIngestConfig(incoming=tmp_path / "incoming", db_path=tmp_path / "monitor.db")
+    store.initialize(cfg.db_path)
+    fact = {
+        "run_id": "",
+        "table_name": "t",
+        "status": "DELIVERED",
+        "created_at": "2026-09-29T00:00:00Z",
+        "snapshot_completed_at": None,
+        "delivered_at": None,
+        "row_count": 1,
+        "chunk_count": 1,
+        "raw_bytes": 1,
+        "compressed_bytes": 1,
+    }
+    with store.connect(cfg.db_path, write=True) as db, db:
+        for run_id in ("r1", "r2"):
+            store.merge_run(
+                db, "node-a", "d", {**fact, "run_id": run_id}, NOW.timestamp(), NOW.timestamp()
+            )
+    config_data.update(
+        role="destination",
+        destination={"incoming_dir": str(tmp_path)},
+        monitor_ingest=cfg.model_dump(),
+    )
+    config = AppConfig.model_validate(config_data)
+    records = [_destination_record("r1"), _destination_record("r2")]
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def metadata_schema_version(self):
+            return timeline.METADATA_SCHEMA_VERSION
+
+        def monitoring_run_page(self, *, after, limit, **kwargs):
+            if failed_query == "page":
+                raise OSError("injected page failure")
+            if after[1] is None:
+                eligible = [record for record in records[:1] if record.run_id > after[0]]
+            else:
+                eligible = [
+                    record
+                    for record in records[:1]
+                    if (record.run_id, record.source_database, record.table_name) >= after
+                ]
+            return eligible[:limit]
+
+        def monitoring_runs_for_identities(self, identities):
+            if failed_query == "exact":
+                raise OSError("injected exact failure")
+            return [
+                record
+                for record in records
+                if (record.run_id, record.source_database, record.table_name) in identities
+            ]
+
+    monkeypatch.setattr(timeline, "DestinationMySQLConnection", Connection)
+    seen = []
+    cursor = ""
+    for _ in range(5):
+        result = timeline.read_runs(config, before=cursor, limit=1)
+        assert result["source_status"] == "OK"
+        assert result["destination_status"] == "UNAVAILABLE"
+        seen.extend(result["items"])
+        cursor = result["next_cursor"]
+        if cursor is None:
+            break
+    else:
+        pytest.fail("pagination did not terminate")
+    assert {item["run_id"] for item in seen} == {"r1", "r2"}
+    assert len(seen) == 2
+    assert sum(item["destination_status"] == "VERIFIED" for item in seen) >= 1
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_exact_failure_does_not_move_joined_run_between_pages(
+    config_data, tmp_path, monkeypatch, limit
+):
+    config = _timeline_case(
+        config_data,
+        tmp_path,
+        monkeypatch,
+        [("r2", "node-n1"), ("r5", "node-n0")],
+        ["r3", "r5", "r7"],
+    )
+    monkeypatch.setattr(
+        timeline,
+        "_exact_destinations",
+        lambda _config, _sources, known=(): (
+            "UNAVAILABLE",
+            {(item.run_id, item.source_database, item.table_name): item for item in known},
+        ),
+    )
+    seen = []
+    before = ""
+    for _ in range(20):
+        page = timeline.read_runs(config, before=before, limit=limit)
+        seen.extend(page["items"])
+        before = page["next_cursor"]
+        if before is None:
+            break
+    else:
+        pytest.fail("pagination did not terminate")
+    identities = [(item["run_id"], item["node_id"], item["destination_status"]) for item in seen]
+    assert [item["run_id"] for item in seen] == ["r2", "r3", "r5", "r7"]
+    assert len(identities) == len(set(identities)) == 4
+    assert sum(item["run_id"] == "r5" for item in seen) == 1
+    assert next(item for item in seen if item["run_id"] == "r5")["destination_status"] == "VERIFIED"
 
 
 def test_run_facts_budget_interrupt_saves_partial_progress(config_data, tmp_path, monkeypatch):
@@ -767,3 +888,267 @@ def test_same_run_different_source_identity_is_not_joined(config_data, tmp_path,
     assert separate["source_database"] == "other-db"
     assert separate["destination_status"] is None
     assert separate["association"] == "unresolved"
+
+
+def _merge_sources(config_data, tmp_path, source_ids):
+    """Real SQLite monitor store plus a destination role config for the walk."""
+    cfg = MonitorIngestConfig(incoming=tmp_path / "incoming", db_path=tmp_path / "monitor.db")
+    store.initialize(cfg.db_path)
+    fact = {
+        "run_id": "",
+        "table_name": "",
+        "status": "DELIVERED",
+        "created_at": "2026-09-29T00:00:00Z",
+        "snapshot_completed_at": None,
+        "delivered_at": None,
+        "row_count": 1,
+        "chunk_count": 1,
+        "raw_bytes": 1,
+        "compressed_bytes": 1,
+    }
+    with store.connect(cfg.db_path, write=True) as db, db:
+        for run_id, node, database, table in source_ids:
+            store.merge_run(
+                db,
+                node,
+                database,
+                {**fact, "run_id": run_id, "table_name": table},
+                NOW.timestamp(),
+                NOW.timestamp(),
+            )
+    data = dict(config_data)
+    data.update(
+        role="destination",
+        destination={"incoming_dir": str(tmp_path)},
+        monitor_ingest=cfg.model_dump(),
+    )
+    return AppConfig.model_validate(data)
+
+
+def _simulated_rds(monkeypatch, records, *, page_failures=(), exact_failures=()):
+    """Simulated RDS honoring the real keyset contract, with injectable failures."""
+    calls = {"page": 0, "exact": 0}
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata_schema_version(self):
+            return timeline.METADATA_SCHEMA_VERSION
+
+        def monitoring_run_page(
+            self, *, after, limit, source_database=None, table_name=None, run_id=None
+        ):
+            calls["page"] += 1
+            if calls["page"] in page_failures:
+                raise OSError("injected page failure")
+            if after[1] is None:
+                eligible = [record for record in records if record.run_id > after[0]]
+            else:
+                eligible = [
+                    record
+                    for record in records
+                    if (record.run_id, record.source_database, record.table_name) >= after
+                ]
+            eligible = [
+                record
+                for record in eligible
+                if (source_database is None or record.source_database == source_database)
+                and (table_name is None or record.table_name == table_name)
+                and (run_id is None or record.run_id == run_id)
+            ]
+            return sorted(eligible, key=lambda r: (r.run_id, r.source_database, r.table_name))[
+                :limit
+            ]
+
+        def monitoring_runs_for_identities(self, identities):
+            calls["exact"] += 1
+            if calls["exact"] in exact_failures:
+                raise OSError("injected exact failure")
+            wanted = set(identities)
+            return [
+                record
+                for record in records
+                if (record.run_id, record.source_database, record.table_name) in wanted
+            ]
+
+    monkeypatch.setattr(timeline, "DestinationMySQLConnection", Connection)
+    return calls
+
+
+def _walk(config, *, limit, max_pages=40):
+    seen, cursor = [], ""
+    for _ in range(max_pages):
+        page = timeline.read_runs(config, before=cursor, limit=limit)
+        seen.extend(page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return seen
+    pytest.fail("pagination did not terminate")
+
+
+def _identity(item):
+    return (item["run_id"], item["node_id"] or "", item["source_database"], item["table_name"])
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_same_run_source_identities_survive_page_boundary(
+    config_data, tmp_path, monkeypatch, limit
+):
+    sources = [("r1", "node-a", "other", "t"), ("r1", "node-z", "d", "t")]
+    destinations = [("r1", "d", "t"), ("r2", "d", "t")]
+    config = _merge_sources(config_data, tmp_path, sources)
+    _simulated_rds(monkeypatch, [_destination_record(*identity) for identity in destinations])
+    seen = _walk(config, limit=limit)
+    assert sorted(map(_identity, seen)) == [
+        ("r1", "node-a", "other", "t"),
+        ("r1", "node-z", "d", "t"),
+        ("r2", "", "d", "t"),
+    ]
+    # A record's sort position is its full logical identity and never moves:
+    # pages deliver the identities in one global key order.
+    assert [_identity(item) for item in seen] == sorted(_identity(item) for item in seen)
+    by_key = {_identity(item): item for item in seen}
+    assert by_key[("r1", "node-z", "d", "t")]["destination_status"] == "VERIFIED"
+    assert by_key[("r1", "node-z", "d", "t")]["association"] == "unique"
+    assert by_key[("r1", "node-a", "other", "t")]["destination_status"] is None
+    assert by_key[("r1", "node-a", "other", "t")]["association"] == "unresolved"
+    assert by_key[("r2", "", "d", "t")]["destination_status"] == "VERIFIED"
+    assert by_key[("r2", "", "d", "t")]["association"] == "unresolved"
+    # Paginating must show exactly the identities a single full read shows.
+    full = _walk(config, limit=50)
+    assert sorted(map(_identity, full)) == sorted(map(_identity, seen))
+
+
+def test_same_run_mixed_unique_ambiguous_and_source_only(config_data, tmp_path, monkeypatch):
+    sources = [
+        ("r1", "node-a", "d", "t"),
+        ("r1", "node-b", "d", "t"),
+        ("r1", "node-a", "other", "u"),
+        ("r1", "node-z", "db3", "t"),
+    ]
+    destinations = [("r1", "d", "t"), ("r1", "other", "u"), ("r2", "d", "t")]
+    config = _merge_sources(config_data, tmp_path, sources)
+    _simulated_rds(monkeypatch, [_destination_record(*identity) for identity in destinations])
+    seen = _walk(config, limit=2)
+    by_key = {_identity(item): item for item in seen}
+    assert set(by_key) == {
+        ("r1", "node-a", "d", "t"),
+        ("r1", "node-b", "d", "t"),
+        ("r1", "", "d", "t"),
+        ("r1", "node-a", "other", "u"),
+        ("r1", "node-z", "db3", "t"),
+        ("r2", "", "d", "t"),
+    }
+    for key in (("r1", "node-a", "d", "t"), ("r1", "node-b", "d", "t"), ("r1", "", "d", "t")):
+        assert by_key[key]["association"] == "ambiguous"
+    # Only the Destination-native ambiguous record carries Destination facts.
+    assert by_key[("r1", "", "d", "t")]["destination_status"] == "VERIFIED"
+    assert by_key[("r1", "node-a", "d", "t")]["destination_status"] is None
+    assert by_key[("r1", "node-b", "d", "t")]["destination_status"] is None
+    assert by_key[("r1", "node-a", "other", "u")]["association"] == "unique"
+    assert by_key[("r1", "node-a", "other", "u")]["destination_status"] == "VERIFIED"
+    assert by_key[("r1", "node-z", "db3", "t")]["association"] == "unresolved"
+    assert by_key[("r1", "node-z", "db3", "t")]["destination_status"] is None
+    assert by_key[("r2", "", "d", "t")]["association"] == "unresolved"
+    assert [_identity(item) for item in seen] == sorted(_identity(item) for item in seen)
+
+
+def test_timeline_random_identities_match_full_read(config_data, tmp_path, monkeypatch):
+    rng = random.Random(20260929)
+    runs = ("r1", "r2", "r3")
+    nodes = ("node-a", "node-b", "node-z")
+    pairs = [("d", "t"), ("other", "t"), ("d", "u")]
+    for trial in range(12):
+        combos = [(run, node, db, table) for run in runs for node in nodes for db, table in pairs]
+        rng.shuffle(combos)
+        source_ids = set(combos[: rng.randrange(4, 10)])
+        dest_ids = {(run, db, table) for run in runs for db, table in pairs if rng.random() < 0.45}
+        if not source_ids and not dest_ids:
+            continue
+        base = tmp_path / f"trial-{trial}"
+        base.mkdir()
+        config = _merge_sources(config_data, base, sorted(source_ids))
+        _simulated_rds(monkeypatch, [_destination_record(*i) for i in sorted(dest_ids)])
+        expected = set(source_ids)
+        for run, db, table in dest_ids:
+            matching = sum(1 for r, _n, d, t in source_ids if (r, d, t) == (run, db, table))
+            if matching != 1:
+                expected.add((run, "", db, table))
+        for limit in (1, 2, 3):
+            seen = _walk(config, limit=limit)
+            keys = [_identity(item) for item in seen]
+            assert set(keys) == expected, (trial, limit, sorted(set(keys) ^ expected))
+            assert len(keys) == len(set(keys)) == len(expected)
+            assert keys == sorted(keys)
+            for item in seen:
+                key = _identity(item)
+                matching = sum(
+                    1 for r, _n, d, t in source_ids if (r, d, t) == (key[0], key[2], key[3])
+                )
+                joined = (key[0], key[2], key[3]) in dest_ids and matching == 1
+                if key[1] and joined:
+                    assert item["destination_status"] == "VERIFIED", (trial, key)
+                elif key[1]:
+                    assert item["destination_status"] is None, (trial, key)
+        full = _walk(config, limit=50)
+        assert sorted(_identity(item) for item in full) == sorted(expected)
+
+
+def test_page_query_failure_recovers_without_loss(config_data, tmp_path, monkeypatch):
+    sources = [("r1", "node-a", "d", "t"), ("r2", "node-a", "d", "t")]
+    destinations = [("r1", "d", "t"), ("r3", "d", "t")]
+    config = _merge_sources(config_data, tmp_path, sources)
+    calls = _simulated_rds(
+        monkeypatch,
+        [_destination_record(*identity) for identity in destinations],
+        page_failures={1},
+    )
+    seen = _walk(config, limit=1)
+    assert calls["page"] >= 3
+    by_key = {_identity(item): item for item in seen}
+    assert set(by_key) == {
+        ("r1", "node-a", "d", "t"),
+        ("r2", "node-a", "d", "t"),
+        ("r3", "", "d", "t"),
+    }
+    assert by_key[("r1", "node-a", "d", "t")]["destination_status"] == "VERIFIED"
+    assert by_key[("r3", "", "d", "t")]["destination_status"] == "VERIFIED"
+
+
+@pytest.mark.parametrize("exact_failures", [{1}, {2}])
+def test_exact_query_failure_windows_keep_identities(
+    config_data, tmp_path, monkeypatch, exact_failures
+):
+    sources = [
+        ("r1", "node-a", "d", "t"),
+        ("r2", "node-b", "other", "u"),
+        ("r3", "node-a", "db3", "v"),
+    ]
+    destinations = [("r1", "d", "t"), ("r2", "other", "u"), ("r4", "d", "t")]
+    config = _merge_sources(config_data, tmp_path, sources)
+    _simulated_rds(
+        monkeypatch,
+        [_destination_record(*identity) for identity in destinations],
+        exact_failures=exact_failures,
+    )
+    seen = _walk(config, limit=1)
+    by_key = {_identity(item): item for item in seen}
+    assert set(by_key) == {
+        ("r1", "node-a", "d", "t"),
+        ("r2", "node-b", "other", "u"),
+        ("r3", "node-a", "db3", "v"),
+        ("r4", "", "d", "t"),
+    }
+    # Whatever the failure window, each identity is shown exactly once and the
+    # joins recover: pages that could not see the exact lookup degrade the
+    # association but never move or duplicate the record.
+    for key in (("r1", "node-a", "d", "t"), ("r2", "node-b", "other", "u")):
+        assert by_key[key]["destination_status"] in (None, "VERIFIED")
+    assert by_key[("r4", "", "d", "t")]["destination_status"] == "VERIFIED"

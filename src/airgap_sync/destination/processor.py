@@ -33,6 +33,7 @@ from airgap_sync.destination.mysql import (
     backup_table_name,
     staging_table_name,
 )
+from airgap_sync.monitor.progress import Recorder
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,19 @@ class DestinationVerifier:
         self._db = connection
         self._fetch_size = fetch_size
 
-    def verify(self, table: str, columns: list[str]) -> VerificationSummary:
+    def verify(self, table: str, columns: list[str], on_progress=None) -> VerificationSummary:
         digest = MultisetDigest()
+        reported = 0
+        started = time.monotonic()
         with self._db.stream_table_columns(table, columns, self._fetch_size) as rows:
             for row in rows:
                 digest.update(encode_row(row))
+                if on_progress and digest.row_count - reported >= self._fetch_size:
+                    on_progress(digest.row_count - reported, time.monotonic() - started)
+                    reported = digest.row_count
+                    started = time.monotonic()
+        if on_progress:
+            on_progress(digest.row_count - reported, time.monotonic() - started)
         return digest.summary()
 
 
@@ -87,8 +96,10 @@ class DestinationProcessor:
         self._config = config
         self._destination = config.destination
         self._verifier = DestinationVerifier(connection, self._destination.verify_fetch_size)
+        self._progress = None
 
     def process(self, run_id: str) -> ProcessResult:
+        self._progress = None
         started = datetime.now(UTC)
         existing = self._db.get_run(run_id)
         if existing is not None and existing.status == "VERIFIED":
@@ -108,6 +119,17 @@ class DestinationProcessor:
             )
 
         manifest = validated.manifest
+        self._progress = (
+            Recorder(
+                self._config.monitor_ingest.db_path.parent / "progress" / "destination",
+                "destination",
+                manifest.source.database,
+                manifest.source.table,
+                run_id,
+            )
+            if self._config.monitor_ingest
+            else None
+        )
         staging = staging_table_name(run_id)
         if not self._db.acquire_run_lock(run_id):
             return ProcessResult(
@@ -129,6 +151,9 @@ class DestinationProcessor:
         try:
             return self._process_locked(validated, staging)
         except (DestinationError, DestinationMySQLError, SchemaError) as exc:
+            if self._progress:
+                for stage in ("destination_import", "destination_verify"):
+                    self._progress.update(stage, state="INTERRUPTED", force=True)
             try:
                 self._db.fail_run(run_id, str(exc))
             except DestinationMySQLError:
@@ -166,6 +191,8 @@ class DestinationProcessor:
                 "STAGING_STATE_MISMATCH", "run requires verification but staging is missing"
             )
 
+        if self._progress:
+            self._progress.update("destination_verify", total_rows=manifest.row_count)
         summary = self._verify(manifest.run_id, staging, manifest.columns)
         if not self._matches(manifest, summary):
             return ProcessResult(
@@ -230,9 +257,24 @@ class DestinationProcessor:
         insert_indices = [index for index, column in enumerate(columns) if not column.generated]
         insert_columns = [columns[index].name for index in insert_indices]
         self._db.begin_import(manifest.run_id)
+        if self._progress:
+            self._progress.update(
+                "destination_import",
+                total_rows=manifest.row_count,
+                total_chunks=len(manifest.chunks),
+            )
         for chunk, path in zip(manifest.chunks, validated.chunk_paths, strict=True):
             if self._db.chunk_status(manifest.run_id, chunk.sequence) == "IMPORTED":
+                if self._progress:
+                    self._progress.update(
+                        "destination_import",
+                        rows=chunk.rows,
+                        chunks=1,
+                        bytes_=chunk.compressed_bytes,
+                        recovered=True,
+                    )
                 continue
+            chunk_started = time.monotonic()
             self._import_chunk(
                 manifest.run_id,
                 chunk.sequence,
@@ -243,7 +285,17 @@ class DestinationProcessor:
                 insert_columns,
                 insert_indices,
             )
+            if self._progress:
+                self._progress.update(
+                    "destination_import",
+                    rows=chunk.rows,
+                    chunks=1,
+                    bytes_=chunk.compressed_bytes,
+                    seconds=time.monotonic() - chunk_started,
+                )
         self._db.complete_staged(manifest.run_id, manifest.row_count)
+        if self._progress:
+            self._progress.update("destination_import", state="COMPLETE", force=True)
         elapsed = max(time.monotonic() - started, 0.000001)
         logger.info(
             "destination import metrics: run_id=%s rows_per_second=%.1f duration_seconds=%.3f",
@@ -255,7 +307,17 @@ class DestinationProcessor:
     def _verify(self, run_id: str, table: str, columns: list[str]) -> VerificationSummary:
         started = time.monotonic()
         self._db.set_verifying(run_id)
-        summary = self._verifier.verify(table, columns)
+        if self._progress:
+            summary = self._verifier.verify(
+                table,
+                columns,
+                lambda rows, seconds: self._progress.update(
+                    "destination_verify", rows=rows, seconds=seconds
+                ),
+            )
+            self._progress.update("destination_verify", state="COMPLETE", force=True)
+        else:
+            summary = self._verifier.verify(table, columns)
         elapsed = max(time.monotonic() - started, 0.000001)
         logger.info(
             "destination verify metrics: run_id=%s rows_per_second=%.1f duration_seconds=%.3f",

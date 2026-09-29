@@ -162,10 +162,11 @@ def test_upload_success_and_size_limit(config, tmp_path, monkeypatch):
     def uploaded(self, path, name, sha):
         names.append(name)
         assert json.loads(path.read_text()) == {
-            "schema_version": 2,
+            "schema_version": 4,
             "source_database": config.mysql.database,
             "run_facts_status": "UNAVAILABLE",
             "run_facts": [],
+            "run_progress": [],
         }
         assert len(sha) == 64
 

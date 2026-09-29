@@ -11,6 +11,11 @@
 <h3>Stage durations</h3><div class="table-wrap"><table><thead><tr><th>Stage</th><th>Seconds</th><th>State</th><th>Clock</th></tr></thead><tbody>
 {% for interval in run.intervals %}<tr><td>{{ interval.label }}</td><td>{{ interval.seconds if interval.seconds is not none else 'Unknown' }}</td><td>{{ interval.state }}</td><td>{{ interval.clock }}</td></tr>{% endfor %}</tbody></table></div>
 <h3>Performance</h3><ul>{% for key, value in run.metrics.items() %}<li>{{ key }}: {{ value if value is not none else 'Unknown' }}</li>{% endfor %}</ul>
+<h3>Observed stage progress</h3>
+<p>Source observations are delayed by Reporter cadence and one-way transfer. Rates are averages between valid samples of one execution attempt.</p>
+<div class="table-wrap"><table><thead><tr><th>Stage</th><th>State</th><th>Rows</th><th>Chunks</th><th>Bytes</th><th>Elapsed seconds</th><th>Rows/s</th><th>Bytes/s</th><th>Attempts</th><th>Retry payload bytes (nominal)</th></tr></thead><tbody>
+{% for name, stage in run.progress.items() %}<tr><td>{{ name }}</td><td>{{ stage.state }}</td><td>{{ stage.rows }} / {{ stage.total_rows if stage.total_rows is not none else 'Unknown' }}{% if stage.percent is not none %} ({{ '%.1f'|format(stage.percent) }}%){% endif %}</td><td>{{ stage.chunks }} / {{ stage.total_chunks if stage.total_chunks is not none else 'Unknown' }}{% if stage.chunk_percent is not none %} ({{ '%.1f'|format(stage.chunk_percent) }}%){% endif %}</td><td>{{ stage.bytes }}</td><td>{{ stage.seconds }}</td><td>{{ stage.rows_per_second if stage.rows_per_second is not none else 'Unknown' }}</td><td>{{ stage.bytes_per_second if stage.bytes_per_second is not none else 'Unknown' }}</td><td>{{ stage.attempts }}</td><td>{{ stage.retry_bytes }}</td></tr>{% else %}<tr><td colspan="10">Unknown: no M6 observation for this Run.</td></tr>{% endfor %}
+</tbody></table></div>
 <p>Missing: {{ run.missing|join(', ') if run.missing else 'None' }}. Conflicts/anomalies: {{ run.anomalies|join(', ') if run.anomalies else 'None' }}.</p>
 {% else %}<p>No matching Run in the bounded query, or metadata is unavailable.</p>{% endfor %}
 {% endblock %}
