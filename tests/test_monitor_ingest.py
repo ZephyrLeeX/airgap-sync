@@ -599,12 +599,14 @@ def test_source_html_timezone_keeps_raw_api_and_cursors(
         assert storage in html
         assert boot in html
         assert next_action in html
-        assert f"Destination received: {received_display}" in html
-        assert f"started_at</dt><dd>{cycle_display}" in html
-        assert "completed_at</dt><dd>Unknown" in html
-        assert "2026-09-27T20:30:00Z" not in html or "Raw payload (UTC timestamps)" in html
+        assert f"目标端接收时间： {received_display}" in html
+        assert f"开始时间</dt><dd>{cycle_display}" in html
+        assert "完成时间</dt><dd>未知" in html
+        assert "2026-09-27T20:30:00Z" not in html or "原始负载（UTC 时间戳）" in html
     history = client.get("/source-history?node=source-01&window=30d").text
-    assert "Raw payload (UTC timestamps)" in history
+    assert "原始负载（UTC 时间戳）" in history
+    assert 'window=7d">7 天</a>' in history
+    assert "<title>Airgap Sync · 源端历史</title>" in history
     assert '"captured_at": "2026-09-27T20:30:00Z"' in history
     assert dashboard_before["system"]["boot_time"] == "2026-09-27T18:00:00+00:00"
     assert client.get("/api/dashboard").json()["sources"]["samples"][0]["payload"] == payload

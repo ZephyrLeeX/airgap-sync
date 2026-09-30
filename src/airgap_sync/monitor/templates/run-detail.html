@@ -1,21 +1,21 @@
-{% extends "base.html" %}{% block title %}Run detail{% endblock %}{% block content %}
-<p class="intro">Run timeline. API timestamps are UTC; displayed timestamps use {{ data.timezone }}.</p>
-<p>Source facts: {{ result.source_status }} · Destination metadata: {{ result.destination_status }}</p>
+{% extends "base.html" %}{% block title %}任务详情{% endblock %}{% block content %}
+<p class="intro">任务时间线。API 时间戳使用 UTC，界面显示时区为 {{ data.timezone }}。</p>
+<p>源端观测状态： {{ result.source_status|zh }} · 目标端元数据： {{ result.destination_status|zh }}</p>
 {% for run in result['items'] %}
 <h2>{{ run.source_database }}.{{ run.table_name }} · {{ run.run_id }}</h2>
-<p>Node: {{ run.node_id or 'Unknown' }} · Source: {{ run.source_status or 'Not recorded' }} · Destination: {{ run.destination_status or 'Not recorded' }} · Association: {{ run.association }}</p>
-<p>Source observed: {{ run.source_last_observed_at|display_time if run.source_last_observed_at else 'Unknown' }} · Telemetry received: {{ run.source_last_received_at|display_time if run.source_last_received_at else 'Unknown' }} · Destination updated: {{ run.destination_updated_at|display_time if run.destination_updated_at else 'Unknown' }} (update time is not a stage completion).</p>
-{% for state in run.ongoing %}<p>Estimated ongoing elapsed ({{ state.side }} {{ state.status }}, as of {{ state.as_of|display_time }}): {{ state.elapsed_seconds if state.elapsed_seconds is not none else 'Unknown' }} seconds.</p>{% endfor %}
-<h3>Recorded timeline</h3><div class="table-wrap"><table><thead><tr><th>Event</th><th>Time</th><th>Source</th></tr></thead><tbody>
-{% for event in run.timeline %}<tr><td>{{ event.label }}</td><td>{{ event.at|display_time if event.at else 'Not recorded' }}</td><td>{{ event.origin }}</td></tr>{% endfor %}</tbody></table></div>
-<h3>Stage durations</h3><div class="table-wrap"><table><thead><tr><th>Stage</th><th>Seconds</th><th>State</th><th>Clock</th></tr></thead><tbody>
-{% for interval in run.intervals %}<tr><td>{{ interval.label }}</td><td>{{ interval.seconds if interval.seconds is not none else 'Unknown' }}</td><td>{{ interval.state }}</td><td>{{ interval.clock }}</td></tr>{% endfor %}</tbody></table></div>
-<h3>Performance</h3><ul>{% for key, value in run.metrics.items() %}<li>{{ key }}: {{ value if value is not none else 'Unknown' }}</li>{% endfor %}</ul>
-<h3>Observed stage progress</h3>
-<p>Source observations are delayed by Reporter cadence and one-way transfer. Rates are averages between valid samples of one execution attempt.</p>
-<div class="table-wrap"><table><thead><tr><th>Stage</th><th>State</th><th>Rows</th><th>Chunks</th><th>Bytes</th><th>Elapsed seconds</th><th>Rows/s</th><th>Bytes/s</th><th>Attempts</th><th>Retry payload bytes (nominal)</th></tr></thead><tbody>
-{% for name, stage in run.progress.items() %}<tr><td>{{ name }}</td><td>{{ stage.state }}</td><td>{{ stage.rows }} / {{ stage.total_rows if stage.total_rows is not none else 'Unknown' }}{% if stage.percent is not none %} ({{ '%.1f'|format(stage.percent) }}%){% endif %}</td><td>{{ stage.chunks }} / {{ stage.total_chunks if stage.total_chunks is not none else 'Unknown' }}{% if stage.chunk_percent is not none %} ({{ '%.1f'|format(stage.chunk_percent) }}%){% endif %}</td><td>{{ stage.bytes }}</td><td>{{ stage.seconds }}</td><td>{{ stage.rows_per_second if stage.rows_per_second is not none else 'Unknown' }}</td><td>{{ stage.bytes_per_second if stage.bytes_per_second is not none else 'Unknown' }}</td><td>{{ stage.attempts }}</td><td>{{ stage.retry_bytes }}</td></tr>{% else %}<tr><td colspan="10">Unknown: no M6 observation for this Run.</td></tr>{% endfor %}
+<p>节点： {{ run.node_id or '未知' }} · 源端： {{ (run.source_status or '未记录')|zh }} · 目标端： {{ (run.destination_status or '未记录')|zh }} · 关联情况： {{ run.association|zh }}</p>
+<p>源端观测时间： {{ run.source_last_observed_at|display_time if run.source_last_observed_at else '未知' }} · 遥测接收时间： {{ run.source_last_received_at|display_time if run.source_last_received_at else '未知' }} · 目标端更新时间： {{ run.destination_updated_at|display_time if run.destination_updated_at else '未知' }} （更新时间不代表阶段完成时间）。</p>
+{% for state in run.ongoing %}<p>进行中阶段的估算耗时（{{ state.side|zh }} {{ state.status|zh }}，截至 {{ state.as_of|display_time }}）： {{ state.elapsed_seconds if state.elapsed_seconds is not none else '未知' }} 秒。</p>{% endfor %}
+<h3>已记录的时间线</h3><div class="table-wrap"><table><thead><tr><th>事件</th><th>时间</th><th>记录来源</th></tr></thead><tbody>
+{% for event in run.timeline %}<tr><td>{{ event.label|zh }}</td><td>{{ event.at|display_time if event.at else '未记录' }}</td><td>{{ event.origin|zh }}</td></tr>{% endfor %}</tbody></table></div>
+<h3>阶段耗时</h3><div class="table-wrap"><table><thead><tr><th>阶段</th><th>秒数</th><th>状态</th><th>时钟来源</th></tr></thead><tbody>
+{% for interval in run.intervals %}<tr><td>{{ interval.label|zh }}</td><td>{{ interval.seconds if interval.seconds is not none else '未知' }}</td><td>{{ interval.state|zh }}</td><td>{{ interval.clock|zh }}</td></tr>{% endfor %}</tbody></table></div>
+<h3>性能指标</h3><ul>{% for key, value in run.metrics.items() %}<li>{{ key|zh }}: {{ value if value is not none else '未知' }}</li>{% endfor %}</ul>
+<h3>阶段进度观测</h3>
+<p>源端观测受上报周期和单向传输影响而延迟。速率为单次执行尝试中有效采样之间的平均值。</p>
+<div class="table-wrap"><table><thead><tr><th>阶段</th><th>状态</th><th>行数</th><th>分块数</th><th>字节数</th><th>耗时（秒）</th><th>行/秒</th><th>字节/秒</th><th>尝试次数</th><th>重试负载字节数（标称值）</th></tr></thead><tbody>
+{% for name, stage in run.progress.items() %}<tr><td>{{ name|zh }}</td><td>{{ stage.state|zh }}</td><td>{{ stage.rows }} / {{ stage.total_rows if stage.total_rows is not none else '未知' }}{% if stage.percent is not none %} ({{ '%.1f'|format(stage.percent) }}%){% endif %}</td><td>{{ stage.chunks }} / {{ stage.total_chunks if stage.total_chunks is not none else '未知' }}{% if stage.chunk_percent is not none %} ({{ '%.1f'|format(stage.chunk_percent) }}%){% endif %}</td><td>{{ stage.bytes }}</td><td>{{ stage.seconds }}</td><td>{{ stage.rows_per_second if stage.rows_per_second is not none else '未知' }}</td><td>{{ stage.bytes_per_second if stage.bytes_per_second is not none else '未知' }}</td><td>{{ stage.attempts }}</td><td>{{ stage.retry_bytes }}</td></tr>{% else %}<tr><td colspan="10">未知：此任务暂无 M6 观测数据。</td></tr>{% endfor %}
 </tbody></table></div>
-<p>Missing: {{ run.missing|join(', ') if run.missing else 'None' }}. Conflicts/anomalies: {{ run.anomalies|join(', ') if run.anomalies else 'None' }}.</p>
-{% else %}<p>No matching Run in the bounded query, or metadata is unavailable.</p>{% endfor %}
+<p>缺失记录： {{ run.missing|map('zh')|join('、') if run.missing else '无' }}。 冲突 / 异常： {{ run.anomalies|map('zh')|join('、') if run.anomalies else '无' }}。</p>
+{% else %}<p>限定范围内未查到匹配任务，或元数据不可用。</p>{% endfor %}
 {% endblock %}

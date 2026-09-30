@@ -128,6 +128,9 @@ def test_pages_and_api_show_metadata_without_initialization(tmp_path, monkeypatc
     for path in ("/", "/tables", "/runs", "/system", "/problems"):
         response = client.get(path)
         assert response.status_code == 200, (path, response.text)
+        assert 'lang="zh-CN"' in response.text
+        assert "目标端监控" in response.text
+        assert "同步任务" in response.text
     data = client.get("/api/dashboard").json()
     assert data["rds"] == "CONNECTED"
     assert data["counts"]["MISMATCH"] == 1
@@ -153,7 +156,7 @@ def test_disconnected_and_secrets_are_not_rendered(tmp_path, monkeypatch):
     for path in ("/", "/system", "/api/dashboard"):
         response = client.get(path)
         assert response.status_code == 200
-        assert "DISCONNECTED" in response.text
+        assert ("DISCONNECTED" if path == "/api/dashboard" else "未连接") in response.text
         assert "topsecret" not in response.text
         assert "relay-secret" not in response.text
         assert "SECRET_PASSWORD_ENV" not in response.text
@@ -161,7 +164,7 @@ def test_disconnected_and_secrets_are_not_rendered(tmp_path, monkeypatch):
             assert response.json()["system"]["hostname"]
             assert response.json()["status"] == "DEGRADED"
         else:
-            assert "hostname" in response.text.lower()
+            assert "主机名" in response.text
 
 
 def test_schema_mismatch_never_queries_or_migrates(tmp_path, monkeypatch):
@@ -274,7 +277,7 @@ def test_persisted_error_redacts_configured_secret(tmp_path, monkeypatch):
     monkeypatch.setattr("airgap_sync.monitor.dashboard.DestinationMySQLConnection", SecretError)
     response = TestClient(create_app(config(tmp_path))).get("/runs")
     assert "private-password" not in response.text
-    assert "Last error" not in response.text
+    assert "最近错误" not in response.text
 
 
 def test_monitoring_mysql_queries_are_select_only(tmp_path):
@@ -344,8 +347,8 @@ def test_read_timeout_stops_queries_and_returns_local_facts(tmp_path, monkeypatc
         assert response.status_code == 200
         assert "private" not in response.text
         if path == "/":
-            assert "DEGRADED" in response.text or "CRITICAL" in response.text
-            assert "Incoming candidates" in response.text
+            assert "降级" in response.text or "严重" in response.text
+            assert "待接收候选任务" in response.text
         else:
             data = response.json()
             assert data["query_error"] == "Metadata query unavailable"
@@ -395,12 +398,15 @@ def test_known_latest_failure_survives_runs_timeout(tmp_path, monkeypatch, failu
         assert response.status_code == 200
         assert "private" not in response.text
         if path == "/":
-            assert "CRITICAL" in response.text
-            assert "Incoming candidates" in response.text
-            assert "FAILED / MISMATCH</label><strong>—" in response.text
+            assert "严重" in response.text
+            assert "待接收候选任务" in response.text
+            assert "失败 / 校验不一致</label><strong>—" in response.text
         if path == "/problems":
-            assert f"Known {failure_status} run: failed" in response.text
-            assert "Metadata query unavailable" in response.text
+            assert (
+                f"已知{'失败' if failure_status == 'FAILED' else '校验不一致'}任务：failed"
+                in response.text
+            )
+            assert "元数据查询不可用" in response.text
     assert calls == ["latest", "runs"] * 4
 
 
@@ -575,7 +581,7 @@ def test_unverified_tables_show_status_and_unknown_statistics(tmp_path, monkeypa
     assert data["max_data_age"] is None
     page = client.get("/tables").text
     assert "[REDACTED]" in page and "private-password" not in page
-    assert "IMPORTING" in page and "FAILED" in page
+    assert "导入中" in page and "失败" in page
 
 
 def test_system_degrades_and_deduplicates(tmp_path, monkeypatch):
@@ -618,8 +624,8 @@ def test_overview_filesystems_include_incoming_and_keep_uses(tmp_path, monkeypat
     response = TestClient(create_app(config(tmp_path))).get("/")
     assert response.status_code == 200
     assert str(tmp_path) in response.text
-    assert "incoming" in response.text
-    assert "root" in response.text
+    assert "接收目录" in response.text
+    assert "根目录" in response.text
     data = system_snapshot(tmp_path)
     if shared_device:
         assert any(

@@ -1,14 +1,14 @@
-{% extends "base.html" %}{% block title %}Source history{% endblock %}{% block content %}
-<h2>{{ node }} · {{ window }} · {{ data.sources.status }}</h2>
-<p>Observations in {{ data.timezone }}, newest first. Up to 100 samples per page.</p>
-<p>{% for period in ['24h', '7d', '30d'] %}<a href="?node={{ node|urlencode }}&amp;window={{ period }}">{{ period }}</a> {% endfor %}</p>
+{% extends "base.html" %}{% block title %}源端历史{% endblock %}{% block content %}
+<h2>{{ node }} · {{ window|zh }} · {{ data.sources.status|zh }}</h2>
+<p>观测时区：{{ data.timezone }}，按时间倒序排列，每页最多 100 条采样。</p>
+<p>{% for period in ['24h', '7d', '30d'] %}<a href="?node={{ node|urlencode }}&amp;window={{ period }}">{{ period|zh }}</a> {% endfor %}</p>
 {% for sample in data.sources.samples %}
-<details><summary>{{ sample.payload.captured_at|display_time }} · CPU {{ sample.payload.system.cpu_percent if sample.payload.system.cpu_percent is not none else 'Unknown' }}% · Memory {{ sample.payload.system.memory_used_percent if sample.payload.system.memory_used_percent is not none else 'Unknown' }}%</summary>
-<p>Destination received: {{ sample.received_at|display_time }} · Host boot: {{ sample.payload.host.boot_time|display_time }} · Managed storage measured: {{ sample.payload.managed_storage.captured_at|display_time }} · Next action: {{ sample.payload.next_action_at|display_time }}</p>
-{% for title, observed in [('Latest Cycle', sample.payload.cycle), ('Current Run', sample.payload.current_run), ('Last Run', sample.payload.last_run)] %}
-<h3>{{ title }}</h3>{% if observed is not none %}<dl>{% for key, value in observed.items() %}<dt>{{ key }}</dt><dd>{{ (value|display_time) if key in ('started_at', 'completed_at', 'created_at') else (value if value is not none else 'Unknown') }}</dd>{% endfor %}</dl>{% else %}<p>Unavailable / unrecorded</p>{% endif %}
+<details><summary>{{ sample.payload.captured_at|display_time }} · CPU {{ sample.payload.system.cpu_percent if sample.payload.system.cpu_percent is not none else '未知' }}% · 内存 {{ sample.payload.system.memory_used_percent if sample.payload.system.memory_used_percent is not none else '未知' }}%</summary>
+<p>目标端接收时间： {{ sample.received_at|display_time }} · 主机启动时间： {{ sample.payload.host.boot_time|display_time }} · 存储测量时间： {{ sample.payload.managed_storage.captured_at|display_time }} · 下次执行时间： {{ sample.payload.next_action_at|display_time }}</p>
+{% for title, observed in [('最近同步周期', sample.payload.cycle), ('当前任务', sample.payload.current_run), ('上次任务', sample.payload.last_run)] %}
+<h3>{{ title|zh }}</h3>{% if observed is not none %}<dl>{% for key, value in observed.items() %}<dt>{{ key|zh }}</dt><dd>{{ (value|display_time) if key in ('started_at', 'completed_at', 'created_at') else ((value|zh if key == 'status' else value) if value is not none else '未知') }}</dd>{% endfor %}</dl>{% else %}<p>不可用 / 未记录</p>{% endif %}
 {% endfor %}
-<p>Raw payload (UTC timestamps)</p><pre>{{ sample.payload|tojson(indent=2) }}</pre></details>
-{% else %}<p>No samples available.</p>{% endfor %}
-{% if data.sources.next_cursor %}<a href="?node={{ node|urlencode }}&amp;window={{ window }}&amp;before={{ data.sources.next_cursor|urlencode }}">Older samples</a>{% endif %}
+<p>原始负载（UTC 时间戳）</p><pre>{{ sample.payload|tojson(indent=2) }}</pre></details>
+{% else %}<p>暂无采样数据。</p>{% endfor %}
+{% if data.sources.next_cursor %}<a href="?node={{ node|urlencode }}&amp;window={{ window }}&amp;before={{ data.sources.next_cursor|urlencode }}">更早的采样</a>{% endif %}
 {% endblock %}

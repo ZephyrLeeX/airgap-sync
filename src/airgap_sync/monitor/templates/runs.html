@@ -1,22 +1,22 @@
-{% extends "base.html" %}{% block title %}Runs{% endblock %}{% block content %}
-<p class="intro">Recorded Source and Destination Runs. Times are shown in {{ data.timezone }}; API values remain UTC. A page never proves an older Run is absent.</p>
-<p>Source facts: {{ result.source_status }} · Destination metadata: {{ result.destination_status }}</p>
-<form method="get" action="/runs"><label>Node <input name="node" value="{{ filters.node or '' }}"></label> <label>Database <input name="database" value="{{ filters.database or '' }}"></label> <label>Table <input name="table" value="{{ filters.table or '' }}"></label> <button type="submit">Filter</button></form>
-<div class="table-wrap"><table><thead><tr><th>Run</th><th>Node</th><th>Database</th><th>Table</th><th>Source</th><th>Destination</th><th>Source rows</th><th>Dest expected / actual rows</th><th>Source / Dest chunks</th><th>Raw bytes</th><th>Compressed bytes</th><th>Snapshot seconds</th><th>Import seconds</th><th>End-to-end seconds</th><th>Compressed / raw</th><th>Association</th></tr></thead><tbody>
+{% extends "base.html" %}{% block title %}同步任务{% endblock %}{% block content %}
+<p class="intro">已记录的源端和目标端同步任务。显示时区为 {{ data.timezone }}；API 时间仍使用 UTC。当前页未显示不代表更早的任务不存在。</p>
+<p>源端观测状态： {{ result.source_status|zh }} · 目标端元数据： {{ result.destination_status|zh }}</p>
+<form method="get" action="/runs"><label>节点 <input name="node" value="{{ filters.node or '' }}"></label> <label>数据库 <input name="database" value="{{ filters.database or '' }}"></label> <label>数据表 <input name="table" value="{{ filters.table or '' }}"></label> <button type="submit">筛选</button></form>
+<div class="table-wrap"><table><thead><tr><th>任务</th><th>节点</th><th>数据库</th><th>数据表</th><th>源端</th><th>目标端</th><th>源端行数</th><th>目标端预期 / 实际行数</th><th>源端 / 目标端分块数</th><th>原始字节数</th><th>压缩字节数</th><th>快照耗时（秒）</th><th>导入耗时（秒）</th><th>端到端耗时（秒）</th><th>压缩 / 原始大小</th><th>关联情况</th></tr></thead><tbody>
 {% for run in result['items'] %}<tr>
 <td><a href="/runs/{{ run.run_id|urlencode }}?node={{ (run.node_id or '')|urlencode }}&amp;database={{ run.source_database|urlencode }}&amp;table={{ run.table_name|urlencode }}">{{ run.run_id }}</a></td>
-<td>{{ run.node_id or 'Unknown' }}</td><td>{{ run.source_database }}</td><td>{{ run.table_name }}</td>
-<td>{{ run.source_status or 'Not recorded' }}</td><td>{{ run.destination_status or 'Not recorded' }}</td>
-<td>{{ run.metrics.source_rows if run.metrics.source_rows is not none else 'Unknown' }}</td>
-<td>{{ run.metrics.destination_expected_rows if run.metrics.destination_expected_rows is not none else 'Unknown' }} / {{ run.metrics.destination_actual_rows if run.metrics.destination_actual_rows is not none else 'Unknown' }}</td>
-<td>{{ run.metrics.source_chunks if run.metrics.source_chunks is not none else 'Unknown' }} / {{ run.metrics.destination_chunks if run.metrics.destination_chunks is not none else 'Unknown' }}</td>
-<td>{{ run.metrics.raw_bytes if run.metrics.raw_bytes is not none else 'Unknown' }}</td>
-<td>{{ run.metrics.compressed_bytes if run.metrics.compressed_bytes is not none else 'Unknown' }}</td>
-<td>{{ run.duration_seconds.snapshot if run.duration_seconds.snapshot is not none else 'Unknown' }}</td>
-<td>{{ run.duration_seconds['import'] if run.duration_seconds['import'] is not none else 'Unknown' }}</td>
-<td>{{ run.duration_seconds.end_to_end if run.duration_seconds.end_to_end is not none else 'Unknown' }}</td>
-<td>{{ run.metrics.compressed_over_raw if run.metrics.compressed_over_raw is not none else 'Unknown' }}</td>
-<td>{{ run.association }}</td></tr>{% else %}<tr><td colspan="16">No Run on this page; try another cursor or check data availability.</td></tr>{% endfor %}
+<td>{{ run.node_id or '未知' }}</td><td>{{ run.source_database }}</td><td>{{ run.table_name }}</td>
+<td>{{ (run.source_status or '未记录')|zh }}</td><td>{{ (run.destination_status or '未记录')|zh }}</td>
+<td>{{ run.metrics.source_rows if run.metrics.source_rows is not none else '未知' }}</td>
+<td>{{ run.metrics.destination_expected_rows if run.metrics.destination_expected_rows is not none else '未知' }} / {{ run.metrics.destination_actual_rows if run.metrics.destination_actual_rows is not none else '未知' }}</td>
+<td>{{ run.metrics.source_chunks if run.metrics.source_chunks is not none else '未知' }} / {{ run.metrics.destination_chunks if run.metrics.destination_chunks is not none else '未知' }}</td>
+<td>{{ run.metrics.raw_bytes if run.metrics.raw_bytes is not none else '未知' }}</td>
+<td>{{ run.metrics.compressed_bytes if run.metrics.compressed_bytes is not none else '未知' }}</td>
+<td>{{ run.duration_seconds.snapshot if run.duration_seconds.snapshot is not none else '未知' }}</td>
+<td>{{ run.duration_seconds['import'] if run.duration_seconds['import'] is not none else '未知' }}</td>
+<td>{{ run.duration_seconds.end_to_end if run.duration_seconds.end_to_end is not none else '未知' }}</td>
+<td>{{ run.metrics.compressed_over_raw if run.metrics.compressed_over_raw is not none else '未知' }}</td>
+<td>{{ run.association|zh }}</td></tr>{% else %}<tr><td colspan="16">本页暂无任务；可尝试其他分页位置或检查数据是否可用。</td></tr>{% endfor %}
 </tbody></table></div>
-{% if result.next_cursor %}<a href="/runs?before={{ result.next_cursor|urlencode }}&amp;node={{ (filters.node or '')|urlencode }}&amp;database={{ (filters.database or '')|urlencode }}&amp;table={{ (filters.table or '')|urlencode }}">Next page</a>{% endif %}
+{% if result.next_cursor %}<a href="/runs?before={{ result.next_cursor|urlencode }}&amp;node={{ (filters.node or '')|urlencode }}&amp;database={{ (filters.database or '')|urlencode }}&amp;table={{ (filters.table or '')|urlencode }}">下一页</a>{% endif %}
 {% endblock %}

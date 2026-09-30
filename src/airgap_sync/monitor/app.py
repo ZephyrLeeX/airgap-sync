@@ -19,6 +19,7 @@ from airgap_sync.common.models import AppConfig, Role
 from airgap_sync.monitor.alerts import read_alerts, summary
 from airgap_sync.monitor.dashboard import snapshot
 from airgap_sync.monitor.ingest import BackgroundIngest
+from airgap_sync.monitor.localization import zh
 from airgap_sync.monitor.store import read_sources
 from airgap_sync.monitor.timeline import read_runs
 
@@ -79,13 +80,14 @@ def create_app(config: AppConfig) -> FastAPI:
 
     def display_time(value: str | None) -> str:
         if value is None:
-            return "Unknown"
+            return "未知"
         observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=UTC)
         return observed.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
 
     templates.env.filters["display_time"] = display_time
+    templates.env.filters["zh"] = zh
 
     def run_query(**kwargs):
         try:

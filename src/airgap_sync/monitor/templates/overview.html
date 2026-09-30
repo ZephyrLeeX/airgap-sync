@@ -1,20 +1,20 @@
-{% extends "base.html" %}{% block title %}Overview{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}概览{% endblock %}{% block content %}
 <div class="cards">
-<article><label>Open alerts</label><strong>{{ data.alerts.count if data.alerts.count is not none else 'Unknown' }}</strong><small>Highest: {{ data.alerts.highest or '—' }} · Store {{ data.alerts.status }} · Evaluation {{ data.alert_status }}</small></article>
-<article><label>Destination worker</label><strong>{{ data.system.worker.status }}</strong><small>{{ data.system.worker.detail }}</small></article>
-<article><label>RDS connectivity</label><strong>{{ data.rds }}</strong><small>MySQL {{ data.mysql_version or '—' }}</small></article>
-<article><label>Metadata schema</label><strong>{{ data.metadata_status }}</strong><small>Version {{ data.metadata_version if data.metadata_version is not none else '—' }}</small></article>
-<article><label>Latest VERIFIED</label><strong>{{ data.latest_verified.run_id if data.latest_verified else '—' }}</strong><small>{{ data.latest_verified.display_timestamps.applied_at if data.latest_verified else 'Unavailable' }}</small></article>
-<article><label>Active Destination run</label><strong>{{ data.active_run.run_id if data.active_run else '—' }}</strong><small>{{ data.active_run.status if data.active_run else 'None observed' }}</small></article>
-<article><label>FAILED / MISMATCH</label><strong>{{ (data.counts.get('FAILED', 0) ~ ' / ' ~ data.counts.get('MISMATCH', 0)) if data.counts is not none else '—' }}</strong></article>
-<article><label>Incoming candidates</label><strong>{{ data.system.incoming_candidates if data.system.incoming_candidates is not none else '—' }}</strong></article>
-<article><label>Cleanup pending</label><strong>{{ data.counts.get('cleanup_pending', 0) if data.counts is not none else '—' }}</strong></article>
-<article><label>Max data age</label><strong>{{ data.max_data_age or '—' }}</strong></article>
-{% for fs in data.system.filesystems %}<article><label>Free space · {% for location in fs.locations %}{{ location.label }}{% if not loop.last %}, {% endif %}{% endfor %}</label><strong>{{ fs.free|filesizeformat if fs.free is not none else '—' }}</strong><small>{% for location in fs.locations %}{{ location.label }}: {{ location.path }}{% if not loop.last %} · {% endif %}{% endfor %} · Used {{ fs.used_percent ~ '%' if fs.used_percent is not none else 'unknown' }}</small></article>{% else %}<article><label>Free space</label><strong>—</strong><small>Filesystem information unavailable</small></article>{% endfor %}
-<article><label>Agent version</label><strong>{{ data.system.version }}</strong></article>
-<article><label>Hostname / OS</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
-<article><label>Uptime</label><strong>{{ data.system.uptime or '—' }}</strong></article>
-<article><label>Memory available</label><strong>{{ data.system.memory_available|filesizeformat if data.system.memory_available is not none else '—' }}</strong></article>
+<article><label>未恢复告警</label><strong>{{ data.alerts.count if data.alerts.count is not none else '未知' }}</strong><small>最高级别： {{ data.alerts.highest|zh or '—' }} · 存储 {{ data.alerts.status|zh }} · 评估 {{ data.alert_status|zh }}</small></article>
+<article><label>目标端工作进程</label><strong>{{ data.system.worker.status|zh }}</strong><small>{{ data.system.worker.detail|zh }}</small></article>
+<article><label>RDS 连接</label><strong>{{ data.rds|zh }}</strong><small>MySQL {{ data.mysql_version or '—' }}</small></article>
+<article><label>元数据结构</label><strong>{{ data.metadata_status|zh }}</strong><small>版本 {{ data.metadata_version if data.metadata_version is not none else '—' }}</small></article>
+<article><label>最近验证成功</label><strong>{{ data.latest_verified.run_id if data.latest_verified else '—' }}</strong><small>{{ data.latest_verified.display_timestamps.applied_at if data.latest_verified else '不可用' }}</small></article>
+<article><label>目标端当前任务</label><strong>{{ data.active_run.run_id if data.active_run else '—' }}</strong><small>{{ data.active_run.status|zh if data.active_run else '未观测到' }}</small></article>
+<article><label>失败 / 校验不一致</label><strong>{{ (data.counts.get('FAILED', 0) ~ ' / ' ~ data.counts.get('MISMATCH', 0)) if data.counts is not none else '—' }}</strong></article>
+<article><label>待接收候选任务</label><strong>{{ data.system.incoming_candidates if data.system.incoming_candidates is not none else '—' }}</strong></article>
+<article><label>待清理</label><strong>{{ data.counts.get('cleanup_pending', 0) if data.counts is not none else '—' }}</strong></article>
+<article><label>最长数据时龄</label><strong>{{ data.max_data_age|zh or '—' }}</strong></article>
+{% for fs in data.system.filesystems %}<article><label>可用空间 · {% for location in fs.locations %}{{ location.label|zh }}{% if not loop.last %}, {% endif %}{% endfor %}</label><strong>{{ fs.free|filesizeformat if fs.free is not none else '—' }}</strong><small>{% for location in fs.locations %}{{ location.label|zh }}: {{ location.path }}{% if not loop.last %} · {% endif %}{% endfor %} · 已用 {{ fs.used_percent ~ '%' if fs.used_percent is not none else '未知' }}</small></article>{% else %}<article><label>可用空间</label><strong>—</strong><small>文件系统信息不可用</small></article>{% endfor %}
+<article><label>代理程序版本</label><strong>{{ data.system.version }}</strong></article>
+<article><label>主机名 / 操作系统</label><strong>{{ data.system.hostname }}</strong><small>{{ data.system.os }}</small></article>
+<article><label>运行时长</label><strong>{{ data.system.uptime|zh or '—' }}</strong></article>
+<article><label>可用内存</label><strong>{{ data.system.memory_available|filesizeformat if data.system.memory_available is not none else '—' }}</strong></article>
 </div>
-{% if data.alerts.important %}<section><h2>Important alerts</h2><ul>{% for item in data.alerts.important %}<li><a href="/alerts?status=OPEN">{{ item.severity }} · {{ item.alert_type }} · {{ item.object_id }}</a> — {{ item.message }}{% if item.evaluation_state == 'UNKNOWN' %} (evidence unavailable){% endif %}</li>{% endfor %}</ul></section>{% endif %}
+{% if data.alerts.important %}<section><h2>重要告警</h2><ul>{% for item in data.alerts.important %}<li><a href="/alerts?status=OPEN">{{ item.severity|zh }} · {{ item.alert_type|zh }} · {{ item.object_id }}</a> — {{ item.message|zh }}{% if item.evaluation_state == 'UNKNOWN' %} (观测依据不可用){% endif %}</li>{% endfor %}</ul></section>{% endif %}
 {% include "sources.html" %}{% endblock %}

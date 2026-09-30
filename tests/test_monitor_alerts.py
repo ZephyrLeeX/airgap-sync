@@ -338,6 +338,8 @@ def test_alert_routes_escape_and_keep_get_read_only(tmp_path, monkeypatch):
     html = client.get("/alerts?status=OPEN").text
     assert "&lt;script&gt;" in html and "<script>" not in html
     assert "1970-01-01 08:00:01" in html
+    assert 'value="OPEN"' in html and ">未恢复</option>" in html
+    assert 'value="WARNING"' in html and ">警告</option>" in html
     assert client.get("/api/alerts?limit=201").status_code == 422
     assert client.post("/api/alerts").status_code == 405
     with store.connect(cfg.db_path) as db:

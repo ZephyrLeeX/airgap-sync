@@ -1,23 +1,23 @@
-<h2>Source observations · {{ data.sources.status }}</h2>
-<p>Ingest: {{ data.ingest_status }}. Times below use {{ data.timezone }}. Observations do not assert Destination verification or heartbeat recovery.</p>
+<h2>源端观测 · {{ data.sources.status|zh }}</h2>
+<p>采集状态： {{ data.ingest_status|zh }}。下列时间使用 {{ data.timezone }}。观测数据不代表目标端验证成功或心跳恢复。</p>
 {% for sample in data.sources.samples %}{% set p = sample.payload %}
-<section><h3>{{ p.node_id }} · {{ p.host.hostname if p.host.hostname is not none else 'Unknown' }}</h3>
-<p>{{ p.host.os if p.host.os is not none else 'Unknown OS' }} · Agent {{ p.agent_version }} · Host boot: {{ p.host.boot_time|display_time }}</p>
-<p>Source captured: {{ p.captured_at|display_time }} · Destination received: {{ sample.received_at|display_time }} · Age: {{ sample.age_seconds|round(0) }} seconds</p>
-<p>Worker: {{ p.worker.status }} · PID: {{ p.worker.pid if p.worker.pid is not none else 'Unknown' }} · Task Scheduler: {{ p.worker.task_status }}</p>
+<section><h3>{{ p.node_id }} · {{ p.host.hostname if p.host.hostname is not none else '未知' }}</h3>
+<p>{{ p.host.os if p.host.os is not none else '操作系统未知' }} · 代理程序 {{ p.agent_version }} · 主机启动时间： {{ p.host.boot_time|display_time }}</p>
+<p>源端采样时间： {{ p.captured_at|display_time }} · 目标端接收时间： {{ sample.received_at|display_time }} · 采样时龄： {{ sample.age_seconds|round(0) }} 秒</p>
+<p>工作进程： {{ p.worker.status|zh }} · PID: {{ p.worker.pid if p.worker.pid is not none else '未知' }} · 任务计划程序： {{ p.worker.task_status|zh }}</p>
 <div class="cards">
-{% for key, value in p.system.items() %}<article><label>{{ key }}</label><strong>{{ value if value is not none else 'Unknown' }}</strong></article>{% endfor %}
+{% for key, value in p.system.items() %}<article><label>{{ key|zh }}</label><strong>{{ value if value is not none else '未知' }}</strong></article>{% endfor %}
 </div>
-<h4>Filesystems</h4><div class="table-wrap"><table><thead><tr><th>Locations</th><th>Mount</th><th>Total bytes</th><th>Free bytes</th><th>Free %</th></tr></thead><tbody>
-{% for fs in p.filesystems %}<tr><td>{{ fs.locations|join(', ') }}</td><td>{{ fs.mount if fs.mount is not none else 'Unknown' }}</td><td>{{ fs.total_bytes if fs.total_bytes is not none else 'Unknown' }}</td><td>{{ fs.free_bytes if fs.free_bytes is not none else 'Unknown' }}</td><td>{{ fs.free_percent if fs.free_percent is not none else 'Unknown' }}</td></tr>{% else %}<tr><td colspan="5">Unavailable</td></tr>{% endfor %}
+<h4>文件系统</h4><div class="table-wrap"><table><thead><tr><th>位置</th><th>挂载点</th><th>总字节数</th><th>可用字节数</th><th>可用比例</th></tr></thead><tbody>
+{% for fs in p.filesystems %}<tr><td>{{ fs.locations|map('zh')|join('、') }}</td><td>{{ fs.mount if fs.mount is not none else '未知' }}</td><td>{{ fs.total_bytes if fs.total_bytes is not none else '未知' }}</td><td>{{ fs.free_bytes if fs.free_bytes is not none else '未知' }}</td><td>{{ fs.free_percent if fs.free_percent is not none else '未知' }}</td></tr>{% else %}<tr><td colspan="5">不可用</td></tr>{% endfor %}
 </tbody></table></div>
-<h4>Managed storage · measured {{ p.managed_storage.captured_at|display_time }}</h4>
-<dl>{% for key, value in p.managed_storage.items() if key != 'captured_at' %}<dt>{{ key }}</dt><dd>{{ value if value is not none else 'Unknown / unconfigured' }}</dd>{% endfor %}</dl>
-{% for title, observed in [('Latest Cycle', p.cycle), ('Current Run', p.current_run), ('Last Run', p.last_run)] %}<h4>{{ title }}</h4>
-{% if observed is not none %}<dl>{% for key, value in observed.items() %}<dt>{{ key }}</dt><dd>{{ (value|display_time) if key in ('started_at', 'completed_at', 'created_at') else (value if value is not none else 'Unknown') }}</dd>{% endfor %}</dl>{% else %}<p>Unavailable / unrecorded</p>{% endif %}{% endfor %}
-<p>Next action: {{ p.next_action_at|display_time }}</p>
-<p>Connectivity: MySQL {{ p.connectivity.source_mysql }} · Relay {{ p.connectivity.relay }}</p>
-<p>Collection errors: {{ p.collection_errors|join(', ') if p.collection_errors else 'None reported' }}</p>
-<p>System history: {% for period in ['24h', '7d', '30d'] %}<a href="/source-history?node={{ p.node_id|urlencode }}&amp;window={{ period }}">{{ period }}</a> {% endfor %}</p>
-</section>{% else %}<p>No Source sample available.</p>{% endfor %}
-{% if data.sources.next_cursor %}<p>Additional nodes available through the paginated /api/sources endpoint.</p>{% endif %}
+<h4>受管存储 · 测量时间 {{ p.managed_storage.captured_at|display_time }}</h4>
+<dl>{% for key, value in p.managed_storage.items() if key != 'captured_at' %}<dt>{{ key|zh }}</dt><dd>{{ value if value is not none else '未知 / 未配置' }}</dd>{% endfor %}</dl>
+{% for title, observed in [('最近同步周期', p.cycle), ('当前任务', p.current_run), ('上次任务', p.last_run)] %}<h4>{{ title|zh }}</h4>
+{% if observed is not none %}<dl>{% for key, value in observed.items() %}<dt>{{ key|zh }}</dt><dd>{{ (value|display_time) if key in ('started_at', 'completed_at', 'created_at') else ((value|zh if key == 'status' else value) if value is not none else '未知') }}</dd>{% endfor %}</dl>{% else %}<p>不可用 / 未记录</p>{% endif %}{% endfor %}
+<p>下次执行时间： {{ p.next_action_at|display_time }}</p>
+<p>连接状态： MySQL {{ p.connectivity.source_mysql|zh }} · 中继服务 {{ p.connectivity.relay|zh }}</p>
+<p>采集错误： {{ p.collection_errors|map('zh')|join('、') if p.collection_errors else '未上报' }}</p>
+<p>系统历史： {% for period in ['24h', '7d', '30d'] %}<a href="/source-history?node={{ p.node_id|urlencode }}&amp;window={{ period }}">{{ period|zh }}</a> {% endfor %}</p>
+</section>{% else %}<p>暂无源端采样数据。</p>{% endfor %}
+{% if data.sources.next_cursor %}<p>更多节点可通过 /api/sources 分页接口查看。</p>{% endif %}
