@@ -290,14 +290,14 @@ SMOKE_APP_STUB_MODULES = (
 )
 
 
-def make_app_wheel(directory: Path, app_version: str) -> str:
+def make_app_wheel(directory: Path, app_version: str, cli_version: str | None = None) -> str:
     """A real, dependency-free wheel providing the smoke-test imports + CLI."""
     wheel_name = f"{TEST_DIST}-{app_version}-py3-none-any.whl"
     directory.mkdir(parents=True, exist_ok=True)
     payload: list[tuple[str, str]] = [
         (
             f"{TEST_DIST}/__init__.py",
-            f"def main():\n    print('airgap-sync {app_version}')\n",
+            f"def main():\n    print('airgap-sync {cli_version or app_version}')\n",
         ),
         *(
             (f"{module}.py", "# test stub satisfying smoke-app imports\n")
@@ -342,6 +342,7 @@ def build_test_bundle(
     git_commit: str,
     python_version: str = PYTHON_15,
     env_extra: str = "",
+    cli_version: str | None = None,
 ) -> Path:
     """Assemble a checksum-valid bundle that the real deploy script can install."""
     for name in ("runtime", "app", "wheelhouse", "config"):
@@ -350,7 +351,7 @@ def build_test_bundle(
         f"cpython-{python_version}+20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
     )
     make_runtime_tarball(bundle / "runtime" / runtime_artifact)
-    app_wheel = make_app_wheel(bundle / "app", APP_VERSION)
+    app_wheel = make_app_wheel(bundle / "app", APP_VERSION, cli_version)
     shutil.copy(bundle / "app" / app_wheel, bundle / "wheelhouse" / app_wheel)
     (bundle / "config" / "source.example.yaml").write_text("role: source\n")
     (bundle / "config" / "destination.example.yaml").write_text("role: destination\n")
@@ -470,6 +471,26 @@ class TestLinuxInstallGuard:
         # current 不变, 新 release 未安装
         assert current_release(deploy_env) == RELEASE_A
         assert not (deploy_env["install_root"] / "releases" / RELEASE_C).exists()
+
+    def test_wrong_cli_version_cannot_complete_or_switch_current(
+        self, deploy_env: dict, tmp_path: Path
+    ) -> None:
+        assert (
+            run_deploy(deploy_env["bundle_a"], *deploy_args(deploy_env, "install")).returncode == 0
+        )
+        bundle_c = build_test_bundle(
+            tmp_path / "bundle-c",
+            release_id=RELEASE_C,
+            git_commit=COMMIT_C,
+            cli_version="9.9.9",
+        )
+        result = run_deploy(
+            bundle_c, *deploy_args(deploy_env, "upgrade", "--assume-worker-stopped")
+        )
+        assert result.returncode != 0
+        assert "unexpected --version output" in result.stdout + result.stderr
+        assert current_release(deploy_env) == RELEASE_A
+        assert not (deploy_env["install_root"] / "releases" / RELEASE_C / "installed.json").exists()
 
 
 class TestLinuxUpgradeRuntimeOrdering:

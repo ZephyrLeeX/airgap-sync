@@ -170,6 +170,8 @@ class ReleaseManifest:
             problems.append(f"release_id {self.release_id!r} is not <version>-<gitsha>")
         if not self.release_id.endswith(self.git_commit[: self._release_sha_length()]):
             problems.append("release_id does not end with the declared git commit")
+        if self.release_id.rsplit("-", 1)[0] != self.app_version:
+            problems.append("release_id version disagrees with app_version")
         if not re.fullmatch(r"[0-9a-f]{7,40}", self.git_commit):
             problems.append(f"git_commit {self.git_commit!r} is not a hex sha")
         if not re.fullmatch(r"\d+\.\d+\.\d+", self.python_version):

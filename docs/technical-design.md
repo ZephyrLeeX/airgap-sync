@@ -191,9 +191,9 @@ Phase 2 新增的能力全部通过**专用方法**实现，不开放任意 SQL 
 ## 6.1 Identifier quoting
 
 ```python
-quote_identifier("normal_table")     # `normal_table`
-quote_identifier("table-name")       # `table-name`
-quote_identifier("we`rd")            # we``rd
+quote_identifier("normal_table")  # `normal_table`
+quote_identifier("table-name")  # `table-name`
+quote_identifier("we`rd")  # we``rd
 ```
 
 规则：反引号包裹，名称内的反引号翻倍。禁止任何 `f"SELECT * FROM {table_name}"` 式的直接拼接。

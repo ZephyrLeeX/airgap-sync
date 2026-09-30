@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
+import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +44,37 @@ class TestVersion:
     def test_version(self, run_cli):
         result = run_cli(["--version"])
         assert result.exit_code == 0
-        assert airgap_sync.__version__ in result.output
-        assert "airgap-sync" in result.output
+        assert result.output.strip() == f"airgap-sync, version {airgap_sync.__version__}"
+
+    def test_version_reads_distribution_metadata(self, run_cli, monkeypatch):
+        real_version = importlib.metadata.version
+        cli_module = importlib.import_module("airgap_sync.cli")
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    importlib.metadata,
+                    "version",
+                    lambda name: "9.8.7" if name == "airgap-sync" else real_version(name),
+                )
+                importlib.reload(cli_module)
+                result = run_cli(["--version"])
+                assert result.exit_code == 0
+                assert result.output.strip() == "airgap-sync, version 9.8.7"
+        finally:
+            importlib.reload(cli_module)
+
+    def test_source_without_distribution_metadata_fails_clearly(self, monkeypatch):
+        def missing(_name):
+            raise importlib.metadata.PackageNotFoundError("airgap-sync")
+
+        monkeypatch.setattr(importlib.metadata, "version", missing)
+        spec = importlib.util.spec_from_file_location(
+            "airgap_sync_uninstalled", airgap_sync.__file__
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with pytest.raises(RuntimeError, match="distribution metadata is unavailable"):
+            spec.loader.exec_module(module)
 
 
 class TestConfigValidate:

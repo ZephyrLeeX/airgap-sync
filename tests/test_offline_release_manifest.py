@@ -125,6 +125,10 @@ class TestManifest:
         with pytest.raises(rm.ReleaseManifestError, match="git commit"):
             make_manifest(release_id="0.1.0-deadbee")
 
+    def test_validation_rejects_mismatched_app_version(self) -> None:
+        with pytest.raises(rm.ReleaseManifestError, match="version disagrees with app_version"):
+            make_manifest(app_version="0.2.0")
+
     @pytest.mark.parametrize(
         "overrides",
         [

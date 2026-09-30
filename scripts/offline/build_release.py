@@ -30,6 +30,8 @@ import urllib.request
 import zipfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 
 import release_manifest as rm
@@ -281,6 +283,50 @@ def build_app_wheel(build_dir: Path) -> Path:
     if len(wheels) != 1:
         raise BuildError(f"expected exactly one app wheel, found: {[w.name for w in wheels]}")
     return wheels[0]
+
+
+def validate_app_wheel(wheel: Path, expected_version: str) -> None:
+    """Check the built distribution's own metadata before any release is assembled."""
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_paths = [
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA") and name.count("/") == 1
+            ]
+            if len(metadata_paths) != 1:
+                raise BuildError(
+                    f"application wheel must contain exactly one dist-info/METADATA: {wheel}"
+                )
+            metadata = BytesParser(policy=policy.default).parsebytes(
+                archive.read(metadata_paths[0])
+            )
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise BuildError(f"cannot read application wheel metadata from {wheel}: {exc}") from exc
+
+    names = metadata.get_all("Name", [])
+    versions = metadata.get_all("Version", [])
+    if metadata.defects or len(names) != 1 or len(versions) != 1:
+        raise BuildError(f"malformed application wheel metadata in {wheel}")
+    name, actual_version = names[0].strip(), versions[0].strip()
+    if not name or not actual_version or normalize_name(name) != "airgap-sync":
+        raise BuildError(f"application wheel name mismatch: expected airgap-sync, got {name!r}")
+    if actual_version != expected_version:
+        raise BuildError(
+            "application version mismatch:\n"
+            f"  pyproject: {expected_version}\n"
+            f"  wheel metadata: {actual_version}"
+        )
+    filename_parts = wheel.name.removesuffix(".whl").split("-")
+    if (
+        len(filename_parts) < 5
+        or normalize_name(filename_parts[0]) != "airgap-sync"
+        or filename_parts[1] != actual_version
+    ):
+        raise BuildError(
+            f"application wheel filename {wheel.name!r} disagrees with metadata "
+            f"{name} {actual_version}"
+        )
 
 
 def seed_download_venv(build_dir: Path, python_version: str) -> Path:
@@ -578,6 +624,7 @@ def build(include_tests: bool, allow_dirty: bool, output_dir: Path, keep_build: 
 
     stage("[4/8] Build application wheel")
     app_wheel = build_app_wheel(build_dir)
+    validate_app_wheel(app_wheel, app_version)
     print(f"  {app_wheel.name}")
 
     stage("[5/8] Download binary wheels for both platforms")

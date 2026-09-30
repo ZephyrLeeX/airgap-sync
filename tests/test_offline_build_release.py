@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -102,6 +103,62 @@ class TestWheelhouseValidation:
     def test_missing_directory(self, tmp_path: Path) -> None:
         wheels, unresolved, _ = br.validate_wheelhouse(tmp_path / "nope", {"click": "8.5.0"})
         assert wheels == 0 and unresolved == ["click"]
+
+
+class TestApplicationWheelMetadata:
+    @staticmethod
+    def wheel(tmp_path: Path, metadata: bytes | None, *, name: str = "airgap_sync") -> Path:
+        wheel = tmp_path / f"{name}-0.2.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            if metadata is not None:
+                archive.writestr(f"{name}-0.2.0.dist-info/METADATA", metadata)
+        return wheel
+
+    def test_matching_metadata(self, tmp_path: Path) -> None:
+        wheel = self.wheel(tmp_path, b"Metadata-Version: 2.1\nName: Airgap_Sync\nVersion: 0.2.0\n")
+        br.validate_app_wheel(wheel, "0.2.0")
+
+    def test_version_mismatch(self, tmp_path: Path) -> None:
+        wheel = self.wheel(tmp_path, b"Name: airgap-sync\nVersion: 0.1.0\n")
+        with pytest.raises(br.BuildError, match="pyproject: 0.2.0\\n  wheel metadata: 0.1.0"):
+            br.validate_app_wheel(wheel, "0.2.0")
+
+    def test_wrong_name(self, tmp_path: Path) -> None:
+        wheel = self.wheel(tmp_path, b"Name: other-project\nVersion: 0.2.0\n")
+        with pytest.raises(br.BuildError, match="name mismatch"):
+            br.validate_app_wheel(wheel, "0.2.0")
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            b"Name: airgap-sync\n",
+            b"not a valid header\n",
+            b"Name: airgap-sync\nName: evil\nVersion: 0.2.0\n",
+        ],
+    )
+    def test_missing_or_malformed_metadata(self, tmp_path: Path, metadata: bytes | None) -> None:
+        wheel = self.wheel(tmp_path, metadata)
+        with pytest.raises(br.BuildError):
+            br.validate_app_wheel(wheel, "0.2.0")
+
+    def test_validation_precedes_manifest_assembly(self, tmp_path: Path, monkeypatch) -> None:
+        wheel = self.wheel(tmp_path, b"Name: airgap-sync\nVersion: 0.1.0\n")
+        monkeypatch.setattr(br, "REPO_ROOT", tmp_path)
+        monkeypatch.setattr(br, "preflight", lambda _dirty: ("a" * 40, "0.2.0"))
+        monkeypatch.setattr(br, "load_runtime_versions", lambda: {"python": "3.13.15"})
+        monkeypatch.setattr(br, "lock_closures", lambda: ({}, {}))
+        monkeypatch.setattr(br, "export_runtime_requirements", lambda *_args: {})
+        monkeypatch.setattr(br, "build_app_wheel", lambda _dir: wheel)
+
+        def too_late(*_args):
+            raise AssertionError("release processing started before wheel validation")
+
+        monkeypatch.setattr(br, "seed_download_venv", too_late)
+        monkeypatch.setattr(br, "assemble_bundle", too_late)
+        with pytest.raises(br.BuildError, match="application version mismatch"):
+            br.build(False, False, tmp_path / "dist", False)
+        assert not (tmp_path / "dist").exists()
 
 
 class TestRuntimeVersions:

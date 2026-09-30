@@ -12,7 +12,6 @@ from threading import Event
 import click
 from click.exceptions import Exit as ClickExit
 
-from airgap_sync import __version__
 from airgap_sync.common.config import (
     ConfigError,
     load_config,
@@ -47,7 +46,7 @@ _SIZE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
 
 
 @click.group()
-@click.version_option(version=__version__, prog_name="airgap-sync")
+@click.version_option(package_name="airgap-sync", prog_name="airgap-sync")
 @click.option(
     "--log-level",
     type=click.Choice(LOG_LEVELS),
